@@ -1,12 +1,13 @@
 ---
 name: blink
-description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, and transaction history via the Blink API.
-version: 1.2.0
+description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, and transaction history via the Blink API. All output is JSON.
+version: 1.3.0
+repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
     project: blink
     identifier: blink
-    version: "1.2.0"
+    version: "1.3.0"
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -19,6 +20,12 @@ metadata:
     primaryEnv: BLINK_API_KEY
     emoji: "⚡"
     homepage: "https://github.com/blinkbitcoin/blink-skill"
+    security:
+      secrets: ["BLINK_API_KEY"]
+      network: "outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions"
+      filesystem: "reads ~/.profile, ~/.bashrc, ~/.bash_profile, ~/.zshrc to locate BLINK_API_KEY export (env var checked first); writes temporary QR PNGs to /tmp"
+      persistence: "none — stateless, no data stored between runs"
+      notes: "Zero npm runtime dependencies. Only Node.js built-in modules used. No global installs required — scripts run standalone via node."
 ---
 
 # Blink Skill
@@ -44,56 +51,84 @@ Blink is a custodial Bitcoin Lightning wallet with a GraphQL API. Key concepts:
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
 
-## Setup
+## Getting Started
 
-### 1. Install dependencies and link the CLI
+### 1. Get your API key
 
-From the `blink-skill` project root:
-
-```bash
-npm install
-npm link
-```
-
-This makes the `blink` command available globally. Verify with:
-
-```bash
-blink --help
-```
-
-### 2. Configure your API key
-
-The CLI automatically reads `BLINK_API_KEY` from your environment or from shell rc files (`~/.profile`, `~/.bashrc`, `~/.bash_profile`, `~/.zshrc`). Store your key in any of these:
+1. Create a free account at [dashboard.blink.sv](https://dashboard.blink.sv).
+2. Go to **API Keys** and create a key with the scopes you need.
+3. Set it in your environment:
 
 ```bash
 export BLINK_API_KEY="blink_..."
 ```
-
-Get your API key from the [Blink Dashboard](https://dashboard.blink.sv) under API Keys.
 
 **API Key Scopes:**
 - **Read** — query balances, transaction history, price, account info
 - **Receive** — create invoices
 - **Write** — send payments (use with caution)
 
-### 3. Staging / Testnet (optional)
+> **Tip:** Start with Read + Receive only. Add Write when you need to send payments.
 
-To use the Blink staging environment (signet), set:
+### 2. Verify it works
+
+```bash
+node {baseDir}/scripts/balance.js
+```
+
+If you see JSON with your wallet balances, you're ready.
+
+### 3. Staging / Testnet (recommended for first-time setup)
+
+To use the Blink staging environment (signet) instead of real money:
 ```bash
 export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ```
 
-If not set, production (`https://api.blink.sv/graphql`) is used by default.
+Create a staging API key at [dashboard.staging.blink.sv](https://dashboard.staging.blink.sv). The staging environment uses signet bitcoin (no real value) — perfect for testing payment flows safely.
 
-### Alternative: Run scripts directly
+If `BLINK_API_URL` is not set, production (`https://api.blink.sv/graphql`) is used by default.
 
-All scripts remain runnable standalone without the CLI:
+### API key auto-detection
+
+Scripts automatically resolve `BLINK_API_KEY` using this order:
+1. `process.env.BLINK_API_KEY` (checked first)
+2. Shell rc files: `~/.profile`, `~/.bashrc`, `~/.bash_profile`, `~/.zshrc` — scanned for an `export BLINK_API_KEY=...` line only
+
+No `source ~/.profile` prefix is needed. The rc file scan uses a targeted regex that reads only the `BLINK_API_KEY` export line — no other data is extracted from these files.
+
+### Optional: CLI wrapper (full GitHub repo only)
+
+If you have cloned the [full GitHub repo](https://github.com/blinkbitcoin/blink-skill), you can optionally install a `blink` CLI command:
+
 ```bash
-node blink/scripts/balance.js
-node blink/scripts/price.js 50000
+npm install   # install dev dependencies (eslint, prettier)
+npm link      # creates global 'blink' command
+blink --help  # verify
 ```
 
-The API key sniffing works the same way — no `source ~/.profile` prefix needed.
+> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`.
+
+## Agent Safety Policy
+
+These rules are mandatory for any AI agent using this skill:
+
+1. **Ask before spending.** Never execute `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, or `swap-execute` without explicit user confirmation of the amount and recipient.
+2. **Dry-run first.** For swaps, always run with `--dry-run` before executing for real unless the user explicitly says to skip it.
+3. **Check balance before sending.** Always run `balance` before any payment or swap to verify sufficient funds.
+4. **Probe fees before paying.** Run `fee-probe` before `pay-invoice` to show the user the fee cost.
+5. **Use minimum scopes.** Only request Write-scoped API keys when send operations are actually needed.
+6. **Never log or display the API key.** Treat `BLINK_API_KEY` as a secret. Do not echo it, include it in messages, or write it to files.
+7. **Prefer staging for testing.** When the user is testing or learning, suggest setting `BLINK_API_URL` to the staging endpoint.
+8. **Respect irreversibility.** Warn the user that Lightning payments and swaps cannot be reversed once executed.
+
+## Bitcoin Units
+
+- **BTC wallet** amounts are always in **satoshis** (sats). 1 BTC = 100,000,000 sats.
+- **USD wallet** amounts are always in **cents**. $1.00 = 100 cents.
+- When displaying amounts to users, use the formatted fields from output JSON (e.g. `btcBalanceUsdFormatted`, `usdBalanceFormatted`).
+- Do not perform manual BTC-to-USD conversion math — use `blink price <sats>` or the `btcBalanceUsd` field from `balance` output instead.
+- For swap amounts, the `--unit` flag controls interpretation: `sats` for BTC, `cents` for USD.
 
 ## Workflow
 
@@ -219,6 +254,8 @@ Pays a BOLT-11 Lightning invoice from the BTC or USD wallet. Returns payment sta
 
 **Requires Write scope on the API key.**
 
+> **AGENT:** This command spends funds. Always run `balance` and `fee-probe` first, then confirm amount and recipient with the user before executing.
+
 ### Pay to Lightning Address
 ```bash
 blink pay-lnaddress <lightning_address> <amount_sats> [--wallet BTC|USD]
@@ -232,6 +269,8 @@ Sends satoshis to a Lightning Address (e.g. `user@blink.sv`). Returns payment st
 
 **Requires Write scope on the API key.**
 
+> **AGENT:** This command spends funds. Always run `balance` first, confirm the Lightning Address and amount with the user, then execute.
+
 ### Pay to LNURL
 ```bash
 blink pay-lnurl <lnurl> <amount_sats> [--wallet BTC|USD]
@@ -244,6 +283,8 @@ Sends satoshis to a raw LNURL payRequest string. For Lightning Addresses (`user@
 - `--wallet BTC|USD` — wallet to pay from (default: BTC). When USD is selected, the amount is still specified in satoshis; the Blink API debits the USD equivalent from the USD wallet automatically.
 
 **Requires Write scope on the API key.**
+
+> **AGENT:** This command spends funds. Always run `balance` first, confirm the LNURL and amount with the user, then execute.
 
 ### Estimate Payment Fee
 ```bash
@@ -656,6 +697,8 @@ Executes a real BTC <-> USD conversion. First generates a quote, then performs t
 
 **CAUTION: Without `--dry-run`, this moves real funds between wallets. Requires Write scope.**
 
+> **AGENT:** This command moves funds between wallets. Always run with `--dry-run` first, show the quote to the user, and get explicit confirmation before executing without `--dry-run`.
+
 ### Swap Output Examples
 
 **Quote output:**
@@ -703,15 +746,37 @@ Executes a real BTC <-> USD conversion. First generates a quote, then performs t
 }
 ```
 
-## Security Notes
+## Security
 
-- **API key is your wallet access** — anyone with a Write-scoped key can spend your balance
-- **Use minimum scopes** — Read-only for balance checks, Receive for invoices, Write only when sending
-- **Never expose keys in client-side code** — keys are for server-side / agent use only
-- **Sending is irreversible** — Lightning payments cannot be reversed once sent
-- **Test on staging first** — use `BLINK_API_URL` to point at the signet staging environment
-- **USD invoices expire fast** — ~5 minutes due to exchange rate lock
-- **Price queries are public** — `blink price` works without an API key; only wallet operations require authentication
+### API Key Handling
+
+- **Your API key is your wallet access** — anyone with a Write-scoped key can spend your entire balance.
+- **Use minimum scopes** — Read-only for balance checks, Receive for invoices, Write only when sending.
+- **Never expose keys in output** — do not echo, log, or include `BLINK_API_KEY` in chat messages or files.
+- Keys are for server-side / agent use only. Never embed in client-side code.
+
+### What Data Leaves the Machine
+
+- **Outbound HTTPS** to `api.blink.sv` (or `BLINK_API_URL` override) for all GraphQL queries and mutations.
+- **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
+- **No other network calls.** Scripts do not phone home, send telemetry, or contact any third-party services.
+
+### Filesystem Access
+
+- **RC file reading:** If `BLINK_API_KEY` is not found in `process.env`, the client scans `~/.profile`, `~/.bashrc`, `~/.bash_profile`, and `~/.zshrc` for a line matching `export BLINK_API_KEY=...`. Only the value of that specific export is extracted — no other data is read from these files. The environment variable is always checked first.
+- **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
+- **No other filesystem writes.** Scripts do not create config files, databases, or caches.
+
+### Stateless Design
+
+This skill stores no data between runs. There are no databases, config files, session tokens, or caches. Each script invocation is independent — it reads the API key, makes API calls, outputs JSON, and exits.
+
+### Payment Safety
+
+- **Sending is irreversible** — Lightning payments cannot be reversed once settled.
+- **Test on staging first** — use `BLINK_API_URL=https://api.staging.blink.sv/graphql` to point at the signet staging environment with test funds.
+- **USD invoices expire fast** — ~5 minutes due to exchange rate lock.
+- **Price queries are public** — `blink price` works without an API key; only wallet operations require authentication.
 
 ## Reference Files
 
