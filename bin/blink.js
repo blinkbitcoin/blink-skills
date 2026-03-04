@@ -3,365 +3,674 @@
  * Blink Lightning Wallet CLI
  *
  * Unified entry point for all Blink wallet operations.
+ * Zero npm dependencies — uses Node's built-in util.parseArgs.
  * Run `blink --help` for usage or `blink <command> --help` for command-specific help.
  */
 
-const { Command, InvalidArgumentError } = require('commander');
-const path = require('path');
+const { parseArgs } = require('node:util');
+const path = require('node:path');
 
-const program = new Command();
 const scriptsDir = path.join(__dirname, '..', 'blink', 'scripts');
+const VERSION = require('../package.json').version;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Coercion helpers ─────────────────────────────────────────────────────────
 
-function parseSats(value) {
+function parseSats(value, name) {
   const n = parseInt(value, 10);
-  if (isNaN(n) || n <= 0) throw new InvalidArgumentError('Must be a positive integer (sats).');
+  if (isNaN(n) || n <= 0) {
+    console.error(`Error: '${name}' must be a positive integer (sats), got '${value}'.`);
+    process.exit(1);
+  }
   return n;
 }
 
-function parseCents(value) {
+function parseCents(value, name) {
   const n = parseInt(value, 10);
-  if (isNaN(n) || n <= 0) throw new InvalidArgumentError('Must be a positive integer (cents).');
+  if (isNaN(n) || n <= 0) {
+    console.error(`Error: '${name}' must be a positive integer (cents), got '${value}'.`);
+    process.exit(1);
+  }
   return n;
 }
 
-function parseNonNegativeInt(value) {
+function parseNonNegativeInt(value, name) {
   const n = parseInt(value, 10);
-  if (isNaN(n) || n < 0) throw new InvalidArgumentError('Must be a non-negative integer.');
+  if (isNaN(n) || n < 0) {
+    console.error(`Error: '${name}' must be a non-negative integer, got '${value}'.`);
+    process.exit(1);
+  }
   return n;
 }
 
-function parsePositiveInt(value) {
+function parsePositiveInt(value, name) {
   const n = parseInt(value, 10);
-  if (isNaN(n) || n < 1) throw new InvalidArgumentError('Must be a positive integer.');
+  if (isNaN(n) || n < 1) {
+    console.error(`Error: '${name}' must be a positive integer, got '${value}'.`);
+    process.exit(1);
+  }
   return n;
 }
 
-/**
- * Inject parsed commander options/args into process.argv so that existing
- * script main() functions (which parse process.argv internally) work unchanged.
- *
- * @param {string[]} argv  Synthetic argv entries (e.g., ['1000', '--wallet', 'BTC'])
- */
+// ── Argv passthrough ─────────────────────────────────────────────────────────
+
 function setProcessArgv(argv) {
   process.argv = [process.argv[0], 'blink', ...argv];
 }
 
-/** Standard error handler matching the existing script convention. */
 function handleError(e) {
   console.error('Error:', e.message);
   process.exit(1);
 }
 
-// ── Program setup ────────────────────────────────────────────────────────────
+// ── Command registry ─────────────────────────────────────────────────────────
+//
+// Each command declares:
+//   args:     Array of { name, required, variadic, description, coerce? }
+//   options:  parseArgs-compatible options config (type, short, default)
+//   optMeta:  Display metadata for options { description, valueName? }
+//   examples: Array of example strings
+//   action:   async (positionals, values) => void
 
-program
-  .name('blink')
-  .version(require('../package.json').version)
-  .description('Bitcoin Lightning wallet CLI — balances, invoices, payments, QR codes, price conversion, and transaction history via the Blink API.')
-  .showHelpAfterError('(run with --help for usage)')
-  .showSuggestionAfterError();
+const commands = {};
 
-// ── balance ──────────────────────────────────────────────────────────────────
-
-program
-  .command('balance')
-  .description('Show BTC and USD wallet balances with pre-computed USD estimates')
-  .addHelpText('after', '\nExamples:\n  blink balance')
-  .action(async () => {
+commands.balance = {
+  description: 'Show BTC and USD wallet balances with pre-computed USD estimates',
+  args: [],
+  options: {},
+  optMeta: {},
+  examples: ['blink balance'],
+  action: async () => {
     setProcessArgv([]);
     const { main } = require(path.join(scriptsDir, 'balance.js'));
     await main();
-  });
+  },
+};
 
-// ── pay-invoice ──────────────────────────────────────────────────────────────
-
-program
-  .command('pay-invoice')
-  .description('Pay a BOLT-11 Lightning invoice')
-  .argument('<bolt11>', 'BOLT-11 payment request string (lnbc...)')
-  .option('-w, --wallet <currency>', 'Wallet to pay from', 'BTC')
-  .option('--dry-run', 'Show what would be sent without executing the payment')
-  .option('--force', 'Skip balance sufficiency check')
-  .addHelpText('after', '\nExamples:\n  blink pay-invoice lnbc10u1p...\n  blink pay-invoice lnbc10u1p... --wallet USD\n  blink pay-invoice lnbc10u1p... --dry-run')
-  .action(async (bolt11, opts) => {
-    const argv = [bolt11, '--wallet', opts.wallet];
-    if (opts.dryRun) argv.push('--dry-run');
+commands['pay-invoice'] = {
+  description: 'Pay a BOLT-11 Lightning invoice',
+  args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
+  options: {
+    wallet:    { type: 'string', short: 'w', default: 'BTC' },
+    'dry-run': { type: 'boolean', default: false },
+    force:     { type: 'boolean', default: false },
+  },
+  optMeta: {
+    wallet:    { description: 'Wallet to pay from', valueName: 'currency' },
+    'dry-run': { description: 'Show what would be sent without executing the payment' },
+    force:     { description: 'Skip balance sufficiency check' },
+  },
+  examples: [
+    'blink pay-invoice lnbc10u1p...',
+    'blink pay-invoice lnbc10u1p... --wallet USD',
+    'blink pay-invoice lnbc10u1p... --dry-run',
+  ],
+  action: async (pos, opts) => {
+    const argv = [pos[0], '--wallet', opts.wallet];
+    if (opts['dry-run']) argv.push('--dry-run');
     if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'pay_invoice.js'));
     await main();
-  });
+  },
+};
 
-// ── pay-lnaddress ────────────────────────────────────────────────────────────
-
-program
-  .command('pay-lnaddress')
-  .description('Send sats to a Lightning Address (user@domain)')
-  .argument('<address>', 'Lightning Address (e.g. user@blink.sv)')
-  .argument('<amount>', 'Amount in satoshis', parseSats)
-  .option('-w, --wallet <currency>', 'Wallet to pay from', 'BTC')
-  .option('--dry-run', 'Show what would be sent without executing the payment')
-  .option('--force', 'Skip balance sufficiency check')
-  .option('--max-amount <sats>', 'Reject if amount exceeds this threshold', parseSats)
-  .addHelpText('after', '\nExamples:\n  blink pay-lnaddress user@blink.sv 1000\n  blink pay-lnaddress user@blink.sv 1000 --wallet USD\n  blink pay-lnaddress user@blink.sv 1000 --dry-run')
-  .action(async (address, amount, opts) => {
-    if (opts.maxAmount && amount > opts.maxAmount) {
-      console.error(`Error: amount ${amount} sats exceeds --max-amount ${opts.maxAmount} sats`);
+commands['pay-lnaddress'] = {
+  description: 'Send sats to a Lightning Address (user@domain)',
+  args: [
+    { name: 'address', required: true, description: 'Lightning Address (e.g. user@blink.sv)' },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+  ],
+  options: {
+    wallet:       { type: 'string', short: 'w', default: 'BTC' },
+    'dry-run':    { type: 'boolean', default: false },
+    force:        { type: 'boolean', default: false },
+    'max-amount': { type: 'string' },
+  },
+  optMeta: {
+    wallet:       { description: 'Wallet to pay from', valueName: 'currency' },
+    'dry-run':    { description: 'Show what would be sent without executing the payment' },
+    force:        { description: 'Skip balance sufficiency check' },
+    'max-amount': { description: 'Reject if amount exceeds this threshold (sats)', valueName: 'sats' },
+  },
+  examples: [
+    'blink pay-lnaddress user@blink.sv 1000',
+    'blink pay-lnaddress user@blink.sv 1000 --wallet USD',
+    'blink pay-lnaddress user@blink.sv 1000 --dry-run',
+  ],
+  action: async (pos, opts) => {
+    const amount = pos[1];
+    const maxAmount = opts['max-amount'] != null ? parseSats(opts['max-amount'], '--max-amount') : undefined;
+    if (maxAmount && amount > maxAmount) {
+      console.error(`Error: amount ${amount} sats exceeds --max-amount ${maxAmount} sats`);
       process.exit(1);
     }
-    const argv = [address, String(amount), '--wallet', opts.wallet];
-    if (opts.dryRun) argv.push('--dry-run');
+    const argv = [pos[0], String(amount), '--wallet', opts.wallet];
+    if (opts['dry-run']) argv.push('--dry-run');
     if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'pay_lnaddress.js'));
     await main();
-  });
+  },
+};
 
-// ── pay-lnurl ────────────────────────────────────────────────────────────────
-
-program
-  .command('pay-lnurl')
-  .description('Send sats to a raw LNURL payRequest string')
-  .argument('<lnurl>', 'LNURL string (lnurl1...)')
-  .argument('<amount>', 'Amount in satoshis', parseSats)
-  .option('-w, --wallet <currency>', 'Wallet to pay from', 'BTC')
-  .option('--dry-run', 'Show what would be sent without executing the payment')
-  .option('--force', 'Skip balance sufficiency check')
-  .option('--max-amount <sats>', 'Reject if amount exceeds this threshold', parseSats)
-  .addHelpText('after', '\nExamples:\n  blink pay-lnurl lnurl1dp68... 5000\n  blink pay-lnurl lnurl1dp68... 5000 --wallet USD')
-  .action(async (lnurl, amount, opts) => {
-    if (opts.maxAmount && amount > opts.maxAmount) {
-      console.error(`Error: amount ${amount} sats exceeds --max-amount ${opts.maxAmount} sats`);
+commands['pay-lnurl'] = {
+  description: 'Send sats to a raw LNURL payRequest string',
+  args: [
+    { name: 'lnurl', required: true, description: 'LNURL string (lnurl1...)' },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+  ],
+  options: {
+    wallet:       { type: 'string', short: 'w', default: 'BTC' },
+    'dry-run':    { type: 'boolean', default: false },
+    force:        { type: 'boolean', default: false },
+    'max-amount': { type: 'string' },
+  },
+  optMeta: {
+    wallet:       { description: 'Wallet to pay from', valueName: 'currency' },
+    'dry-run':    { description: 'Show what would be sent without executing the payment' },
+    force:        { description: 'Skip balance sufficiency check' },
+    'max-amount': { description: 'Reject if amount exceeds this threshold (sats)', valueName: 'sats' },
+  },
+  examples: [
+    'blink pay-lnurl lnurl1dp68... 5000',
+    'blink pay-lnurl lnurl1dp68... 5000 --wallet USD',
+  ],
+  action: async (pos, opts) => {
+    const amount = pos[1];
+    const maxAmount = opts['max-amount'] != null ? parseSats(opts['max-amount'], '--max-amount') : undefined;
+    if (maxAmount && amount > maxAmount) {
+      console.error(`Error: amount ${amount} sats exceeds --max-amount ${maxAmount} sats`);
       process.exit(1);
     }
-    const argv = [lnurl, String(amount), '--wallet', opts.wallet];
-    if (opts.dryRun) argv.push('--dry-run');
+    const argv = [pos[0], String(amount), '--wallet', opts.wallet];
+    if (opts['dry-run']) argv.push('--dry-run');
     if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'pay_lnurl.js'));
     await main();
-  });
+  },
+};
 
-// ── create-invoice ───────────────────────────────────────────────────────────
-
-program
-  .command('create-invoice')
-  .description('Create a BTC Lightning invoice (BOLT-11) with optional auto-subscribe')
-  .argument('<amount>', 'Amount in satoshis', parseSats)
-  .argument('[memo...]', 'Optional memo text')
-  .option('--timeout <seconds>', 'Subscription timeout in seconds (0 = no timeout)', parseNonNegativeInt, 300)
-  .option('--no-subscribe', 'Skip WebSocket auto-subscribe for payment status')
-  .addHelpText('after', '\nExamples:\n  blink create-invoice 1000\n  blink create-invoice 5000 "Coffee payment"\n  blink create-invoice 1000 --no-subscribe\n  blink create-invoice 1000 --timeout 60')
-  .action(async (amount, memo, opts) => {
-    const argv = [String(amount)];
-    if (opts.timeout !== undefined) argv.push('--timeout', String(opts.timeout));
+commands['create-invoice'] = {
+  description: 'Create a BTC Lightning invoice (BOLT-11) with optional auto-subscribe',
+  args: [
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+    { name: 'memo', required: false, variadic: true, description: 'Optional memo text' },
+  ],
+  options: {
+    timeout:   { type: 'string', default: '300' },
+    subscribe: { type: 'boolean', default: true },
+  },
+  optMeta: {
+    timeout:   { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    subscribe: { description: 'Auto-subscribe for payment status (use --no-subscribe to skip)' },
+  },
+  examples: [
+    'blink create-invoice 1000',
+    'blink create-invoice 5000 "Coffee payment"',
+    'blink create-invoice 1000 --no-subscribe',
+    'blink create-invoice 1000 --timeout 60',
+  ],
+  action: async (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const argv = [String(pos[0])];
+    if (timeout !== undefined) argv.push('--timeout', String(timeout));
     if (opts.subscribe === false) argv.push('--no-subscribe');
-    if (memo && memo.length > 0) argv.push(...memo);
+    const memo = pos.slice(1);
+    if (memo.length > 0) argv.push(...memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice.js'));
     await main();
-  });
+  },
+};
 
-// ── create-invoice-usd ──────────────────────────────────────────────────────
-
-program
-  .command('create-invoice-usd')
-  .description('Create a USD-denominated Lightning invoice (amount in cents, e.g. 100 = $1.00)')
-  .argument('<amount>', 'Amount in USD cents (e.g. 100 = $1.00)', parseCents)
-  .argument('[memo...]', 'Optional memo text')
-  .option('--timeout <seconds>', 'Subscription timeout in seconds (0 = no timeout)', parseNonNegativeInt, 300)
-  .option('--no-subscribe', 'Skip WebSocket auto-subscribe for payment status')
-  .addHelpText('after', '\nExamples:\n  blink create-invoice-usd 100      # $1.00\n  blink create-invoice-usd 500 "Tip"\n  blink create-invoice-usd 100 --no-subscribe')
-  .action(async (amount, memo, opts) => {
-    const argv = [String(amount)];
-    if (opts.timeout !== undefined) argv.push('--timeout', String(opts.timeout));
+commands['create-invoice-usd'] = {
+  description: 'Create a USD-denominated Lightning invoice (amount in cents, e.g. 100 = $1.00)',
+  args: [
+    { name: 'amount', required: true, description: 'Amount in USD cents (e.g. 100 = $1.00)', coerce: parseCents },
+    { name: 'memo', required: false, variadic: true, description: 'Optional memo text' },
+  ],
+  options: {
+    timeout:   { type: 'string', default: '300' },
+    subscribe: { type: 'boolean', default: true },
+  },
+  optMeta: {
+    timeout:   { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    subscribe: { description: 'Auto-subscribe for payment status (use --no-subscribe to skip)' },
+  },
+  examples: [
+    'blink create-invoice-usd 100      # $1.00',
+    'blink create-invoice-usd 500 "Tip"',
+    'blink create-invoice-usd 100 --no-subscribe',
+  ],
+  action: async (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const argv = [String(pos[0])];
+    if (timeout !== undefined) argv.push('--timeout', String(timeout));
     if (opts.subscribe === false) argv.push('--no-subscribe');
-    if (memo && memo.length > 0) argv.push(...memo);
+    const memo = pos.slice(1);
+    if (memo.length > 0) argv.push(...memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice_usd.js'));
     await main();
-  });
+  },
+};
 
-// ── check-invoice ────────────────────────────────────────────────────────────
-
-program
-  .command('check-invoice')
-  .description('Check payment status of a Lightning invoice by payment hash')
-  .argument('<payment_hash>', 'Payment hash (64-char hex string from create-invoice)')
-  .addHelpText('after', '\nExamples:\n  blink check-invoice abc123def456...')
-  .action(async (paymentHash) => {
-    setProcessArgv([paymentHash]);
+commands['check-invoice'] = {
+  description: 'Check payment status of a Lightning invoice by payment hash',
+  args: [{ name: 'payment_hash', required: true, description: 'Payment hash (64-char hex string from create-invoice)' }],
+  options: {},
+  optMeta: {},
+  examples: ['blink check-invoice abc123def456...'],
+  action: async (pos) => {
+    setProcessArgv([pos[0]]);
     const { main } = require(path.join(scriptsDir, 'check_invoice.js'));
     await main();
-  });
+  },
+};
 
-// ── fee-probe ────────────────────────────────────────────────────────────────
-
-program
-  .command('fee-probe')
-  .description('Estimate the fee for paying a Lightning invoice without sending')
-  .argument('<bolt11>', 'BOLT-11 payment request string (lnbc...)')
-  .option('-w, --wallet <currency>', 'Wallet to probe from', 'BTC')
-  .addHelpText('after', '\nExamples:\n  blink fee-probe lnbc10u1p...\n  blink fee-probe lnbc10u1p... --wallet USD')
-  .action(async (bolt11, opts) => {
-    setProcessArgv([bolt11, '--wallet', opts.wallet]);
+commands['fee-probe'] = {
+  description: 'Estimate the fee for paying a Lightning invoice without sending',
+  args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
+  options: {
+    wallet: { type: 'string', short: 'w', default: 'BTC' },
+  },
+  optMeta: {
+    wallet: { description: 'Wallet to probe from', valueName: 'currency' },
+  },
+  examples: [
+    'blink fee-probe lnbc10u1p...',
+    'blink fee-probe lnbc10u1p... --wallet USD',
+  ],
+  action: async (pos, opts) => {
+    setProcessArgv([pos[0], '--wallet', opts.wallet]);
     const { main } = require(path.join(scriptsDir, 'fee_probe.js'));
     await main();
-  });
+  },
+};
 
-// ── qr ───────────────────────────────────────────────────────────────────────
-
-program
-  .command('qr')
-  .description('Generate a QR code for a Lightning invoice (terminal + PNG file)')
-  .argument('<bolt11>', 'BOLT-11 payment request string (lnbc...)')
-  .addHelpText('after', '\nExamples:\n  blink qr lnbc10u1p...\n\nOutputs QR code to terminal (stderr) and saves PNG to /tmp/blink_qr_<timestamp>.png')
-  .action((bolt11) => {
-    setProcessArgv([bolt11]);
+commands.qr = {
+  description: 'Generate a QR code for a Lightning invoice (terminal + PNG file)',
+  args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
+  options: {},
+  optMeta: {},
+  examples: ['blink qr lnbc10u1p...'],
+  action: (pos) => {
+    setProcessArgv([pos[0]]);
     const { main } = require(path.join(scriptsDir, 'qr_invoice.js'));
     main();
-  });
+  },
+};
 
-// ── transactions ─────────────────────────────────────────────────────────────
-
-program
-  .command('transactions')
-  .description('List recent wallet transactions with pagination')
-  .option('--first <n>', 'Number of transactions to return (1-100)', parsePositiveInt, 20)
-  .option('--after <cursor>', 'Pagination cursor from a previous response')
-  .option('-w, --wallet <currency>', 'Filter to BTC or USD wallet')
-  .addHelpText('after', '\nExamples:\n  blink transactions\n  blink transactions --first 50\n  blink transactions --wallet BTC\n  blink transactions --after <endCursor>')
-  .action(async (opts) => {
+commands.transactions = {
+  description: 'List recent wallet transactions with pagination',
+  args: [],
+  options: {
+    first:  { type: 'string', default: '20' },
+    after:  { type: 'string' },
+    wallet: { type: 'string', short: 'w' },
+  },
+  optMeta: {
+    first:  { description: 'Number of transactions to return (1-100)', valueName: 'n' },
+    after:  { description: 'Pagination cursor from a previous response', valueName: 'cursor' },
+    wallet: { description: 'Filter to BTC or USD wallet', valueName: 'currency' },
+  },
+  examples: [
+    'blink transactions',
+    'blink transactions --first 50',
+    'blink transactions --wallet BTC',
+    'blink transactions --after <endCursor>',
+  ],
+  action: async (_pos, opts) => {
+    const first = parsePositiveInt(opts.first, '--first');
     const argv = [];
-    if (opts.first) argv.push('--first', String(opts.first));
+    if (first) argv.push('--first', String(first));
     if (opts.after) argv.push('--after', opts.after);
     if (opts.wallet) argv.push('--wallet', opts.wallet);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'transactions.js'));
     await main();
-  });
+  },
+};
 
-// ── price ────────────────────────────────────────────────────────────────────
-
-program
-  .command('price')
-  .description('BTC/USD price, currency conversion, and price history (no API key required)')
-  .argument('[amount_sats]', 'Convert this many sats to USD')
-  .option('--usd <amount>', 'Convert USD amount to sats', parseFloat)
-  .option('--history <range>', 'Show historical prices (ONE_DAY, ONE_WEEK, ONE_MONTH, ONE_YEAR, FIVE_YEARS)')
-  .option('--currencies', 'List all supported display currencies')
-  .option('--raw', 'Include raw realtimePrice data')
-  .addHelpText('after', '\nExamples:\n  blink price                    # Current BTC/USD price\n  blink price 50000              # Convert 50000 sats to USD\n  blink price --usd 10.00        # Convert $10.00 to sats\n  blink price --history ONE_WEEK # Weekly price history\n  blink price --currencies       # List supported currencies')
-  .action(async (amountSats, opts) => {
+commands.price = {
+  description: 'BTC/USD price, currency conversion, and price history (no API key required)',
+  args: [{ name: 'amount_sats', required: false, description: 'Convert this many sats to USD' }],
+  options: {
+    usd:        { type: 'string' },
+    history:    { type: 'string' },
+    currencies: { type: 'boolean', default: false },
+    raw:        { type: 'boolean', default: false },
+  },
+  optMeta: {
+    usd:        { description: 'Convert USD amount to sats', valueName: 'amount' },
+    history:    { description: 'Show historical prices (ONE_DAY, ONE_WEEK, ONE_MONTH, ONE_YEAR, FIVE_YEARS)', valueName: 'range' },
+    currencies: { description: 'List all supported display currencies' },
+    raw:        { description: 'Include raw realtimePrice data' },
+  },
+  examples: [
+    'blink price                    # Current BTC/USD price',
+    'blink price 50000              # Convert 50000 sats to USD',
+    'blink price --usd 10.00        # Convert $10.00 to sats',
+    'blink price --history ONE_WEEK # Weekly price history',
+    'blink price --currencies       # List supported currencies',
+  ],
+  action: async (pos, opts) => {
     const argv = [];
     if (opts.raw) argv.push('--raw');
-    if (opts.usd !== undefined) {
-      argv.push('--usd', String(opts.usd));
+    if (opts.usd != null) {
+      argv.push('--usd', opts.usd);
     } else if (opts.history) {
       argv.push('--history', opts.history);
     } else if (opts.currencies) {
       argv.push('--currencies');
-    } else if (amountSats) {
-      argv.push(amountSats);
+    } else if (pos[0]) {
+      argv.push(pos[0]);
     }
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'price.js'));
     await main();
-  });
+  },
+};
 
-// ── account-info ─────────────────────────────────────────────────────────────
-
-program
-  .command('account-info')
-  .description('Show account level, spending limits, and wallet summary')
-  .addHelpText('after', '\nExamples:\n  blink account-info')
-  .action(async () => {
+commands['account-info'] = {
+  description: 'Show account level, spending limits, and wallet summary',
+  args: [],
+  options: {},
+  optMeta: {},
+  examples: ['blink account-info'],
+  action: async () => {
     setProcessArgv([]);
     const { main } = require(path.join(scriptsDir, 'account_info.js'));
     await main();
-  });
+  },
+};
 
-// ── subscribe-invoice ────────────────────────────────────────────────────────
-
-program
-  .command('subscribe-invoice')
-  .description('Watch a Lightning invoice for payment via WebSocket (requires Node 22+ or --experimental-websocket)')
-  .argument('<bolt11>', 'BOLT-11 payment request string (lnbc...)')
-  .option('--timeout <seconds>', 'Timeout in seconds (0 = no timeout)', parseNonNegativeInt, 300)
-  .addHelpText('after', '\nExamples:\n  blink subscribe-invoice lnbc10u1p...\n  blink subscribe-invoice lnbc10u1p... --timeout 60')
-  .action((bolt11, opts) => {
-    const argv = [bolt11];
-    if (opts.timeout !== undefined) argv.push('--timeout', String(opts.timeout));
+commands['subscribe-invoice'] = {
+  description: 'Watch a Lightning invoice for payment via WebSocket (requires Node 22+ or --experimental-websocket)',
+  args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
+  options: {
+    timeout: { type: 'string', default: '300' },
+  },
+  optMeta: {
+    timeout: { description: 'Timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+  },
+  examples: [
+    'blink subscribe-invoice lnbc10u1p...',
+    'blink subscribe-invoice lnbc10u1p... --timeout 60',
+  ],
+  action: (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const argv = [pos[0]];
+    if (timeout !== undefined) argv.push('--timeout', String(timeout));
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'subscribe_invoice.js'));
     main();
-  });
+  },
+};
 
-// ── subscribe-updates ────────────────────────────────────────────────────────
-
-program
-  .command('subscribe-updates')
-  .description('Stream account activity updates via WebSocket (NDJSON output; requires Node 22+ or --experimental-websocket)')
-  .option('--timeout <seconds>', 'Timeout in seconds (0 = no timeout)', parseNonNegativeInt, 0)
-  .option('--max <count>', 'Stop after this many events (0 = unlimited)', parseNonNegativeInt, 0)
-  .addHelpText('after', '\nExamples:\n  blink subscribe-updates\n  blink subscribe-updates --timeout 60\n  blink subscribe-updates --max 5')
-  .action((opts) => {
+commands['subscribe-updates'] = {
+  description: 'Stream account activity updates via WebSocket (NDJSON output)',
+  args: [],
+  options: {
+    timeout: { type: 'string', default: '0' },
+    max:     { type: 'string', default: '0' },
+  },
+  optMeta: {
+    timeout: { description: 'Timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    max:     { description: 'Stop after this many events (0 = unlimited)', valueName: 'count' },
+  },
+  examples: [
+    'blink subscribe-updates',
+    'blink subscribe-updates --timeout 60',
+    'blink subscribe-updates --max 5',
+  ],
+  action: (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const max = parseNonNegativeInt(opts.max, '--max');
     const argv = [];
-    if (opts.timeout !== undefined) argv.push('--timeout', String(opts.timeout));
-    if (opts.max !== undefined) argv.push('--max', String(opts.max));
+    if (timeout !== undefined) argv.push('--timeout', String(timeout));
+    if (max !== undefined) argv.push('--max', String(max));
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'subscribe_updates.js'));
     main();
-  });
+  },
+};
 
-// ── swap-quote ───────────────────────────────────────────────────────────────
-
-program
-  .command('swap-quote')
-  .description('Get a BTC <-> USD conversion quote (no funds moved)')
-  .argument('<direction>', 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)')
-  .argument('<amount>', 'Amount to swap (positive integer)', parsePositiveInt)
-  .option('--unit <unit>', 'Amount unit: sats or cents (default depends on direction)')
-  .option('--ttl-seconds <seconds>', 'Quote TTL in seconds', parsePositiveInt, 60)
-  .option('--immediate', 'Flag the quote for immediate execution')
-  .addHelpText('after', '\nExamples:\n  blink swap-quote btc-to-usd 1000\n  blink swap-quote usd-to-btc 500 --unit cents\n  blink swap-quote btc-to-usd 1000 --immediate --ttl-seconds 45')
-  .action(async (direction, amount, opts) => {
-    const argv = [direction, String(amount)];
+commands['swap-quote'] = {
+  description: 'Get a BTC <-> USD conversion quote (no funds moved)',
+  args: [
+    { name: 'direction', required: true, description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)' },
+    { name: 'amount', required: true, description: 'Amount to swap (positive integer)', coerce: parsePositiveInt },
+  ],
+  options: {
+    unit:           { type: 'string' },
+    'ttl-seconds':  { type: 'string', default: '60' },
+    immediate:      { type: 'boolean', default: false },
+  },
+  optMeta: {
+    unit:           { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
+    'ttl-seconds':  { description: 'Quote TTL in seconds', valueName: 'seconds' },
+    immediate:      { description: 'Flag the quote for immediate execution' },
+  },
+  examples: [
+    'blink swap-quote btc-to-usd 1000',
+    'blink swap-quote usd-to-btc 500 --unit cents',
+    'blink swap-quote btc-to-usd 1000 --immediate --ttl-seconds 45',
+  ],
+  action: async (pos, opts) => {
+    const ttl = parsePositiveInt(opts['ttl-seconds'], '--ttl-seconds');
+    const argv = [pos[0], String(pos[1])];
     if (opts.unit) argv.push('--unit', opts.unit);
-    if (opts.ttlSeconds !== undefined) argv.push('--ttl-seconds', String(opts.ttlSeconds));
+    if (ttl !== undefined) argv.push('--ttl-seconds', String(ttl));
     if (opts.immediate) argv.push('--immediate');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'swap_quote.js'));
     await main();
-  });
+  },
+};
 
-// ── swap-execute ─────────────────────────────────────────────────────────────
-
-program
-  .command('swap-execute')
-  .description('Execute a BTC <-> USD wallet conversion (CAUTION: moves real funds without --dry-run)')
-  .argument('<direction>', 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)')
-  .argument('<amount>', 'Amount to swap (positive integer)', parsePositiveInt)
-  .option('--unit <unit>', 'Amount unit: sats or cents (default depends on direction)')
-  .option('--dry-run', 'Show what would be swapped without executing')
-  .option('--memo <text>', 'Optional memo attached to the transaction')
-  .option('--ttl-seconds <seconds>', 'Quote TTL in seconds', parsePositiveInt, 60)
-  .option('--immediate', 'Flag the quote for immediate execution')
-  .addHelpText('after', '\nExamples:\n  blink swap-execute btc-to-usd 2000\n  blink swap-execute usd-to-btc 500 --unit cents\n  blink swap-execute btc-to-usd 2000 --dry-run\n  blink swap-execute btc-to-usd 2000 --memo "Monthly DCA"')
-  .action(async (direction, amount, opts) => {
-    const argv = [direction, String(amount)];
+commands['swap-execute'] = {
+  description: 'Execute a BTC <-> USD wallet conversion (CAUTION: moves real funds without --dry-run)',
+  args: [
+    { name: 'direction', required: true, description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)' },
+    { name: 'amount', required: true, description: 'Amount to swap (positive integer)', coerce: parsePositiveInt },
+  ],
+  options: {
+    unit:           { type: 'string' },
+    'dry-run':      { type: 'boolean', default: false },
+    memo:           { type: 'string' },
+    'ttl-seconds':  { type: 'string', default: '60' },
+    immediate:      { type: 'boolean', default: false },
+  },
+  optMeta: {
+    unit:           { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
+    'dry-run':      { description: 'Show what would be swapped without executing' },
+    memo:           { description: 'Optional memo attached to the transaction', valueName: 'text' },
+    'ttl-seconds':  { description: 'Quote TTL in seconds', valueName: 'seconds' },
+    immediate:      { description: 'Flag the quote for immediate execution' },
+  },
+  examples: [
+    'blink swap-execute btc-to-usd 2000',
+    'blink swap-execute usd-to-btc 500 --unit cents',
+    'blink swap-execute btc-to-usd 2000 --dry-run',
+    'blink swap-execute btc-to-usd 2000 --memo "Monthly DCA"',
+  ],
+  action: async (pos, opts) => {
+    const ttl = parsePositiveInt(opts['ttl-seconds'], '--ttl-seconds');
+    const argv = [pos[0], String(pos[1])];
     if (opts.unit) argv.push('--unit', opts.unit);
-    if (opts.ttlSeconds !== undefined) argv.push('--ttl-seconds', String(opts.ttlSeconds));
+    if (ttl !== undefined) argv.push('--ttl-seconds', String(ttl));
     if (opts.immediate) argv.push('--immediate');
-    if (opts.dryRun) argv.push('--dry-run');
+    if (opts['dry-run']) argv.push('--dry-run');
     if (opts.memo) argv.push('--memo', opts.memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'swap_execute.js'));
     await main();
-  });
+  },
+};
 
-// ── Parse ────────────────────────────────────────────────────────────────────
+// ── Help formatting ──────────────────────────────────────────────────────────
 
-program.parseAsync().catch(handleError);
+function formatMainHelp() {
+  const lines = [
+    `blink v${VERSION} — Bitcoin Lightning wallet CLI`,
+    '',
+    'Usage: blink <command> [options]',
+    '',
+    'Commands:',
+  ];
+
+  const names = Object.keys(commands);
+  const maxLen = Math.max(...names.map((n) => n.length));
+  for (const name of names) {
+    lines.push(`  ${name.padEnd(maxLen + 2)}${commands[name].description}`);
+  }
+
+  lines.push('');
+  lines.push('Options:');
+  lines.push('  --help, -h     Show help');
+  lines.push('  --version, -V  Show version number');
+  lines.push('');
+  lines.push('Run `blink <command> --help` for command-specific usage.');
+  return lines.join('\n');
+}
+
+function formatCommandHelp(name, cmd) {
+  const argStr = cmd.args
+    .map((a) => {
+      const tag = a.variadic ? `${a.name}...` : a.name;
+      return a.required ? `<${tag}>` : `[${tag}]`;
+    })
+    .join(' ');
+
+  const lines = [
+    `Usage: blink ${name}${argStr ? ' ' + argStr : ''} [options]`,
+    '',
+    cmd.description,
+  ];
+
+  if (cmd.args.length > 0) {
+    lines.push('');
+    lines.push('Arguments:');
+    const maxArgLen = Math.max(...cmd.args.map((a) => a.name.length));
+    for (const a of cmd.args) {
+      lines.push(`  ${a.name.padEnd(maxArgLen + 2)}${a.description}`);
+    }
+  }
+
+  const optNames = Object.keys(cmd.optMeta);
+  // Always include --help in per-command help
+  if (optNames.length > 0 || true) {
+    lines.push('');
+    lines.push('Options:');
+    const entries = [];
+    for (const oName of optNames) {
+      const conf = cmd.options[oName] || {};
+      const meta = cmd.optMeta[oName];
+      let flag = `--${oName}`;
+      if (conf.short) flag = `-${conf.short}, ${flag}`;
+      if (meta.valueName) flag += ` <${meta.valueName}>`;
+      let desc = meta.description;
+      if (conf.default !== undefined && conf.default !== false) desc += ` (default: ${conf.default})`;
+      entries.push([flag, desc]);
+    }
+    entries.push(['--help, -h', 'Show this help message']);
+    const maxFlagLen = Math.max(...entries.map(([f]) => f.length));
+    for (const [flag, desc] of entries) {
+      lines.push(`  ${flag.padEnd(maxFlagLen + 2)}${desc}`);
+    }
+  }
+
+  if (cmd.examples.length > 0) {
+    lines.push('');
+    lines.push('Examples:');
+    for (const ex of cmd.examples) {
+      lines.push(`  ${ex}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+// ── Main dispatch ────────────────────────────────────────────────────────────
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+
+  // Global flags: --help / -h / --version / -V with no command
+  if (rawArgs.length === 0 || rawArgs[0] === '--help' || rawArgs[0] === '-h') {
+    console.log(formatMainHelp());
+    return;
+  }
+  if (rawArgs[0] === '--version' || rawArgs[0] === '-V') {
+    console.log(VERSION);
+    return;
+  }
+
+  const cmdName = rawArgs[0];
+  const cmd = commands[cmdName];
+
+  if (!cmd) {
+    console.error(`Error: unknown command '${cmdName}'.`);
+    console.error('(run with --help for usage)');
+    process.exit(1);
+  }
+
+  const cmdArgs = rawArgs.slice(1);
+
+  // Per-command --help / -h
+  if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
+    console.log(formatCommandHelp(cmdName, cmd));
+    return;
+  }
+
+  // Build parseArgs config — include --help so strict mode doesn't reject it
+  const parseConfig = {
+    args: cmdArgs,
+    options: { ...cmd.options, help: { type: 'boolean', short: 'h' } },
+    allowPositionals: true,
+    allowNegative: true,
+    strict: true,
+  };
+
+  let parsed;
+  try {
+    parsed = parseArgs(parseConfig);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    console.error('(run with --help for usage)');
+    process.exit(1);
+  }
+
+  const { values, positionals } = parsed;
+
+  // Validate required positional arguments and apply coercions
+  const requiredArgs = cmd.args.filter((a) => a.required);
+  const hasVariadic = cmd.args.some((a) => a.variadic);
+
+  if (positionals.length < requiredArgs.length) {
+    const missing = requiredArgs[positionals.length];
+    console.error(`Error: missing required argument '${missing.name}'.`);
+    console.error('(run with --help for usage)');
+    process.exit(1);
+  }
+
+  if (!hasVariadic && positionals.length > cmd.args.length) {
+    console.error(`Error: too many arguments. Expected ${cmd.args.length}, got ${positionals.length}.`);
+    console.error('(run with --help for usage)');
+    process.exit(1);
+  }
+
+  // Apply coercions to positional args
+  const coerced = [...positionals];
+  for (let i = 0; i < cmd.args.length && i < coerced.length; i++) {
+    if (cmd.args[i].coerce) {
+      coerced[i] = cmd.args[i].coerce(coerced[i], cmd.args[i].name);
+    }
+  }
+
+  await cmd.action(coerced, values);
+}
+
+main().catch(handleError);
