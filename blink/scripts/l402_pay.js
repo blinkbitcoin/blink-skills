@@ -434,7 +434,9 @@ async function main() {
   const domain = extractDomain(canonicalUrl);
 
   // ── Check token store first ──
-  if (!args.noStore && !args.force) {
+  // Skip cache on --dry-run: dry-run must always probe the server fresh so it
+  // can report the current invoice price, even if a cached token exists.
+  if (!args.noStore && !args.force && !args.dryRun) {
     const cached = getToken(domain);
     if (cached) {
       console.error(`Using cached L402 token for ${domain} (paid ${cached.satoshis ?? '?'} sats previously).`);

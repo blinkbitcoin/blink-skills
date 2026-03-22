@@ -90,14 +90,14 @@ commands['pay-invoice'] = {
   description: 'Pay a BOLT-11 Lightning invoice',
   args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
   options: {
-    wallet:    { type: 'string', short: 'w', default: 'BTC' },
+    wallet: { type: 'string', short: 'w', default: 'BTC' },
     'dry-run': { type: 'boolean', default: false },
-    force:     { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
   },
   optMeta: {
-    wallet:    { description: 'Wallet to pay from', valueName: 'currency' },
+    wallet: { description: 'Wallet to pay from', valueName: 'currency' },
     'dry-run': { description: 'Show what would be sent without executing the payment' },
-    force:     { description: 'Skip balance sufficiency check' },
+    force: { description: 'Skip balance sufficiency check' },
   },
   examples: [
     'blink pay-invoice lnbc10u1p...',
@@ -121,15 +121,15 @@ commands['pay-lnaddress'] = {
     { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
   ],
   options: {
-    wallet:       { type: 'string', short: 'w', default: 'BTC' },
-    'dry-run':    { type: 'boolean', default: false },
-    force:        { type: 'boolean', default: false },
+    wallet: { type: 'string', short: 'w', default: 'BTC' },
+    'dry-run': { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
     'max-amount': { type: 'string' },
   },
   optMeta: {
-    wallet:       { description: 'Wallet to pay from', valueName: 'currency' },
-    'dry-run':    { description: 'Show what would be sent without executing the payment' },
-    force:        { description: 'Skip balance sufficiency check' },
+    wallet: { description: 'Wallet to pay from', valueName: 'currency' },
+    'dry-run': { description: 'Show what would be sent without executing the payment' },
+    force: { description: 'Skip balance sufficiency check' },
     'max-amount': { description: 'Reject if amount exceeds this threshold (sats)', valueName: 'sats' },
   },
   examples: [
@@ -160,21 +160,18 @@ commands['pay-lnurl'] = {
     { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
   ],
   options: {
-    wallet:       { type: 'string', short: 'w', default: 'BTC' },
-    'dry-run':    { type: 'boolean', default: false },
-    force:        { type: 'boolean', default: false },
+    wallet: { type: 'string', short: 'w', default: 'BTC' },
+    'dry-run': { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
     'max-amount': { type: 'string' },
   },
   optMeta: {
-    wallet:       { description: 'Wallet to pay from', valueName: 'currency' },
-    'dry-run':    { description: 'Show what would be sent without executing the payment' },
-    force:        { description: 'Skip balance sufficiency check' },
+    wallet: { description: 'Wallet to pay from', valueName: 'currency' },
+    'dry-run': { description: 'Show what would be sent without executing the payment' },
+    force: { description: 'Skip balance sufficiency check' },
     'max-amount': { description: 'Reject if amount exceeds this threshold (sats)', valueName: 'sats' },
   },
-  examples: [
-    'blink pay-lnurl lnurl1dp68... 5000',
-    'blink pay-lnurl lnurl1dp68... 5000 --wallet USD',
-  ],
+  examples: ['blink pay-lnurl lnurl1dp68... 5000', 'blink pay-lnurl lnurl1dp68... 5000 --wallet USD'],
   action: async (pos, opts) => {
     const amount = pos[1];
     const maxAmount = opts['max-amount'] != null ? parseSats(opts['max-amount'], '--max-amount') : undefined;
@@ -198,11 +195,11 @@ commands['create-invoice'] = {
     { name: 'memo', required: false, variadic: true, description: 'Optional memo text' },
   ],
   options: {
-    timeout:   { type: 'string', default: '300' },
+    timeout: { type: 'string', default: '300' },
     subscribe: { type: 'boolean', default: true },
   },
   optMeta: {
-    timeout:   { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    timeout: { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
     subscribe: { description: 'Auto-subscribe for payment status (use --no-subscribe to skip)' },
   },
   examples: [
@@ -231,11 +228,11 @@ commands['create-invoice-usd'] = {
     { name: 'memo', required: false, variadic: true, description: 'Optional memo text' },
   ],
   options: {
-    timeout:   { type: 'string', default: '300' },
+    timeout: { type: 'string', default: '300' },
     subscribe: { type: 'boolean', default: true },
   },
   optMeta: {
-    timeout:   { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    timeout: { description: 'Subscription timeout in seconds (0 = no timeout)', valueName: 'seconds' },
     subscribe: { description: 'Auto-subscribe for payment status (use --no-subscribe to skip)' },
   },
   examples: [
@@ -258,7 +255,9 @@ commands['create-invoice-usd'] = {
 
 commands['check-invoice'] = {
   description: 'Check payment status of a Lightning invoice by payment hash',
-  args: [{ name: 'payment_hash', required: true, description: 'Payment hash (64-char hex string from create-invoice)' }],
+  args: [
+    { name: 'payment_hash', required: true, description: 'Payment hash (64-char hex string from create-invoice)' },
+  ],
   options: {},
   optMeta: {},
   examples: ['blink check-invoice abc123def456...'],
@@ -278,10 +277,7 @@ commands['fee-probe'] = {
   optMeta: {
     wallet: { description: 'Wallet to probe from', valueName: 'currency' },
   },
-  examples: [
-    'blink fee-probe lnbc10u1p...',
-    'blink fee-probe lnbc10u1p... --wallet USD',
-  ],
+  examples: ['blink fee-probe lnbc10u1p...', 'blink fee-probe lnbc10u1p... --wallet USD'],
   action: async (pos, opts) => {
     setProcessArgv([pos[0], '--wallet', opts.wallet]);
     const { main } = require(path.join(scriptsDir, 'fee_probe.js'));
@@ -306,13 +302,13 @@ commands.transactions = {
   description: 'List recent wallet transactions with pagination',
   args: [],
   options: {
-    first:  { type: 'string', default: '20' },
-    after:  { type: 'string' },
+    first: { type: 'string', default: '20' },
+    after: { type: 'string' },
     wallet: { type: 'string', short: 'w' },
   },
   optMeta: {
-    first:  { description: 'Number of transactions to return (1-100)', valueName: 'n' },
-    after:  { description: 'Pagination cursor from a previous response', valueName: 'cursor' },
+    first: { description: 'Number of transactions to return (1-100)', valueName: 'n' },
+    after: { description: 'Pagination cursor from a previous response', valueName: 'cursor' },
     wallet: { description: 'Filter to BTC or USD wallet', valueName: 'currency' },
   },
   examples: [
@@ -337,16 +333,19 @@ commands.price = {
   description: 'BTC/USD price, currency conversion, and price history (no API key required)',
   args: [{ name: 'amount_sats', required: false, description: 'Convert this many sats to USD' }],
   options: {
-    usd:        { type: 'string' },
-    history:    { type: 'string' },
+    usd: { type: 'string' },
+    history: { type: 'string' },
     currencies: { type: 'boolean', default: false },
-    raw:        { type: 'boolean', default: false },
+    raw: { type: 'boolean', default: false },
   },
   optMeta: {
-    usd:        { description: 'Convert USD amount to sats', valueName: 'amount' },
-    history:    { description: 'Show historical prices (ONE_DAY, ONE_WEEK, ONE_MONTH, ONE_YEAR, FIVE_YEARS)', valueName: 'range' },
+    usd: { description: 'Convert USD amount to sats', valueName: 'amount' },
+    history: {
+      description: 'Show historical prices (ONE_DAY, ONE_WEEK, ONE_MONTH, ONE_YEAR, FIVE_YEARS)',
+      valueName: 'range',
+    },
     currencies: { description: 'List all supported display currencies' },
-    raw:        { description: 'Include raw realtimePrice data' },
+    raw: { description: 'Include raw realtimePrice data' },
   },
   examples: [
     'blink price                    # Current BTC/USD price',
@@ -395,10 +394,7 @@ commands['subscribe-invoice'] = {
   optMeta: {
     timeout: { description: 'Timeout in seconds (0 = no timeout)', valueName: 'seconds' },
   },
-  examples: [
-    'blink subscribe-invoice lnbc10u1p...',
-    'blink subscribe-invoice lnbc10u1p... --timeout 60',
-  ],
+  examples: ['blink subscribe-invoice lnbc10u1p...', 'blink subscribe-invoice lnbc10u1p... --timeout 60'],
   action: (pos, opts) => {
     const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
     const argv = [pos[0]];
@@ -414,17 +410,13 @@ commands['subscribe-updates'] = {
   args: [],
   options: {
     timeout: { type: 'string', default: '0' },
-    max:     { type: 'string', default: '0' },
+    max: { type: 'string', default: '0' },
   },
   optMeta: {
     timeout: { description: 'Timeout in seconds (0 = no timeout)', valueName: 'seconds' },
-    max:     { description: 'Stop after this many events (0 = unlimited)', valueName: 'count' },
+    max: { description: 'Stop after this many events (0 = unlimited)', valueName: 'count' },
   },
-  examples: [
-    'blink subscribe-updates',
-    'blink subscribe-updates --timeout 60',
-    'blink subscribe-updates --max 5',
-  ],
+  examples: ['blink subscribe-updates', 'blink subscribe-updates --timeout 60', 'blink subscribe-updates --max 5'],
   action: (pos, opts) => {
     const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
     const max = parseNonNegativeInt(opts.max, '--max');
@@ -440,18 +432,22 @@ commands['subscribe-updates'] = {
 commands['swap-quote'] = {
   description: 'Get a BTC <-> USD conversion quote (no funds moved)',
   args: [
-    { name: 'direction', required: true, description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)' },
+    {
+      name: 'direction',
+      required: true,
+      description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)',
+    },
     { name: 'amount', required: true, description: 'Amount to swap (positive integer)', coerce: parsePositiveInt },
   ],
   options: {
-    unit:           { type: 'string' },
-    'ttl-seconds':  { type: 'string', default: '60' },
-    immediate:      { type: 'boolean', default: false },
+    unit: { type: 'string' },
+    'ttl-seconds': { type: 'string', default: '60' },
+    immediate: { type: 'boolean', default: false },
   },
   optMeta: {
-    unit:           { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
-    'ttl-seconds':  { description: 'Quote TTL in seconds', valueName: 'seconds' },
-    immediate:      { description: 'Flag the quote for immediate execution' },
+    unit: { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
+    'ttl-seconds': { description: 'Quote TTL in seconds', valueName: 'seconds' },
+    immediate: { description: 'Flag the quote for immediate execution' },
   },
   examples: [
     'blink swap-quote btc-to-usd 1000',
@@ -473,22 +469,26 @@ commands['swap-quote'] = {
 commands['swap-execute'] = {
   description: 'Execute a BTC <-> USD wallet conversion (CAUTION: moves real funds without --dry-run)',
   args: [
-    { name: 'direction', required: true, description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)' },
+    {
+      name: 'direction',
+      required: true,
+      description: 'Swap direction: btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc)',
+    },
     { name: 'amount', required: true, description: 'Amount to swap (positive integer)', coerce: parsePositiveInt },
   ],
   options: {
-    unit:           { type: 'string' },
-    'dry-run':      { type: 'boolean', default: false },
-    memo:           { type: 'string' },
-    'ttl-seconds':  { type: 'string', default: '60' },
-    immediate:      { type: 'boolean', default: false },
+    unit: { type: 'string' },
+    'dry-run': { type: 'boolean', default: false },
+    memo: { type: 'string' },
+    'ttl-seconds': { type: 'string', default: '60' },
+    immediate: { type: 'boolean', default: false },
   },
   optMeta: {
-    unit:           { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
-    'dry-run':      { description: 'Show what would be swapped without executing' },
-    memo:           { description: 'Optional memo attached to the transaction', valueName: 'text' },
-    'ttl-seconds':  { description: 'Quote TTL in seconds', valueName: 'seconds' },
-    immediate:      { description: 'Flag the quote for immediate execution' },
+    unit: { description: 'Amount unit: sats or cents (default depends on direction)', valueName: 'unit' },
+    'dry-run': { description: 'Show what would be swapped without executing' },
+    memo: { description: 'Optional memo attached to the transaction', valueName: 'text' },
+    'ttl-seconds': { description: 'Quote TTL in seconds', valueName: 'seconds' },
+    immediate: { description: 'Flag the quote for immediate execution' },
   },
   examples: [
     'blink swap-execute btc-to-usd 2000',
@@ -507,6 +507,112 @@ commands['swap-execute'] = {
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'swap_execute.js'));
     await main();
+  },
+};
+
+commands['l402-discover'] = {
+  description: 'Probe a URL for L402 payment requirements (no payment made)',
+  args: [{ name: 'url', required: true, description: 'URL to probe for L402 challenge' }],
+  options: {
+    method: { type: 'string', default: 'GET' },
+    header: { type: 'string', multiple: true },
+  },
+  optMeta: {
+    method: { description: 'HTTP method (GET or POST)', valueName: 'method' },
+    header: { description: 'Extra request header in key:value format (repeatable)', valueName: 'key:value' },
+  },
+  examples: [
+    'blink l402-discover https://api.example.com/resource',
+    'blink l402-discover https://api.example.com/resource --method POST',
+    'blink l402-discover https://api.example.com/resource --header "Accept:application/json"',
+  ],
+  action: async (pos, opts) => {
+    const argv = [pos[0], '--method', opts.method];
+    if (opts.header) {
+      const headers = Array.isArray(opts.header) ? opts.header : [opts.header];
+      for (const h of headers) argv.push('--header', h);
+    }
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'l402_discover.js'));
+    await main();
+  },
+};
+
+commands['l402-pay'] = {
+  description: 'Fetch an L402-gated resource, paying automatically via Blink if required',
+  args: [{ name: 'url', required: true, description: 'URL to access' }],
+  options: {
+    wallet: { type: 'string', short: 'w', default: 'BTC' },
+    'max-amount': { type: 'string' },
+    'dry-run': { type: 'boolean', default: false },
+    method: { type: 'string', default: 'GET' },
+    header: { type: 'string', multiple: true },
+    body: { type: 'string' },
+    'no-store': { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
+    probe: { type: 'boolean', default: false },
+  },
+  optMeta: {
+    wallet: { description: 'Wallet to pay from', valueName: 'currency' },
+    'max-amount': { description: 'Refuse to pay more than N sats', valueName: 'sats' },
+    'dry-run': { description: 'Discover price without paying (always bypasses cache)' },
+    method: { description: 'HTTP method (default: GET)', valueName: 'method' },
+    header: { description: 'Extra request header in key:value format (repeatable)', valueName: 'key:value' },
+    body: { description: 'Request body for POST/PUT', valueName: 'string' },
+    'no-store': { description: 'Disable token cache for this request' },
+    force: { description: 'Pay fresh even if a valid cached token exists' },
+    probe: { description: 'Run fee probe before paying; adds feeProbe field to output' },
+  },
+  examples: [
+    'blink l402-pay https://api.example.com/resource --dry-run',
+    'blink l402-pay https://api.example.com/resource --max-amount 500',
+    'blink l402-pay https://api.example.com/resource --max-amount 500 --probe',
+    'blink l402-pay https://api.example.com/resource --force',
+  ],
+  action: async (pos, opts) => {
+    const argv = [pos[0], '--wallet', opts.wallet];
+    if (opts['max-amount']) argv.push('--max-amount', opts['max-amount']);
+    if (opts['dry-run']) argv.push('--dry-run');
+    if (opts.method !== 'GET') argv.push('--method', opts.method);
+    if (opts.header) {
+      const headers = Array.isArray(opts.header) ? opts.header : [opts.header];
+      for (const h of headers) argv.push('--header', h);
+    }
+    if (opts.body) argv.push('--body', opts.body);
+    if (opts['no-store']) argv.push('--no-store');
+    if (opts.force) argv.push('--force');
+    if (opts.probe) argv.push('--probe');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'l402_pay.js'));
+    await main();
+  },
+};
+
+commands['l402-store'] = {
+  description: 'Manage the L402 token cache (~/.blink/l402-tokens.json)',
+  args: [
+    { name: 'subcommand', required: true, description: 'list | get | clear' },
+    { name: 'domain', required: false, description: 'Domain for get subcommand' },
+  ],
+  options: {
+    expired: { type: 'boolean', default: false },
+  },
+  optMeta: {
+    expired: { description: 'With clear: remove only expired tokens' },
+  },
+  examples: [
+    'blink l402-store list',
+    'blink l402-store get satring.com',
+    'blink l402-store clear',
+    'blink l402-store clear --expired',
+  ],
+  action: async (pos, opts) => {
+    const argv = [pos[0]];
+    if (pos[1]) argv.push(pos[1]);
+    if (opts.expired) argv.push('--expired');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'l402_store.js'));
+    main();
   },
 };
 
@@ -544,11 +650,7 @@ function formatCommandHelp(name, cmd) {
     })
     .join(' ');
 
-  const lines = [
-    `Usage: blink ${name}${argStr ? ' ' + argStr : ''} [options]`,
-    '',
-    cmd.description,
-  ];
+  const lines = [`Usage: blink ${name}${argStr ? ' ' + argStr : ''} [options]`, '', cmd.description];
 
   if (cmd.args.length > 0) {
     lines.push('');

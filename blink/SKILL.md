@@ -1,13 +1,13 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.4.3
+version: 1.4.4
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
     project: blink
     identifier: blink
-    version: '1.4.3'
+    version: '1.4.4'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -875,7 +875,7 @@ Makes an HTTP request. If the server returns 402, automatically parses the chall
 - `url` — URL to access (required)
 - `--wallet BTC|USD` — wallet to pay from (default: BTC)
 - `--max-amount <sats>` — refuse to pay more than N sats (safety limit)
-- `--dry-run` — discover price without paying
+- `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists
 - `--method GET|POST|PUT|DELETE|PATCH` — HTTP method (default: GET)
 - `--header key:value` — extra request header (repeatable)
 - `--body <string>` — request body for POST/PUT

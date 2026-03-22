@@ -498,6 +498,99 @@ describe('l402_pay dry-run flow', () => {
     assert.equal(out.withinBudget, true);
     assert.equal(out.satoshis, 10); // 100n = 10 sats
   });
+
+  it('--dry-run bypasses token cache and emits l402_dry_run even when cached token exists', async () => {
+    // Seed a real cached token into ~/.blink/l402-tokens.json so that the
+    // cache lookup would normally short-circuit and return l402_paid immediately.
+    const storeDir = path.join(os.homedir(), '.blink');
+    const storeFile = path.join(storeDir, 'l402-tokens.json');
+    fs.mkdirSync(storeDir, { recursive: true });
+    const previousStore = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : null;
+    const cachedEntry = {
+      macaroon: 'CACHED_MAC==',
+      preimage: 'cachedpreimage',
+      satoshis: 42,
+      expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+    };
+    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com': cachedEntry }));
+
+    try {
+      // Mock: server still returns 402 (dry-run should reach this, not the cache)
+      global.fetch = async (_url, _opts) => ({
+        status: 402,
+        headers: {
+          get: (name) => {
+            if (name.toLowerCase() === 'www-authenticate') {
+              return 'L402 macaroon="FRESH_MAC==", invoice="lnbc100n1p0nocache"';
+            }
+            return null;
+          },
+        },
+        text: async () => '',
+      });
+
+      process.argv = ['node', 'l402_pay.js', 'https://api.example.com/resource', '--dry-run'];
+      const { main } = require(payPath);
+      await main();
+
+      const out = JSON.parse(stdoutLines.join('\n'));
+      // Must be l402_dry_run, not l402_paid (which would mean the cache was used)
+      assert.equal(out.event, 'l402_dry_run', '--dry-run must bypass cache and report fresh invoice');
+      assert.equal(out.invoice, 'lnbc100n1p0nocache');
+    } finally {
+      // Restore store to previous state
+      if (previousStore === null) {
+        fs.unlinkSync(storeFile);
+      } else {
+        fs.writeFileSync(storeFile, previousStore);
+      }
+    }
+  });
+
+  it('without --dry-run, cached token is reused and emits l402_paid with tokenReused: true', async () => {
+    // Confirm the cache-reuse path still works correctly (regression guard)
+    const storeDir = path.join(os.homedir(), '.blink');
+    const storeFile = path.join(storeDir, 'l402-tokens.json');
+    fs.mkdirSync(storeDir, { recursive: true });
+    const previousStore = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : null;
+    const cachedEntry = {
+      macaroon: 'REUSE_MAC==',
+      preimage: 'reusepreimage',
+      satoshis: 99,
+      expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+    };
+    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com': cachedEntry }));
+
+    try {
+      // Mock: server returns 200 when Authorization header is present (cache reuse)
+      global.fetch = async (_url, opts) => {
+        if (opts && opts.headers && opts.headers.Authorization) {
+          return {
+            status: 200,
+            headers: { get: () => null },
+            text: async () => JSON.stringify({ result: 'cached-ok' }),
+          };
+        }
+        // Should not be reached — cache should short-circuit before any 402
+        return { status: 402, headers: { get: () => null }, text: async () => '' };
+      };
+
+      process.argv = ['node', 'l402_pay.js', 'https://api.example.com/resource'];
+      const { main } = require(payPath);
+      await main();
+
+      const out = JSON.parse(stdoutLines.join('\n'));
+      assert.equal(out.event, 'l402_paid');
+      assert.equal(out.tokenReused, true);
+      assert.equal(out.satoshis, 99);
+    } finally {
+      if (previousStore === null) {
+        fs.unlinkSync(storeFile);
+      } else {
+        fs.writeFileSync(storeFile, previousStore);
+      }
+    }
+  });
 });
 
 // ── fetchPreimageByPaymentHash (l402_pay.js) ──────────────────────────────────
