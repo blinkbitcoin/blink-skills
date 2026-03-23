@@ -84,8 +84,8 @@ const PAY_INVOICE_MUTATION = `
   }
 `;
 
-// Query to retrieve preimage by payment hash (Option B fallback).
-// Used when lnInvoicePaymentSend does not return settlementVia inline (blinkbitcoin/blink#506).
+// Query to retrieve preimage by payment hash (fallback).
+// Used when the mutation response does not include settlementVia (e.g. race condition, network issue).
 const TRANSACTIONS_BY_HASH_QUERY = `
   query TransactionsForPreimage($first: Int, $walletIds: [WalletId]) {
     me {
@@ -368,8 +368,9 @@ async function resolveL402Challenge(res) {
 /**
  * Attempt to retrieve the real payment preimage from the Blink transactions list.
  *
- * This is Option B from blinkbitcoin/blink#506: a second GraphQL query after
- * payment, matching by paymentHash from lnInvoicePaymentSend's transaction.
+ * This is the fallback path: a second GraphQL query after payment, matching
+ * by paymentHash from lnInvoicePaymentSend's transaction. Used when the
+ * inline preimage from the mutation response is unavailable.
  *
  * Returns the preimage hex string if found, or null if not available yet.
  *
@@ -647,10 +648,10 @@ async function main() {
   console.error(`Payment ${payResult.status === 'ALREADY_PAID' ? 'already paid' : 'successful'}!`);
 
   // ── Resolve preimage ──
-  // Option A (ideal): preImage returned inline via settlementVia in the mutation response.
-  //   Requires blinkbitcoin/blink#506 to be merged.
-  // Option B (interim): second query to transactions, match by paymentHash.
-  // Fallback: SHA-256(invoice) placeholder — works with non-strict servers only.
+  // Option A (primary): preImage returned inline via settlementVia in the mutation response.
+  // Option B (fallback): second query to transactions, match by paymentHash.
+  //   Covers edge cases where inline resolution is unavailable (race condition, network issue).
+  // Option C (last resort): SHA-256(invoice) placeholder — works with non-strict servers only.
   let preimage = payResult.transaction?.settlementVia?.preImage ?? null;
   const paymentHash = payResult.transaction?.initiationVia?.paymentHash ?? null;
 

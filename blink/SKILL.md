@@ -1,13 +1,13 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.4.5
+version: 1.4.6
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
     project: blink
     identifier: blink
-    version: '1.4.5'
+    version: '1.4.6'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -992,7 +992,7 @@ Token cache location: `~/.blink/l402-tokens.json`
 
 - **RC file reading:** If `BLINK_API_KEY` is not found in `process.env`, the client scans `~/.profile`, `~/.bashrc`, `~/.bash_profile`, and `~/.zshrc` for a line matching `export BLINK_API_KEY=...`. Only the value of that specific export is extracted — no other data is read from these files. The environment variable is always checked first.
 - **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
-- **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimage placeholders for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
+- **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimages for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
 
 ### Stateless Design
 
@@ -1004,7 +1004,7 @@ Most scripts are stateless. The exception is `l402-pay`, which maintains a token
 - **Test on staging first** — use `BLINK_API_URL=https://api.staging.blink.sv/graphql` to point at the signet staging environment with test funds.
 - **USD invoices expire fast** — ~5 minutes due to exchange rate lock.
 - **Price queries are public** — `blink price` works without an API key; only wallet operations require authentication.
-- **L402 preimage resolution** — After payment, `l402-pay` first checks if the mutation response returns the preimage inline (requires [blinkbitcoin/blink#506](https://github.com/blinkbitcoin/blink/issues/506)). If not, it fetches the preimage via a follow-up `transactions` query matched by payment hash (Option B). If the transaction is not yet indexed, it falls back to a SHA-256(invoice) placeholder, which works with servers using token-based verification but may fail with servers that cryptographically verify the preimage against the payment hash.
+- **L402 preimage resolution** — After payment, `l402-pay` retrieves the preimage inline from the mutation response (`settlementVia.preImage`). If the inline preimage is unavailable (e.g. race condition or network issue), it falls back to a `transactions` query matched by payment hash. If the transaction is not yet indexed, it falls back to a SHA-256(invoice) placeholder, which works with servers using token-based verification but may fail with servers that cryptographically verify the preimage against the payment hash.
 
 ## Reference Files
 
