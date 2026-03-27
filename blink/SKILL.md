@@ -1,7 +1,7 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.5.0
+version: 1.5.1
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
@@ -864,6 +864,11 @@ Probes a URL for L402 payment requirements without paying. Returns the detected 
 
 **No API key required for discovery.**
 
+Known public L402 endpoints for testing:
+
+- `https://satring.com` — Lightning-gated service (Lightning Labs format)
+- `https://l402.services` — L402 demo service
+
 ### Pay for an L402-Gated Resource
 
 ```bash
@@ -981,6 +986,8 @@ Two-step workflow:
 1. When a client requests a resource, call `blink l402-challenge` to create a signed payment challenge and return it with HTTP 402.
 2. When the client submits a payment token, call `blink l402-verify` to verify the preimage and macaroon signature.
 
+> **Note:** End-to-end round-trip testing (challenge → pay → verify) requires **two separate Blink accounts**. Blink does not allow paying your own invoice (CANT_PAY_SELF). Use a second account or wallet to pay the challenge invoice during testing.
+
 ### Create an L402 Challenge
 
 ```bash
@@ -1024,6 +1031,8 @@ Verifies a client-submitted L402 `Authorization` token. Performs three layers of
 - `--check-api` — additionally query the Blink API to confirm PAID status (belt-and-suspenders)
 
 Exit code `0` when `valid: true`, exit code `1` when `valid: false` or on error.
+
+> **Note:** The `--preimage` value must be a 64-character hex string (32 bytes). Passing a plain string like `fake_preimage` will produce an error explaining the format requirement. For testing rejection, use a valid-format but wrong preimage: 64 zeros (`0000...0000`).
 
 ### L402 Producer Output Examples
 

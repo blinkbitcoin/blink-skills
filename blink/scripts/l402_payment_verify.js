@@ -140,7 +140,12 @@ function parseCliArgs(argv) {
   }
 
   if (!/^[0-9a-fA-F]{64}$/.test(preimage)) {
-    throw new Error('--preimage must be a 64-character hex string.');
+    const hint =
+      preimage.length !== 64 ? `got ${preimage.length} characters, need exactly 64` : 'contains non-hex characters';
+    throw new Error(
+      `--preimage must be a 64-character hex string (${hint}). ` +
+        `Example: blink l402-verify --token <macaroon>:<64-char-hex-preimage>`,
+    );
   }
 
   return {

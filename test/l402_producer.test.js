@@ -635,6 +635,41 @@ describe('l402_payment_verify — parseCliArgs', () => {
     assert.throws(() => verifyModule.parseCliArgs(['--macaroon', 'mac', '--preimage', 'tooshort']), /64-character hex/);
   });
 
+  it('error message includes character count when preimage is too short', () => {
+    let thrown;
+    try {
+      verifyModule.parseCliArgs(['--macaroon', 'mac', '--preimage', 'deadbeef']);
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown, 'should throw');
+    assert.match(thrown.message, /8 characters/);
+    assert.match(thrown.message, /need exactly 64/);
+  });
+
+  it('error message mentions non-hex when preimage has right length but wrong chars', () => {
+    const nonHex = 'z'.repeat(64);
+    let thrown;
+    try {
+      verifyModule.parseCliArgs(['--macaroon', 'mac', '--preimage', nonHex]);
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown, 'should throw');
+    assert.match(thrown.message, /non-hex/);
+  });
+
+  it('error message includes usage example hint', () => {
+    let thrown;
+    try {
+      verifyModule.parseCliArgs(['--macaroon', 'mac', '--preimage', 'tooshort']);
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown, 'should throw');
+    assert.match(thrown.message, /blink l402-verify/);
+  });
+
   it('parses --resource and --check-api flags', () => {
     const preimage = 'd'.repeat(64);
     const args = verifyModule.parseCliArgs([

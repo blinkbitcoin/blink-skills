@@ -61,14 +61,20 @@ function setupTestEnv() {
   let stdoutLines = [];
   let stderrLines = [];
 
-  console.log = (...args) => { stdoutLines.push(args.join(' ')); };
-  console.error = (...args) => { stderrLines.push(args.join(' ')); };
+  console.log = (...args) => {
+    stdoutLines.push(args.join(' '));
+  };
+  console.error = (...args) => {
+    stderrLines.push(args.join(' '));
+  };
 
   return {
     getStdout: () => stdoutLines.join('\n'),
     getStdoutJson: () => JSON.parse(stdoutLines.join('\n')),
     getStderr: () => stderrLines.join('\n'),
-    setFetch: (mockFn) => { global.fetch = mockFn; },
+    setFetch: (mockFn) => {
+      global.fetch = mockFn;
+    },
     restore: () => {
       process.env = originalEnv;
       process.argv = originalArgv;
@@ -119,8 +125,12 @@ const LOW_BTC_WALLETS_DATA = {
 describe('pay_invoice', () => {
   let env;
 
-  beforeEach(() => { env = setupTestEnv(); });
-  afterEach(() => { env.restore(); });
+  beforeEach(() => {
+    env = setupTestEnv();
+  });
+  afterEach(() => {
+    env.restore();
+  });
 
   it('--dry-run outputs JSON with dryRun: true and does not send mutation', async () => {
     let mutationCalled = false;
@@ -132,7 +142,11 @@ describe('pay_invoice', () => {
       }
       if (body.query.includes('LnInvoicePaymentSend')) {
         mutationCalled = true;
-        return { ok: true, json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }), text: async () => '{}' };
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
       }
       throw new Error('Unexpected query');
     };
@@ -150,10 +164,12 @@ describe('pay_invoice', () => {
   });
 
   it('successful payment returns status SUCCESS', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnInvoicePaymentSend': { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnInvoicePaymentSend: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice', '--wallet', 'BTC'];
     const { main } = freshRequire('pay_invoice.js');
@@ -166,10 +182,12 @@ describe('pay_invoice', () => {
   });
 
   it('USD wallet payment includes balanceBeforeFormatted', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnInvoicePaymentSend': { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnInvoicePaymentSend: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice', '--wallet', 'USD'];
     const { main } = freshRequire('pay_invoice.js');
@@ -181,9 +199,11 @@ describe('pay_invoice', () => {
   });
 
   it('zero BTC balance without --force throws Insufficient balance', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': EMPTY_BTC_WALLETS_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': EMPTY_BTC_WALLETS_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice'];
     const { main } = freshRequire('pay_invoice.js');
@@ -191,10 +211,17 @@ describe('pay_invoice', () => {
   });
 
   it('zero BTC balance with --force proceeds to mutation', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': EMPTY_BTC_WALLETS_DATA,
-      'LnInvoicePaymentSend': { lnInvoicePaymentSend: { status: 'FAILURE', errors: [{ message: 'Insufficient balance', code: 'INSUFFICIENT_BALANCE' }] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': EMPTY_BTC_WALLETS_DATA,
+        LnInvoicePaymentSend: {
+          lnInvoicePaymentSend: {
+            status: 'FAILURE',
+            errors: [{ message: 'Insufficient balance', code: 'INSUFFICIENT_BALANCE' }],
+          },
+        },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice', '--force'];
     const { main } = freshRequire('pay_invoice.js');
@@ -203,19 +230,57 @@ describe('pay_invoice', () => {
   });
 
   it('payment errors are thrown', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnInvoicePaymentSend': {
-        lnInvoicePaymentSend: {
-          status: 'FAILURE',
-          errors: [{ message: 'Route not found', code: 'ROUTE_NOT_FOUND' }],
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnInvoicePaymentSend: {
+          lnInvoicePaymentSend: {
+            status: 'FAILURE',
+            errors: [{ message: 'Route not found', code: 'ROUTE_NOT_FOUND' }],
+          },
         },
-      },
-    }));
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice'];
     const { main } = freshRequire('pay_invoice.js');
     await assert.rejects(main, /Payment failed.*Route not found/);
+  });
+
+  it('CANT_PAY_SELF error produces a clear actionable message', async () => {
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnInvoicePaymentSend: {
+          lnInvoicePaymentSend: {
+            status: 'FAILURE',
+            errors: [{ message: 'Cannot pay yourself', code: 'CANT_PAY_SELF' }],
+          },
+        },
+      }),
+    );
+
+    process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice'];
+    const { main } = freshRequire('pay_invoice.js');
+    await assert.rejects(main, /Cannot pay your own invoice.*CANT_PAY_SELF/);
+  });
+
+  it('CANT_PAY_SELF detected by message text (lowercase "self")', async () => {
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnInvoicePaymentSend: {
+          lnInvoicePaymentSend: {
+            status: 'FAILURE',
+            errors: [{ message: 'You cannot pay yourself' }],
+          },
+        },
+      }),
+    );
+
+    process.argv = ['node', 'blink', 'lnbc100n1p0testinvoice'];
+    const { main } = freshRequire('pay_invoice.js');
+    await assert.rejects(main, /Cannot pay your own invoice.*CANT_PAY_SELF/);
   });
 });
 
@@ -224,13 +289,19 @@ describe('pay_invoice', () => {
 describe('pay_lnaddress', () => {
   let env;
 
-  beforeEach(() => { env = setupTestEnv(); });
-  afterEach(() => { env.restore(); });
+  beforeEach(() => {
+    env = setupTestEnv();
+  });
+  afterEach(() => {
+    env.restore();
+  });
 
   it('--dry-run outputs JSON with dryRun: true', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'user@blink.sv', '1000', '--wallet', 'BTC', '--dry-run'];
     const { main } = freshRequire('pay_lnaddress.js');
@@ -244,10 +315,12 @@ describe('pay_lnaddress', () => {
   });
 
   it('successful payment returns correct JSON', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnAddressPaymentSend': { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnAddressPaymentSend: { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'user@blink.sv', '1000'];
     const { main } = freshRequire('pay_lnaddress.js');
@@ -260,9 +333,11 @@ describe('pay_lnaddress', () => {
   });
 
   it('insufficient BTC balance without --force throws error', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': LOW_BTC_WALLETS_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': LOW_BTC_WALLETS_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'user@blink.sv', '1000'];
     const { main } = freshRequire('pay_lnaddress.js');
@@ -270,10 +345,12 @@ describe('pay_lnaddress', () => {
   });
 
   it('--force allows payment with insufficient balance', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': LOW_BTC_WALLETS_DATA,
-      'LnAddressPaymentSend': { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': LOW_BTC_WALLETS_DATA,
+        LnAddressPaymentSend: { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'user@blink.sv', '1000', '--force'];
     const { main } = freshRequire('pay_lnaddress.js');
@@ -292,10 +369,12 @@ describe('pay_lnaddress', () => {
 
   it('USD wallet skips balance check (cents vs sats not comparable)', async () => {
     // USD wallet with 1500 cents, sending 5000 sats — should NOT fail balance check
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnAddressPaymentSend': { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnAddressPaymentSend: { lnAddressPaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'user@blink.sv', '5000', '--wallet', 'USD'];
     const { main } = freshRequire('pay_lnaddress.js');
@@ -312,13 +391,19 @@ describe('pay_lnaddress', () => {
 describe('pay_lnurl', () => {
   let env;
 
-  beforeEach(() => { env = setupTestEnv(); });
-  afterEach(() => { env.restore(); });
+  beforeEach(() => {
+    env = setupTestEnv();
+  });
+  afterEach(() => {
+    env.restore();
+  });
 
   it('--dry-run outputs JSON with dryRun: true', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnurl1dp68gup69uhnzwfj9cknpvz', '2000', '--dry-run'];
     const { main } = freshRequire('pay_lnurl.js');
@@ -331,10 +416,12 @@ describe('pay_lnurl', () => {
   });
 
   it('successful payment returns correct JSON shape', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'LnurlPaymentSend': { lnurlPaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        LnurlPaymentSend: { lnurlPaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnurl1dp68gup69uhnzwfj9cknpvz', '2000'];
     const { main } = freshRequire('pay_lnurl.js');
@@ -348,9 +435,11 @@ describe('pay_lnurl', () => {
   });
 
   it('insufficient BTC balance without --force throws error', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': LOW_BTC_WALLETS_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': LOW_BTC_WALLETS_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnurl1dp68gup69uhnzwfj9cknpvz', '2000'];
     const { main } = freshRequire('pay_lnurl.js');
@@ -358,10 +447,12 @@ describe('pay_lnurl', () => {
   });
 
   it('--force allows payment with insufficient balance', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': LOW_BTC_WALLETS_DATA,
-      'LnurlPaymentSend': { lnurlPaymentSend: { status: 'SUCCESS', errors: [] } },
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': LOW_BTC_WALLETS_DATA,
+        LnurlPaymentSend: { lnurlPaymentSend: { status: 'SUCCESS', errors: [] } },
+      }),
+    );
 
     process.argv = ['node', 'blink', 'lnurl1dp68gup69uhnzwfj9cknpvz', '2000', '--force'];
     const { main } = freshRequire('pay_lnurl.js');
