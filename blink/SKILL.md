@@ -1,7 +1,7 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.6.1
+version: 1.7.0
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
@@ -1090,6 +1090,66 @@ WWW-Authenticate: L402 macaroon="AgEL...", invoice="lnbc100n1..."
 }
 ```
 
+## L402 Service Discovery
+
+Find L402-gated APIs that agents can pay for and access. Two directory sources:
+
+- **l402.directory** (default) — curated registry with rich endpoint schemas, pricing, and consumption instructions
+- **402index.io** — broader coverage (50+ services), simpler flat schema
+
+### Search Services
+
+```bash
+blink l402-search                              # all live services from l402.directory
+blink l402-search video                        # keyword search
+blink l402-search --category data              # filter by category
+blink l402-search --status all                 # include offline/new services
+blink l402-search --format minimal             # compact output
+blink l402-search ai --source 402index         # search 402index.io instead
+```
+
+**No API key required** — both directories have free browse APIs.
+
+> **AGENT:** Use `l402-search` to find services before using `l402-pay`. Check pricing in the results before paying.
+
+### Get Service Details
+
+```bash
+blink l402-info <service_id>                   # full details (free, l402.directory)
+blink l402-info <service_id> --report          # paid health report (10 sats via L402)
+blink l402-info <service_id> --report --force  # bypass budget/domain checks
+```
+
+- Without `--report`: free, returns endpoints, pricing, consumption instructions
+- With `--report`: 10 sats, returns uptime percentages, probe history, response times
+- `--report` is subject to budget controls and domain allowlist (domain: `l402.directory`)
+
+### Discovery Output Example
+
+```json
+{
+  "source": "l402.directory",
+  "query": "video",
+  "count": 1,
+  "services": [
+    {
+      "service_id": "71adb942293c89f6",
+      "name": "Hyperdope Video",
+      "description": "Lightning-gated video streaming...",
+      "status": "live",
+      "categories": ["video", "streaming"],
+      "endpoints": [
+        {
+          "url": "https://hyperdope.com/api/l402/videos/{hash}/master.m3u8",
+          "method": "GET",
+          "pricing": { "amount": 10, "currency": "sats", "model": "per-request" }
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## Budget Controls
 
 Prevent runaway spending in autonomous agent workflows with rolling spend limits and domain allowlist.
@@ -1220,5 +1280,7 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/_l402_macaroon.js` — Shared macaroon module: encode/decode/sign/verify + root key management
 - `{baseDir}/scripts/l402_challenge_create.js` — Create L402 payment challenges (invoice + signed macaroon)
 - `{baseDir}/scripts/l402_payment_verify.js` — Verify L402 client payment tokens (preimage + HMAC + caveats)
+- `{baseDir}/scripts/l402_search.js` — Search L402 service directories (l402.directory, 402index.io)
+- `{baseDir}/scripts/l402_info.js` — Get full L402 service details + paid health reports
 - `{baseDir}/scripts/_budget.js` — Shared budget module: config resolution, spend log, rolling limits, domain allowlist
 - `{baseDir}/scripts/budget.js` — Budget controls CLI (status, set, log, reset, allowlist)

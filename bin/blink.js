@@ -687,6 +687,67 @@ commands['l402-verify'] = {
   },
 };
 
+commands['l402-search'] = {
+  description: 'Search L402 service directories for paid APIs (l402.directory or 402index.io)',
+  args: [{ name: 'query', required: false, description: 'Keyword to search across names and descriptions' }],
+  options: {
+    source: { type: 'string', default: 'directory' },
+    category: { type: 'string' },
+    status: { type: 'string', default: 'live' },
+    format: { type: 'string', default: 'full' },
+  },
+  optMeta: {
+    source: { description: '"directory" (l402.directory, default) or "402index" (402index.io)', valueName: 'name' },
+    category: { description: 'Filter by category (e.g. video, data, ai)', valueName: 'name' },
+    status: { description: '"live" (default) or "all" (include offline)', valueName: 'filter' },
+    format: { description: '"full" (default) or "minimal" (compact)', valueName: 'mode' },
+  },
+  examples: [
+    'blink l402-search',
+    'blink l402-search video',
+    'blink l402-search --category data',
+    'blink l402-search ai --source 402index',
+    'blink l402-search --status all --format minimal',
+  ],
+  action: async (pos, opts) => {
+    const argv = [];
+    if (pos[0]) argv.push(pos[0]);
+    if (opts.source !== 'directory') argv.push('--source', opts.source);
+    if (opts.category) argv.push('--category', opts.category);
+    if (opts.status !== 'live') argv.push('--status', opts.status);
+    if (opts.format !== 'full') argv.push('--format', opts.format);
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'l402_search.js'));
+    await main();
+  },
+};
+
+commands['l402-info'] = {
+  description: 'Get full details for an L402 service from l402.directory',
+  args: [{ name: 'service_id', required: true, description: 'Service ID from l402.directory (hex string)' }],
+  options: {
+    report: { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
+  },
+  optMeta: {
+    report: { description: 'Fetch paid health report (10 sats via L402)' },
+    force: { description: 'Bypass budget and domain checks for --report' },
+  },
+  examples: [
+    'blink l402-info 71adb942293c89f6',
+    'blink l402-info 71adb942293c89f6 --report',
+    'blink l402-info 71adb942293c89f6 --report --force',
+  ],
+  action: async (pos, opts) => {
+    const argv = [pos[0]];
+    if (opts.report) argv.push('--report');
+    if (opts.force) argv.push('--force');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'l402_info.js'));
+    await main();
+  },
+};
+
 commands.budget = {
   description: 'Manage spending limits, spending log, and L402 domain allowlist',
   args: [

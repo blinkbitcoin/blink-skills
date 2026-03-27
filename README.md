@@ -2,14 +2,14 @@
 
 Bitcoin Lightning wallet for the command line — zero runtime npm dependencies, Node.js 18+ built-ins only.
 
-22 commands for wallet management, payments, invoices, swaps, L402 paywall operations (both consumer and producer), and budget controls. Designed for humans and AI agents alike.
+24 commands for wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. Designed for humans and AI agents alike.
 
 ## Highlights
 
 - **Zero runtime dependencies** — only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.)
-- **22 commands** — balance, payments, invoices, QR codes, swaps, L402 consumer + producer, budget controls
+- **24 commands** — balance, payments, invoices, QR codes, swaps, L402 consumer + producer, service discovery, budget controls
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **245 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **261 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; also works with any LLM or human
 
@@ -71,6 +71,8 @@ blink l402-verify --token <macaroon>:<preimage>        # verify a client's payme
 | `blink l402-discover <url>`     | Probe a URL for L402 payment requirements (no payment made)  |
 | `blink l402-pay <url>`          | Fetch an L402-gated resource, paying automatically via Blink |
 | `blink l402-store <subcommand>` | Manage the L402 token cache (~/.blink/l402-tokens.json)      |
+| `blink l402-search [query]`     | Search L402 service directories (l402.directory, 402index.io) |
+| `blink l402-info <service_id>`  | Get full service details + paid health reports                |
 
 ### L402 Producer (create paywalls)
 
@@ -109,7 +111,7 @@ blink balance
 
 ### OpenClaw / Hermes Agents
 
-Published on ClawHub as `blink@1.6.0`. The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
+Published on ClawHub as `blink@1.7.0`. The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
 
 ### With blink-mcp
 
@@ -135,7 +137,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 245 tests, node:test framework, zero test dependencies
+npm test    # 261 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation
