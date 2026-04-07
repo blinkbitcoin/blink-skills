@@ -559,7 +559,8 @@ describe('l402_pay dry-run flow', () => {
       satoshis: 99,
       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
     };
-    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com': cachedEntry }));
+    // Store key is domain+path (not just domain) so cache lookup matches the request URL
+    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com/resource': cachedEntry }));
 
     try {
       // Mock: server returns 200 when Authorization header is present (cache reuse)
@@ -643,7 +644,8 @@ describe('l402_pay dry-run flow', () => {
       satoshis: 100,
       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
     };
-    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com': cachedEntry }));
+    // Store key is domain+path (not just domain) so cache lookup matches the request URL
+    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com/resource': cachedEntry }));
 
     let exitCode = null;
     const originalExit = process.exit;

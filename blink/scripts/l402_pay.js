@@ -314,6 +314,26 @@ function extractDomain(url) {
   }
 }
 
+/**
+ * Build a token store key from a URL: hostname + pathname (no query/fragment).
+ *
+ * Different paths on the same domain may have different L402 challenges (e.g.
+ * different prices or resource caveats), so each path needs its own cached token.
+ *
+ * @param {string} url
+ * @returns {string}  e.g. "api.citrusrate.com/v1/btc"
+ */
+function extractStoreKey(url) {
+  try {
+    const u = new URL(url);
+    // Normalise: strip trailing slash for consistency
+    const p = u.pathname.replace(/\/+$/, '') || '';
+    return u.hostname + p;
+  } catch {
+    return url;
+  }
+}
+
 // ── L402 challenge resolution ─────────────────────────────────────────────────
 
 /**
@@ -435,6 +455,7 @@ async function main() {
   }
 
   const domain = extractDomain(canonicalUrl);
+  const storeKey = extractStoreKey(canonicalUrl);
 
   // ── Domain allowlist check (L402 only) ──
   if (!args.dryRun && !args.force) {
@@ -457,9 +478,9 @@ async function main() {
   // Skip cache on --dry-run: dry-run must always probe the server fresh so it
   // can report the current invoice price, even if a cached token exists.
   if (!args.noStore && !args.force && !args.dryRun) {
-    const cached = getToken(domain);
+    const cached = getToken(storeKey);
     if (cached) {
-      console.error(`Using cached L402 token for ${domain} (paid ${cached.satoshis ?? '?'} sats previously).`);
+      console.error(`Using cached L402 token for ${storeKey} (paid ${cached.satoshis ?? '?'} sats previously).`);
       console.error('Retrying request with cached token...');
 
       const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
@@ -706,15 +727,23 @@ async function main() {
     console.error('Preimage received inline from payment response.');
   } else if (paymentHash) {
     console.error(`Fetching preimage via transactions query (paymentHash: ${paymentHash.slice(0, 16)}…)`);
-    preimage = await fetchPreimageByPaymentHash(paymentHash, {
-      apiKey,
-      apiUrl,
-      walletId: wallet.id,
-    });
+    // Poll for up to ~5 seconds (5 attempts × 1 s delay) — the Blink API may
+    // not index the settlement immediately after the mutation returns SUCCESS.
+    for (let attempt = 1; attempt <= 5 && !preimage; attempt++) {
+      preimage = await fetchPreimageByPaymentHash(paymentHash, {
+        apiKey,
+        apiUrl,
+        walletId: wallet.id,
+      });
+      if (!preimage && attempt < 5) {
+        console.error(`Preimage not yet indexed (attempt ${attempt}/5), retrying in 1s...`);
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
     if (preimage) {
       console.error('Preimage resolved via transactions query.');
     } else {
-      console.error('Warning: preimage not yet indexed. Using placeholder (non-strict servers only).');
+      console.error('Warning: preimage not available after 5 attempts. Using placeholder (non-strict servers only).');
       preimage = derivePreimageFromInvoice(challenge.invoice);
     }
   } else {
@@ -727,13 +756,13 @@ async function main() {
   // ── Save token to store ──
   if (!args.noStore) {
     try {
-      saveToken(domain, {
+      saveToken(storeKey, {
         macaroon,
         preimage,
         invoice: challenge.invoice,
         satoshis: satoshis ?? null,
       });
-      console.error(`Token cached for ${domain}.`);
+      console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
       console.error(`Warning: could not save token to store: ${err.message}`);
     }
