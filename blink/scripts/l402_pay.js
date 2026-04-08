@@ -80,6 +80,9 @@ const PAY_INVOICE_MUTATION = `
           ... on SettlementViaLn {
             preImage
           }
+          ... on SettlementViaIntraLedger {
+            preImage
+          }
         }
       }
     }
@@ -102,6 +105,9 @@ const TRANSACTIONS_BY_HASH_QUERY = `
               }
               settlementVia {
                 ... on SettlementViaLn {
+                  preImage
+                }
+                ... on SettlementViaIntraLedger {
                   preImage
                 }
               }
