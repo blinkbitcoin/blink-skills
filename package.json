@@ -16,7 +16,7 @@
     "lint:fix": "eslint --fix blink/scripts/ bin/",
     "format": "prettier --write blink/scripts/ bin/",
     "format:check": "prettier --check blink/scripts/ bin/",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "eslint": "^9.0.0",
