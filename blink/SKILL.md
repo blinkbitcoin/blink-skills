@@ -1,7 +1,7 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.7.0
+version: 2.0.0
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
@@ -24,9 +24,9 @@ metadata:
     security:
       secrets: ['BLINK_API_KEY']
       network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions'
-      filesystem: 'reads ~/.profile, ~/.bashrc, ~/.bash_profile, ~/.zshrc to locate BLINK_API_KEY export (env var checked first); writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json'
+      filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention)'
-      notes: 'Zero npm runtime dependencies. Only Node.js built-in modules used. No global installs required — scripts run standalone via node.'
+      notes: 'Zero npm runtime dependencies. Only Node.js built-in modules used. No global installs required — scripts run standalone via node. BLINK_API_KEY is read from the environment only; shell rc files are never read.'
 ---
 
 # Blink Skill
@@ -94,14 +94,13 @@ Create a staging API key at [dashboard.staging.blink.sv](https://dashboard.stagi
 
 If `BLINK_API_URL` is not set, production (`https://api.blink.sv/graphql`) is used by default.
 
-### API key auto-detection
+### API key resolution
 
-Scripts automatically resolve `BLINK_API_KEY` using this order:
+Scripts read `BLINK_API_KEY` from the process environment only:
 
-1. `process.env.BLINK_API_KEY` (checked first)
-2. Shell rc files: `~/.profile`, `~/.bashrc`, `~/.bash_profile`, `~/.zshrc` — scanned for an `export BLINK_API_KEY=...` line only
+1. `process.env.BLINK_API_KEY`
 
-No `source ~/.profile` prefix is needed. The rc file scan uses a targeted regex that reads only the `BLINK_API_KEY` export line — no other data is extracted from these files.
+No filesystem fallback: shell rc files (`~/.bashrc`, `~/.profile`, etc.) are never read. Export the key in your shell or agent environment before running scripts.
 
 ### Optional: CLI wrapper (full GitHub repo only)
 
@@ -127,7 +126,7 @@ These rules are mandatory for any AI agent using this skill:
 6. **Never log or display the API key.** Treat `BLINK_API_KEY` as a secret. Do not echo it, include it in messages, or write it to files.
 7. **Prefer staging for testing.** When the user is testing or learning, suggest setting `BLINK_API_URL` to the staging endpoint.
 8. **Respect irreversibility.** Warn the user that Lightning payments and swaps cannot be reversed once executed.
-9. **L402 auto-pay requires confirmation.** Never call `l402-pay` without dry-running first (`--dry-run`) and confirming the satoshi amount with the user. The token cache (`~/.blink/l402-tokens.json`) means subsequent calls may reuse a paid token silently — inform the user when a cached token is used.
+9. **L402 auto-pay requires configuration and confirmation.** `l402-pay` fails closed: it refuses to pay unless an explicit spending budget (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) and a non-empty domain allowlist (`BLINK_L402_ALLOWED_DOMAINS` or `blink budget allowlist add`) are configured. It also refuses when the invoice amount cannot be decoded, since no limit can be applied to an unknown sum. Never call `l402-pay` without dry-running first (`--dry-run`) and confirming the satoshi amount with the user. The token cache (`~/.blink/l402-tokens.json`) means subsequent calls may reuse a paid token silently — inform the user when a cached token is used.
 
 ## Bitcoin Units
 
@@ -1117,7 +1116,7 @@ blink l402-search ai --source 402index         # search 402index.io instead
 ```bash
 blink l402-info <service_id>                   # full details (free, l402.directory)
 blink l402-info <service_id> --report          # paid health report (10 sats via L402)
-blink l402-info <service_id> --report --force  # bypass budget/domain checks
+blink l402-info <service_id> --report --force  # pay fresh, ignore cached token
 ```
 
 - Without `--report`: free, returns endpoints, pricing, consumption instructions
@@ -1160,11 +1159,20 @@ Env vars take precedence over the config file (`~/.blink/budget.json`):
 
 | Env var | Config file key | Default | Description |
 |---------|----------------|---------|-------------|
-| `BLINK_BUDGET_HOURLY_SATS` | `hourlyLimitSats` | none (unlimited) | Max sats in rolling 1-hour window |
-| `BLINK_BUDGET_DAILY_SATS` | `dailyLimitSats` | none (unlimited) | Max sats in rolling 24-hour window |
-| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist` | none (all allowed) | Comma-separated domains for L402 auto-pay |
+| `BLINK_BUDGET_HOURLY_SATS` | `hourlyLimitSats` | none | Max sats in rolling 1-hour window |
+| `BLINK_BUDGET_DAILY_SATS` | `dailyLimitSats` | none | Max sats in rolling 24-hour window |
+| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist` | none | Comma-separated domains for L402 auto-pay |
 
-If no env vars and no config file exist, no limits are enforced (fully backward compatible).
+**Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
+kinds of payment behave differently on purpose:
+
+- **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`.
+  You chose the recipient and amount, so these run with or without a budget. If
+  limits are configured they are enforced; if not, the payment proceeds.
+- **Autonomous L402 auto-pay** — `l402-pay`, and `l402-info --report` which
+  delegates to it. These spend without a human in the loop for each payment, so
+  they **fail closed**: with no budget configured, or an empty domain
+  allowlist, the payment is refused. Configure both before enabling auto-pay.
 
 ### Budget Commands
 
@@ -1201,8 +1209,9 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### How Budget Enforcement Works
 
 - **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`
-- **Domain allowlist:** checked for `l402-pay` only — blocks auto-pay to unlisted domains
-- **`--force` bypasses budget:** existing `--force` flag on payment commands skips budget check
+- **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
+- **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
+- **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
@@ -1227,7 +1236,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 
 ### Filesystem Access
 
-- **RC file reading:** If `BLINK_API_KEY` is not found in `process.env`, the client scans `~/.profile`, `~/.bashrc`, `~/.bash_profile`, and `~/.zshrc` for a line matching `export BLINK_API_KEY=...`. Only the value of that specific export is extracted — no other data is read from these files. The environment variable is always checked first.
+- **Credential handling:** `BLINK_API_KEY` is read from `process.env` only. Shell rc files are never read, and no credential is ever written outside the process.
 - **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
 - **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimages for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
 - **Budget files:** Budget config at `~/.blink/budget.json` and spending log at `~/.blink/spending-log.json`. The spending log is auto-pruned (entries older than 25h removed). Use `blink budget reset` to clear the log.

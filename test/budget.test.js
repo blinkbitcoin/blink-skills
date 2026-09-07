@@ -211,9 +211,35 @@ describe('checkBudget', () => {
     try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
   });
 
-  it('allows any amount when no limits set', () => {
+  it('denies when no limits are set (fail closed by default)', () => {
     const result = mod.checkBudget(999999);
+    assert.equal(result.allowed, false);
+    assert.match(result.reason, /NO_BUDGET_CONFIGURED/);
+  });
+
+  it('allows any amount when no limits set and the caller opts out', () => {
+    // Explicitly user-initiated payments (pay-invoice and friends) stay usable
+    // without any budget configuration.
+    const result = mod.checkBudget(999999, { requireConfigured: false });
     assert.equal(result.allowed, true);
+    assert.equal(result.hourlyLimit, null);
+    assert.equal(result.dailyLimit, null);
+  });
+
+  it('reports null limits and zero spend in the unconfigured denial', () => {
+    const result = mod.checkBudget(10, { requireConfigured: true });
+    assert.equal(result.allowed, false);
+    assert.equal(result.hourlySpent, 0);
+    assert.equal(result.dailySpent, 0);
+    assert.equal(result.hourlyLimit, null);
+    assert.equal(result.effectiveRemaining, null);
+  });
+
+  it('does not deny for unconfigured budget once limits exist', () => {
+    process.env.BLINK_BUDGET_HOURLY_SATS = '1000';
+    const result = mod.checkBudget(10);
+    assert.equal(result.allowed, true);
+    assert.equal(result.hourlyLimit, 1000);
   });
 
   it('allows when within hourly limit', () => {
@@ -292,9 +318,13 @@ describe('checkDomainAllowed', () => {
     delete process.env.BLINK_L402_ALLOWED_DOMAINS;
   });
 
-  it('allows all domains when allowlist is empty', () => {
+  it('denies all domains when allowlist is empty (fail closed)', () => {
     const result = mod.checkDomainAllowed('anything.com');
-    assert.equal(result.allowed, true);
+    assert.equal(result.allowed, false);
+    assert.match(result.reason, /NO_ALLOWLIST_CONFIGURED/);
+    // reporting-only callers can opt out of the configured check
+    const report = mod.checkDomainAllowed('anything.com', { requireConfigured: false });
+    assert.equal(report.allowed, true);
   });
 
   it('allows a domain in the allowlist', () => {

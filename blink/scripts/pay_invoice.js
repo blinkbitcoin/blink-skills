@@ -96,11 +96,11 @@ async function main() {
   // ── Budget check ──
   const invoiceSats = decodeBolt11AmountSats(paymentRequest);
   if (invoiceSats !== null && !force) {
-    const budgetResult = checkBudget(invoiceSats);
+    // Explicitly user-initiated payment: an unconfigured budget must not block
+    // it, so opt out of the fail-closed default that guards autonomous spending.
+    const budgetResult = checkBudget(invoiceSats, { requireConfigured: false });
     if (!budgetResult.allowed) {
-      throw new Error(
-        `Budget exceeded: ${budgetResult.reason} Use --force to override.`,
-      );
+      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
     }
   }
 
@@ -148,12 +148,20 @@ async function main() {
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
     if (invoiceSats !== null) {
-      try { recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null }); } catch { /* non-fatal */ }
+      try {
+        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+      } catch {
+        /* non-fatal */
+      }
     }
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
     if (invoiceSats !== null) {
-      try { recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null }); } catch { /* non-fatal */ }
+      try {
+        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+      } catch {
+        /* non-fatal */
+      }
     }
   } else if (result.status === 'ALREADY_PAID') {
     console.error('Invoice was already paid.');

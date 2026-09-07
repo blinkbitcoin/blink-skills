@@ -560,7 +560,7 @@ commands['l402-pay'] = {
     header: { description: 'Extra request header in key:value format (repeatable)', valueName: 'key:value' },
     body: { description: 'Request body for POST/PUT', valueName: 'string' },
     'no-store': { description: 'Disable token cache for this request' },
-    force: { description: 'Pay fresh even if a valid cached token exists' },
+    force: { description: 'Pay fresh even if a valid cached token exists (never bypasses budget/domain checks)' },
     probe: { description: 'Run fee probe before paying; adds feeProbe field to output' },
   },
   examples: [
@@ -731,7 +731,7 @@ commands['l402-info'] = {
   },
   optMeta: {
     report: { description: 'Fetch paid health report (10 sats via L402)' },
-    force: { description: 'Bypass budget and domain checks for --report' },
+    force: { description: 'Pay fresh even if a valid cached token exists (never bypasses budget/domain checks)' },
   },
   examples: [
     'blink l402-info 71adb942293c89f6',

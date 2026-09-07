@@ -85,10 +85,10 @@ function getRootKey() {
     fs.mkdirSync(path.dirname(ROOT_KEY_FILE), { recursive: true });
     fs.writeFileSync(ROOT_KEY_FILE, newKeyHex, { mode: 0o600 });
     console.error(`Warning: Generated new L402 root key and saved to ${ROOT_KEY_FILE}.`);
-    console.error(`         Set BLINK_L402_ROOT_KEY=${newKeyHex} to use it portably.`);
+    console.error(`         To use it portably, copy its value into BLINK_L402_ROOT_KEY (never log the key itself).`);
   } catch (e) {
     console.error(`Warning: Could not persist L402 root key to ${ROOT_KEY_FILE}: ${e.message}`);
-    console.error(`         Set BLINK_L402_ROOT_KEY=${newKeyHex} to reuse this key.`);
+    console.error(`         Set BLINK_L402_ROOT_KEY to a 64-char hex key to reuse this identity.`);
   }
   return newKey;
 }

@@ -12,8 +12,10 @@
  *   service_id      - Required. Service ID from l402.directory (hex string).
  *   --report        - Optional. Fetch paid health report (10 sats, L402-gated).
  *
- * The --report flag triggers an L402 payment. It is subject to budget controls
- * and domain allowlist (domain: l402.directory). Use --force to bypass.
+ * The --report flag triggers an L402 payment. It is subject to the budget
+ * controls and the domain allowlist (domain: l402.directory), both of which
+ * must be configured or the payment is refused. --force only forces a fresh
+ * payment instead of reusing a cached token; it never bypasses either control.
  *
  * No API key required for the free detail endpoint.
  * Write scope required for --report (L402 payment).
@@ -51,7 +53,8 @@ function parseCliArgs(argv) {
         '',
         'Options:',
         '  --report   Fetch paid health report (10 sats via L402)',
-        '  --force    Bypass budget and domain checks for --report',
+        '  --force    Pay fresh instead of reusing a cached token (never bypasses',
+        '             the budget or domain allowlist)',
         '  --help     Show this help',
       ].join('\n'),
     );
@@ -94,43 +97,10 @@ async function fetchServiceDetail(serviceId) {
 // ── Paid report endpoint (L402) ──────────────────────────────────────────────
 
 async function fetchServiceReport(serviceId, { force }) {
-  // Delegate to l402-pay for the L402 payment flow
-  const { checkBudget, checkDomainAllowed, recordSpend } = require('./_budget');
-
+  // Delegate to l402-pay for the L402 payment flow. Budget and domain
+  // enforcement is handled inside l402_pay (fail closed at the point of
+  // payment) — no duplicate pre-checks here.
   const reportUrl = `${DIRECTORY_BASE}/report/${serviceId}`;
-  const domain = 'l402.directory';
-
-  // Domain allowlist check
-  if (!force) {
-    const domainCheck = checkDomainAllowed(domain);
-    if (!domainCheck.allowed) {
-      const output = {
-        event: 'l402_domain_blocked',
-        url: reportUrl,
-        domain,
-        allowlist: domainCheck.allowlist,
-        message: `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
-
-  // Budget check (report costs 10 sats)
-  if (!force) {
-    const budgetResult = checkBudget(10);
-    if (!budgetResult.allowed) {
-      const output = {
-        event: 'l402_budget_exceeded',
-        url: reportUrl,
-        satoshis: 10,
-        ...budgetResult,
-        message: budgetResult.reason,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
 
   // Use l402_pay's main logic by setting up argv and calling it
   const origArgv = process.argv;

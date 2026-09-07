@@ -463,26 +463,11 @@ async function main() {
   const domain = extractDomain(canonicalUrl);
   const storeKey = extractStoreKey(canonicalUrl);
 
-  // ── Domain allowlist check (L402 only) ──
-  if (!args.dryRun && !args.force) {
-    const domainCheck = checkDomainAllowed(domain);
-    if (!domainCheck.allowed) {
-      const output = {
-        event: 'l402_domain_blocked',
-        url: args.url,
-        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        domain,
-        allowlist: domainCheck.allowlist,
-        message: `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
-
   // ── Check token store first ──
   // Skip cache on --dry-run: dry-run must always probe the server fresh so it
   // can report the current invoice price, even if a cached token exists.
+  // NOTE: budget/domain enforcement happens later, only when a payment is
+  // actually required — free (HTTP 200) resources work without configuration.
   if (!args.noStore && !args.force && !args.dryRun) {
     const cached = getToken(storeKey);
     if (cached) {
@@ -604,9 +589,48 @@ async function main() {
     console.error(`Payment required: ${satoshis} sats`);
   }
 
-  // ── Rolling budget check ──
-  if (satoshis !== null && !args.dryRun && !args.force) {
-    const budgetResult = checkBudget(satoshis);
+  // ── Payment enforcement (fail closed) ──
+  // A payment is about to be made: require an explicitly configured domain
+  // allowlist and budget. --force refreshes the token but never bypasses
+  // these checks. Free resources (HTTP 200) never reach this path.
+  if (!args.dryRun) {
+    const domainCheck = checkDomainAllowed(domain);
+    if (!domainCheck.allowed) {
+      const output = {
+        event: 'l402_domain_blocked',
+        url: args.url,
+        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+        domain,
+        allowlist: domainCheck.allowlist,
+        message:
+          domainCheck.reason ||
+          `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
+      };
+      console.log(JSON.stringify(output, null, 2));
+      process.exit(1);
+    }
+
+    // An undecodable amount cannot be budget-checked, so paying it would spend
+    // an unknown sum against limits that were never applied. Refuse rather
+    // than delegate the decision to the backend: `checkBudget` was previously
+    // skipped entirely when `satoshis` was null, which silently defeated both
+    // the budget and --max-amount guards for amountless invoices.
+    if (satoshis === null) {
+      const output = {
+        event: 'l402_amount_undecodable',
+        url: args.url,
+        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+        invoice: challenge.invoice,
+        message:
+          'Refusing to pay: the amount could not be decoded from the L402 invoice, so budget ' +
+          'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
+          'invoice explicitly with `blink pay-invoice` if you trust it.',
+      };
+      console.log(JSON.stringify(output, null, 2));
+      process.exit(1);
+    }
+
+    const budgetResult = checkBudget(satoshis, { requireConfigured: true });
     if (!budgetResult.allowed) {
       const output = {
         event: 'l402_budget_exceeded',
@@ -637,7 +661,9 @@ async function main() {
 
   // ── Dry-run: report price and exit ──
   if (args.dryRun) {
-    const budgetInfo = satoshis !== null ? checkBudget(satoshis) : null;
+    // Reporting only — dry-run never spends. Opt out of the fail-closed default
+    // so an unconfigured budget shows remaining limits instead of a denial.
+    const budgetInfo = satoshis !== null ? checkBudget(satoshis, { requireConfigured: false }) : null;
     const output = {
       event: 'l402_dry_run',
       url: args.url,

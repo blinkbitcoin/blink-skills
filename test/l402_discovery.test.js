@@ -10,9 +10,11 @@
 
 'use strict';
 
-const { describe, it, before, after, afterEach } = require('node:test');
+const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
 
 const scriptsDir = path.resolve(__dirname, '..', 'blink', 'scripts');
 
@@ -242,5 +244,147 @@ describe('l402_info — fetchServiceDetail (mocked)', () => {
   it('throws on 404', async () => {
     global.fetch = async () => ({ ok: false, status: 404, text: async () => 'not found' });
     await assert.rejects(() => mod.fetchServiceDetail('nonexistent'), /not found/i);
+  });
+});
+
+// ── l402_info --report delegates enforcement to l402_pay ─────────────────────
+
+/**
+ * l402_info used to run its own budget and domain pre-checks before delegating
+ * to l402_pay. Those duplicated the real enforcement and had drifted out of
+ * sync with it, so they were removed. This pins the property that matters:
+ * --report still cannot spend when the controls are unconfigured, because
+ * l402_pay enforces at the point of payment.
+ */
+describe('l402_info --report enforcement delegation', () => {
+  const infoPath = path.join(scriptsDir, 'l402_info.js');
+  const payPath = path.join(scriptsDir, 'l402_pay.js');
+  const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+  const storePath = path.join(scriptsDir, 'l402_store.js');
+  const budgetPath = path.join(scriptsDir, '_budget.js');
+
+  const originalEnv = { ...process.env };
+  const originalArgv = [...process.argv];
+  const originalFetch = global.fetch;
+  const originalStdout = console.log;
+  const originalStderr = console.error;
+  const originalHomedir = os.homedir;
+
+  let stdoutLines = [];
+  let tmpDir;
+
+  before(() => {
+    process.env.BLINK_API_KEY = 'blink_test_key';
+    process.env.BLINK_API_URL = 'https://api.test.blink.sv/graphql';
+    console.log = (...args) => stdoutLines.push(args.join(' '));
+    console.error = () => {};
+  });
+
+  after(() => {
+    process.env = originalEnv;
+    process.argv = originalArgv;
+    global.fetch = originalFetch;
+    console.log = originalStdout;
+    console.error = originalStderr;
+    os.homedir = originalHomedir;
+  });
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-info-'));
+    os.homedir = () => tmpDir;
+    delete process.env.BLINK_BUDGET_HOURLY_SATS;
+    delete process.env.BLINK_BUDGET_DAILY_SATS;
+    delete process.env.BLINK_L402_ALLOWED_DOMAINS;
+    stdoutLines = [];
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    os.homedir = originalHomedir;
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+    for (const p of [infoPath, payPath, discoverPath, storePath, budgetPath]) {
+      delete require.cache[require.resolve(p)];
+    }
+  });
+
+  async function runInfoReport(extraArgs = []) {
+    const blinkCalls = [];
+    global.fetch = async (url, _opts) => {
+      blinkCalls.push(String(url));
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (name) =>
+            name.toLowerCase() === 'www-authenticate'
+              ? 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0report"'
+              : null,
+        },
+        text: async () => '',
+      };
+    };
+
+    process.argv = ['node', 'l402_info.js', 'deadbeef', '--report', ...extraArgs];
+    const { main } = require(infoPath);
+    let exitCode = null;
+    const originalExit = process.exit;
+    process.exit = (code) => {
+      exitCode = code;
+      throw new Error(`process.exit(${code})`);
+    };
+    try {
+      await main();
+    } catch {
+      /* swallow the trapped exit */
+    } finally {
+      process.exit = originalExit;
+    }
+    return { exitCode, blinkCalls };
+  }
+
+  it('is denied by the allowlist when nothing is configured', async () => {
+    const { exitCode, blinkCalls } = await runInfoReport();
+
+    assert.equal(exitCode, 1);
+    const out = JSON.parse(stdoutLines.join('\n'));
+    assert.equal(out.event, 'l402_domain_blocked');
+    assert.equal(out.domain, 'l402.directory');
+    assert.equal(
+      blinkCalls.some((u) => u.includes('api.test.blink.sv')),
+      false,
+      'must not reach the Blink payment mutation',
+    );
+  });
+
+  it('is denied by the budget when only the domain is allowlisted', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'l402.directory';
+    const { exitCode, blinkCalls } = await runInfoReport();
+
+    assert.equal(exitCode, 1);
+    const out = JSON.parse(stdoutLines.join('\n'));
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.match(out.message, /NO_BUDGET_CONFIGURED/);
+    assert.equal(
+      blinkCalls.some((u) => u.includes('api.test.blink.sv')),
+      false,
+      'must not reach the Blink payment mutation',
+    );
+  });
+
+  it('--force still does not bypass either control', async () => {
+    const { exitCode, blinkCalls } = await runInfoReport(['--force']);
+
+    assert.equal(exitCode, 1);
+    const out = JSON.parse(stdoutLines.join('\n'));
+    assert.equal(out.event, 'l402_domain_blocked');
+    assert.equal(
+      blinkCalls.some((u) => u.includes('api.test.blink.sv')),
+      false,
+      'must not reach the Blink payment mutation',
+    );
   });
 });
