@@ -608,20 +608,38 @@ async function main() {
       process.exit(1);
     }
 
-    if (satoshis !== null) {
-      const budgetResult = checkBudget(satoshis, { requireConfigured: true });
-      if (!budgetResult.allowed) {
-        const output = {
-          event: 'l402_budget_exceeded',
-          url: args.url,
-          canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-          satoshis,
-          ...budgetResult,
-          message: budgetResult.reason,
-        };
-        console.log(JSON.stringify(output, null, 2));
-        process.exit(1);
-      }
+    // An undecodable amount cannot be budget-checked, so paying it would spend
+    // an unknown sum against limits that were never applied. Refuse rather
+    // than delegate the decision to the backend: `checkBudget` was previously
+    // skipped entirely when `satoshis` was null, which silently defeated both
+    // the budget and --max-amount guards for amountless invoices.
+    if (satoshis === null) {
+      const output = {
+        event: 'l402_amount_undecodable',
+        url: args.url,
+        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+        invoice: challenge.invoice,
+        message:
+          'Refusing to pay: the amount could not be decoded from the L402 invoice, so budget ' +
+          'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
+          'invoice explicitly with `blink pay-invoice` if you trust it.',
+      };
+      console.log(JSON.stringify(output, null, 2));
+      process.exit(1);
+    }
+
+    const budgetResult = checkBudget(satoshis, { requireConfigured: true });
+    if (!budgetResult.allowed) {
+      const output = {
+        event: 'l402_budget_exceeded',
+        url: args.url,
+        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+        satoshis,
+        ...budgetResult,
+        message: budgetResult.reason,
+      };
+      console.log(JSON.stringify(output, null, 2));
+      process.exit(1);
     }
   }
 
