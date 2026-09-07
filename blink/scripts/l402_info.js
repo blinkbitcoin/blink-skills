@@ -12,8 +12,10 @@
  *   service_id      - Required. Service ID from l402.directory (hex string).
  *   --report        - Optional. Fetch paid health report (10 sats, L402-gated).
  *
- * The --report flag triggers an L402 payment. It is subject to budget controls
- * and domain allowlist (domain: l402.directory). Use --force to bypass.
+ * The --report flag triggers an L402 payment. It is subject to the budget
+ * controls and the domain allowlist (domain: l402.directory), both of which
+ * must be configured or the payment is refused. --force only forces a fresh
+ * payment instead of reusing a cached token; it never bypasses either control.
  *
  * No API key required for the free detail endpoint.
  * Write scope required for --report (L402 payment).
@@ -51,7 +53,8 @@ function parseCliArgs(argv) {
         '',
         'Options:',
         '  --report   Fetch paid health report (10 sats via L402)',
-        '  --force    Bypass budget and domain checks for --report',
+        '  --force    Pay fresh instead of reusing a cached token (never bypasses',
+        '             the budget or domain allowlist)',
         '  --help     Show this help',
       ].join('\n'),
     );
