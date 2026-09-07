@@ -463,26 +463,11 @@ async function main() {
   const domain = extractDomain(canonicalUrl);
   const storeKey = extractStoreKey(canonicalUrl);
 
-  // ── Domain allowlist check (L402 only) ──
-  if (!args.dryRun && !args.force) {
-    const domainCheck = checkDomainAllowed(domain);
-    if (!domainCheck.allowed) {
-      const output = {
-        event: 'l402_domain_blocked',
-        url: args.url,
-        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        domain,
-        allowlist: domainCheck.allowlist,
-        message: `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
-
   // ── Check token store first ──
   // Skip cache on --dry-run: dry-run must always probe the server fresh so it
   // can report the current invoice price, even if a cached token exists.
+  // NOTE: budget/domain enforcement happens later, only when a payment is
+  // actually required — free (HTTP 200) resources work without configuration.
   if (!args.noStore && !args.force && !args.dryRun) {
     const cached = getToken(storeKey);
     if (cached) {
@@ -604,20 +589,39 @@ async function main() {
     console.error(`Payment required: ${satoshis} sats`);
   }
 
-  // ── Rolling budget check ──
-  if (satoshis !== null && !args.dryRun && !args.force) {
-    const budgetResult = checkBudget(satoshis);
-    if (!budgetResult.allowed) {
+  // ── Payment enforcement (fail closed) ──
+  // A payment is about to be made: require an explicitly configured domain
+  // allowlist and budget. --force refreshes the token but never bypasses
+  // these checks. Free resources (HTTP 200) never reach this path.
+  if (!args.dryRun) {
+    const domainCheck = checkDomainAllowed(domain);
+    if (!domainCheck.allowed) {
       const output = {
-        event: 'l402_budget_exceeded',
+        event: 'l402_domain_blocked',
         url: args.url,
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        satoshis,
-        ...budgetResult,
-        message: budgetResult.reason,
+        domain,
+        allowlist: domainCheck.allowlist,
+        message: domainCheck.reason || `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(1);
+    }
+
+    if (satoshis !== null) {
+      const budgetResult = checkBudget(satoshis, { requireConfigured: true });
+      if (!budgetResult.allowed) {
+        const output = {
+          event: 'l402_budget_exceeded',
+          url: args.url,
+          canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+          satoshis,
+          ...budgetResult,
+          message: budgetResult.reason,
+        };
+        console.log(JSON.stringify(output, null, 2));
+        process.exit(1);
+      }
     }
   }
 

@@ -94,43 +94,10 @@ async function fetchServiceDetail(serviceId) {
 // ── Paid report endpoint (L402) ──────────────────────────────────────────────
 
 async function fetchServiceReport(serviceId, { force }) {
-  // Delegate to l402-pay for the L402 payment flow
-  const { checkBudget, checkDomainAllowed, recordSpend } = require('./_budget');
-
+  // Delegate to l402-pay for the L402 payment flow. Budget and domain
+  // enforcement is handled inside l402_pay (fail closed at the point of
+  // payment) — no duplicate pre-checks here.
   const reportUrl = `${DIRECTORY_BASE}/report/${serviceId}`;
-  const domain = 'l402.directory';
-
-  // Domain allowlist check
-  if (!force) {
-    const domainCheck = checkDomainAllowed(domain);
-    if (!domainCheck.allowed) {
-      const output = {
-        event: 'l402_domain_blocked',
-        url: reportUrl,
-        domain,
-        allowlist: domainCheck.allowlist,
-        message: `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
-
-  // Budget check (report costs 10 sats)
-  if (!force) {
-    const budgetResult = checkBudget(10);
-    if (!budgetResult.allowed) {
-      const output = {
-        event: 'l402_budget_exceeded',
-        url: reportUrl,
-        satoshis: 10,
-        ...budgetResult,
-        message: budgetResult.reason,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-  }
 
   // Use l402_pay's main logic by setting up argv and calling it
   const origArgv = process.argv;

@@ -154,8 +154,14 @@ function sumSpending(log, nowMs) {
  *
  * Returns { allowed: true } or { allowed: false, reason, ... } with details.
  *
+ * By default, an unconfigured budget allows the payment (explicit one-shot
+ * payments such as pay-invoice remain usable without setup). For autonomous
+ * flows (L402 auto-pay), pass `requireConfigured: true` — unconfigured
+ * budgets then DENY the payment (fail closed).
+ *
  * @param {number}  amountSats
  * @param {object}  [opts]
+ * @param {boolean} [opts.requireConfigured=false]  Deny when no budget is configured.
  * @param {number}  [opts.nowMs]  Override current time for testing.
  * @returns {{
  *   allowed: boolean,
@@ -171,6 +177,23 @@ function sumSpending(log, nowMs) {
  */
 function checkBudget(amountSats, opts = {}) {
   const config = getConfig();
+
+  if (!config.enabled && opts.requireConfigured) {
+    return {
+      allowed: false,
+      reason:
+        'NO_BUDGET_CONFIGURED: L402 auto-pay requires explicit spending limits. ' +
+        'Set BLINK_BUDGET_HOURLY_SATS / BLINK_BUDGET_DAILY_SATS (env) or run ' +
+        '`blink budget set --hourly <sats> --daily <sats>` before auto-paying.',
+      hourlySpent: 0,
+      dailySpent: 0,
+      hourlyLimit: null,
+      dailyLimit: null,
+      hourlyRemaining: null,
+      dailyRemaining: null,
+      effectiveRemaining: null,
+    };
+  }
 
   if (!config.enabled) {
     return { allowed: true, hourlySpent: 0, dailySpent: 0, hourlyLimit: null, dailyLimit: null, hourlyRemaining: null, dailyRemaining: null, effectiveRemaining: null };
@@ -251,20 +274,33 @@ function getStatus(opts = {}) {
 /**
  * Check if a domain is allowed for L402 auto-pay.
  *
- * If the allowlist is empty, all domains are allowed.
- * Matching is case-insensitive on the domain hostname.
+ * Fail closed: when the allowlist is empty, autonomous payments are denied
+ * (pass `requireConfigured: false` for reporting-only callers that just want
+ * to display current status). Matching is case-insensitive on the hostname.
  *
- * @param {string} domain  Hostname to check.
- * @returns {{ allowed: boolean, allowlist: string[] }}
+ * @param {string}  domain  Hostname to check.
+ * @param {object}  [opts]
+ * @param {boolean} [opts.requireConfigured=true]  Deny when allowlist is empty.
+ * @returns {{ allowed: boolean, reason?: string, allowlist: string[] }}
  */
-function checkDomainAllowed(domain) {
+function checkDomainAllowed(domain, opts = {}) {
+  const requireConfigured = opts.requireConfigured !== false;
   const config = getConfig();
   if (config.allowlist.length === 0) {
+    if (requireConfigured) {
+      return {
+        allowed: false,
+        reason:
+          'NO_ALLOWLIST_CONFIGURED: L402 auto-pay requires an explicit domain ' +
+          `allowlist. Add "${domain}" with: blink budget allowlist add ${domain}`,
+        allowlist: [],
+      };
+    }
     return { allowed: true, allowlist: [] };
   }
   const normalized = domain.toLowerCase();
   const allowed = config.allowlist.includes(normalized);
-  return { allowed, allowlist: config.allowlist };
+  return { allowed, ...(allowed ? {} : { reason: `Domain "${domain}" is not in the L402 allowlist.` }), allowlist: config.allowlist };
 }
 
 // ── Record spend ─────────────────────────────────────────────────────────────

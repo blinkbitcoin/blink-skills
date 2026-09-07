@@ -292,9 +292,13 @@ describe('checkDomainAllowed', () => {
     delete process.env.BLINK_L402_ALLOWED_DOMAINS;
   });
 
-  it('allows all domains when allowlist is empty', () => {
+  it('denies all domains when allowlist is empty (fail closed)', () => {
     const result = mod.checkDomainAllowed('anything.com');
-    assert.equal(result.allowed, true);
+    assert.equal(result.allowed, false);
+    assert.match(result.reason, /NO_ALLOWLIST_CONFIGURED/);
+    // reporting-only callers can opt out of the configured check
+    const report = mod.checkDomainAllowed('anything.com', { requireConfigured: false });
+    assert.equal(report.allowed, true);
   });
 
   it('allows a domain in the allowlist', () => {
