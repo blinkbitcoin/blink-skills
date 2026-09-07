@@ -202,7 +202,16 @@ function checkBudget(amountSats, opts = {}) {
   }
 
   if (!config.enabled) {
-    return { allowed: true, hourlySpent: 0, dailySpent: 0, hourlyLimit: null, dailyLimit: null, hourlyRemaining: null, dailyRemaining: null, effectiveRemaining: null };
+    return {
+      allowed: true,
+      hourlySpent: 0,
+      dailySpent: 0,
+      hourlyLimit: null,
+      dailyLimit: null,
+      hourlyRemaining: null,
+      dailyRemaining: null,
+      effectiveRemaining: null,
+    };
   }
 
   const log = readLog();
@@ -306,7 +315,11 @@ function checkDomainAllowed(domain, opts = {}) {
   }
   const normalized = domain.toLowerCase();
   const allowed = config.allowlist.includes(normalized);
-  return { allowed, ...(allowed ? {} : { reason: `Domain "${domain}" is not in the L402 allowlist.` }), allowlist: config.allowlist };
+  return {
+    allowed,
+    ...(allowed ? {} : { reason: `Domain "${domain}" is not in the L402 allowlist.` }),
+    allowlist: config.allowlist,
+  };
 }
 
 // ── Record spend ─────────────────────────────────────────────────────────────

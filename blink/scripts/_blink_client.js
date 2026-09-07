@@ -31,8 +31,7 @@ function getApiKey({ required = true } = {}) {
   const key = process.env.BLINK_API_KEY;
   if (!key && required) {
     throw new Error(
-      'BLINK_API_KEY not found. Set it as an environment variable, e.g.:\n' +
-        '  export BLINK_API_KEY="blink_..."',
+      'BLINK_API_KEY not found. Set it as an environment variable, e.g.:\n' + '  export BLINK_API_KEY="blink_..."',
     );
   }
   return key || null;

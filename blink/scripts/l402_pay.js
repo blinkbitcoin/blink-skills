@@ -602,7 +602,9 @@ async function main() {
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         domain,
         allowlist: domainCheck.allowlist,
-        message: domainCheck.reason || `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
+        message:
+          domainCheck.reason ||
+          `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(1);

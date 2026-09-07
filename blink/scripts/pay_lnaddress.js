@@ -55,7 +55,9 @@ async function main() {
   const amountSats = remaining[1] ? parseInt(remaining[1], 10) : null;
 
   if (!lnAddress || amountSats === null) {
-    console.error('Usage: node pay_lnaddress.js <lightning_address> <amount_sats> [--wallet BTC|USD] [--dry-run] [--force] [--max-amount <sats>]');
+    console.error(
+      'Usage: node pay_lnaddress.js <lightning_address> <amount_sats> [--wallet BTC|USD] [--dry-run] [--force] [--max-amount <sats>]',
+    );
     process.exit(1);
   }
 
@@ -104,9 +106,7 @@ async function main() {
     // it, so opt out of the fail-closed default that guards autonomous spending.
     const budgetResult = checkBudget(amountSats, { requireConfigured: false });
     if (!budgetResult.allowed) {
-      throw new Error(
-        `Budget exceeded: ${budgetResult.reason} Use --force to override.`,
-      );
+      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
     }
   }
 
@@ -163,10 +163,18 @@ async function main() {
 
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
-    try { recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null }); } catch { /* non-fatal */ }
+    try {
+      recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
+    } catch {
+      /* non-fatal */
+    }
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
-    try { recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null }); } catch { /* non-fatal */ }
+    try {
+      recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
+    } catch {
+      /* non-fatal */
+    }
   } else {
     console.error(`Payment status: ${result.status}`);
   }
