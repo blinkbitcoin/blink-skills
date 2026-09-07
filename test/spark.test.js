@@ -1,0 +1,427 @@
+/**
+ * Unit tests for the non-custodial (Spark) layer: _spark_sdk.js helpers and
+ * the spark_send fee/arg helpers.
+ *
+ * The Breez SDK (@breeztech/breez-sdk-spark) is NOT installed in CI; these
+ * tests exercise only the pure helpers and arg parsing, and assert that the
+ * SDK loader fails with a clear, actionable message when the dep is absent.
+ *
+ * Run: node --test test/spark.test.js
+ */
+
+const { describe, it, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+
+const spark = require('../blink/scripts/_spark_sdk');
+const {
+  parseArgs: parseSendArgs,
+  feeFromPrepare,
+  isLnurlPayInput,
+  lnurlPayRequestFrom,
+} = require('../blink/scripts/spark_send');
+
+// ── getMnemonic (env-only, never rc files) ────────────────────────────────────
+
+describe('_spark_sdk.getMnemonic', () => {
+  it('throws when SPARK_MNEMONIC is unset', () => {
+    const saved = process.env.SPARK_MNEMONIC;
+    delete process.env.SPARK_MNEMONIC;
+    try {
+      assert.throws(() => spark.getMnemonic(), /SPARK_MNEMONIC not set/);
+    } finally {
+      if (saved !== undefined) process.env.SPARK_MNEMONIC = saved;
+    }
+  });
+
+  it('rejects a seed that is not 12 or 24 words', () => {
+    const saved = process.env.SPARK_MNEMONIC;
+    process.env.SPARK_MNEMONIC = 'one two three';
+    try {
+      assert.throws(() => spark.getMnemonic(), /12 or 24 word/);
+    } finally {
+      if (saved !== undefined) process.env.SPARK_MNEMONIC = saved;
+      else delete process.env.SPARK_MNEMONIC;
+    }
+  });
+
+  it('rejects a 12-word seed with an invalid BIP39 checksum', () => {
+    // "abandon" x12 has a valid word count and valid words, but the checksum
+    // demands "about" as the 12th. This is the mistyped-word case that would
+    // otherwise silently derive a different, empty wallet.
+    const saved = process.env.SPARK_MNEMONIC;
+    process.env.SPARK_MNEMONIC = new Array(12).fill('abandon').join(' ');
+    try {
+      let bip39Available = true;
+      try {
+        require('bip39');
+      } catch {
+        bip39Available = false;
+      }
+      if (bip39Available) {
+        assert.throws(() => spark.getMnemonic(), /BIP39 checksum/);
+      } else {
+        // Without the optional validator we degrade to the word-count check.
+        assert.equal(spark.getMnemonic().split(' ').length, 12);
+      }
+    } finally {
+      if (saved !== undefined) process.env.SPARK_MNEMONIC = saved;
+      else delete process.env.SPARK_MNEMONIC;
+    }
+  });
+
+  it('never includes the mnemonic in the checksum failure message', () => {
+    const secret = new Array(12).fill('abandon').join(' ');
+    try {
+      spark.validateMnemonicChecksum(secret);
+    } catch (err) {
+      assert.equal(err.message.includes('abandon'), false);
+    }
+  });
+
+  it('accepts and normalizes a 12-word seed', () => {
+    const saved = process.env.SPARK_MNEMONIC;
+    process.env.SPARK_MNEMONIC =
+      '  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about  ';
+    try {
+      const m = spark.getMnemonic();
+      assert.equal(m.split(' ').length, 12);
+      assert.equal(m.startsWith('abandon'), true);
+    } finally {
+      if (saved !== undefined) process.env.SPARK_MNEMONIC = saved;
+      else delete process.env.SPARK_MNEMONIC;
+    }
+  });
+});
+
+// ── storageDirFor (stable, non-reversible) ────────────────────────────────────
+
+describe('_spark_sdk.storageDirFor', () => {
+  it('is deterministic for the same seed + network', () => {
+    const a = spark.storageDirFor('seed words here', 'mainnet');
+    const b = spark.storageDirFor('seed words here', 'mainnet');
+    assert.equal(a, b);
+  });
+
+  it('differs by seed', () => {
+    const a = spark.storageDirFor('seed one', 'mainnet');
+    const b = spark.storageDirFor('seed two', 'mainnet');
+    assert.notEqual(a, b);
+  });
+
+  it('does not embed the raw seed in the path', () => {
+    const dir = spark.storageDirFor('super secret seed phrase', 'mainnet');
+    assert.equal(dir.includes('super secret'), false);
+  });
+});
+
+// ── loadSdkModule (optional dep may or may not be present) ───────────────────
+
+describe('_spark_sdk.loadSdkModule', () => {
+  // The SDK is an optionalDependency, so it may be absent (CI without it,
+  // Node < 22) or present. Assert the contract for whichever holds, rather
+  // than assuming one — a test that only passes when a dep is missing
+  // silently inverts as soon as someone installs it.
+  it('either loads the SDK or throws an actionable install error', () => {
+    let mod;
+    try {
+      mod = spark.loadSdkModule();
+    } catch (err) {
+      assert.match(err.message, /is not installed|npm install/);
+      return;
+    }
+    assert.equal(typeof mod.connect, 'function');
+    assert.equal(typeof mod.defaultConfig, 'function');
+  });
+});
+
+// ── normalizeInfo / normalizePayment ──────────────────────────────────────────
+
+describe('_spark_sdk.normalizeInfo', () => {
+  it('coerces BigInt balanceSats to Number', () => {
+    assert.deepEqual(spark.normalizeInfo({ balanceSats: 12345n }), { balanceSats: 12345 });
+  });
+  it('defaults to 0 when missing', () => {
+    assert.deepEqual(spark.normalizeInfo({}), { balanceSats: 0 });
+  });
+});
+
+describe('_spark_sdk.normalizePayment', () => {
+  it('reads the SDK v0.18 Payment shape (amount + fees, BigInt)', () => {
+    const p = spark.normalizePayment({
+      id: 'p1',
+      paymentType: 'send',
+      status: 'completed',
+      amount: 1000n,
+      fees: 5n,
+      timestamp: 1700000000,
+    });
+    assert.equal(p.id, 'p1');
+    assert.equal(p.type, 'send');
+    assert.equal(p.amountSats, 1000);
+    assert.equal(p.feeSats, 5); // was previously null due to reading the wrong field
+    assert.equal(p.timestamp, 1700000000);
+  });
+
+  it('falls back to older field names (amountSats/feesSats)', () => {
+    const p = spark.normalizePayment({ paymentType: 'receive', amountSats: 200, feesSats: 0 });
+    assert.equal(p.amountSats, 200);
+    assert.equal(p.feeSats, 0);
+  });
+
+  it('returns null fee when no fee field is present', () => {
+    const p = spark.normalizePayment({ amount: 200n });
+    assert.equal(p.feeSats, null);
+    assert.equal(p.amountSats, 200);
+  });
+});
+
+describe('_spark_sdk.waitForStableBalance', () => {
+  it('returns stable when two consecutive reads agree', async () => {
+    let n = 0;
+    const sdk = {
+      async getInfo() {
+        n += 1;
+        return { balanceSats: 2200n };
+      },
+    };
+    const r = await spark.waitForStableBalance(sdk, { maxWaitMs: 3000, intervalMs: 1 });
+    assert.equal(r.balanceSats, 2200);
+    assert.equal(r.stable, true);
+    assert.ok(n >= 2, 'polls at least twice to confirm stability');
+  });
+
+  it('settles after a transient low read (mid-sync)', async () => {
+    const seq = [1176n, 2200n, 2200n];
+    let i = 0;
+    const sdk = {
+      async getInfo() {
+        const v = seq[Math.min(i, seq.length - 1)];
+        i += 1;
+        return { balanceSats: v };
+      },
+    };
+    const r = await spark.waitForStableBalance(sdk, { maxWaitMs: 3000, intervalMs: 1 });
+    assert.equal(r.balanceSats, 2200);
+    assert.equal(r.stable, true);
+  });
+
+  it('returns the last read (stable=false) if it never settles before the cap', async () => {
+    let v = 100;
+    const sdk = {
+      async getInfo() {
+        v += 100; // never repeats
+        return { balanceSats: BigInt(v) };
+      },
+    };
+    const r = await spark.waitForStableBalance(sdk, { maxWaitMs: 20, intervalMs: 5 });
+    assert.equal(r.stable, false);
+    assert.equal(typeof r.balanceSats, 'number');
+  });
+});
+
+// ── spark_send helpers ────────────────────────────────────────────────────────
+
+describe('spark_send.parseArgs', () => {
+  it('parses destination + amount', () => {
+    const a = parseSendArgs(['lnbc10u1p...', '1000']);
+    assert.equal(a.destination, 'lnbc10u1p...');
+    assert.equal(a.amountSats, 1000);
+    assert.equal(a.dryRun, false);
+  });
+
+  it('parses --dry-run and --network', () => {
+    const a = parseSendArgs(['alice@blink.sv', '500', '--dry-run', '--network', 'regtest']);
+    assert.equal(a.dryRun, true);
+    assert.equal(a.network, 'regtest');
+  });
+
+  it('rejects a non-positive amount', () => {
+    assert.throws(() => parseSendArgs(['dest', '0']), /positive integer/);
+  });
+});
+
+describe('spark_send.isLnurlPayInput', () => {
+  it('detects an lnUrlPay parse result', () => {
+    assert.equal(isLnurlPayInput({ type: 'lnUrlPay' }), true);
+  });
+  it('detects a lightningAddress parse result', () => {
+    assert.equal(isLnurlPayInput({ type: 'lightningAddress' }), true);
+  });
+  it('is case-insensitive', () => {
+    assert.equal(isLnurlPayInput({ type: 'LNURLPAY' }), true);
+  });
+  it('returns false for a bolt11 invoice', () => {
+    assert.equal(isLnurlPayInput({ type: 'bolt11Invoice' }), false);
+  });
+  it('returns false for a spark address', () => {
+    assert.equal(isLnurlPayInput({ type: 'sparkAddress' }), false);
+  });
+  it('returns false for null / missing type', () => {
+    assert.equal(isLnurlPayInput(null), false);
+    assert.equal(isLnurlPayInput({}), false);
+  });
+});
+
+describe('spark_send.lnurlPayRequestFrom', () => {
+  it('extracts payRequest for a lightningAddress parse result', () => {
+    const parsed = {
+      type: 'lightningAddress',
+      address: 'a@b',
+      payRequest: { callback: 'https://x', minSendable: 1000 },
+    };
+    assert.deepEqual(lnurlPayRequestFrom(parsed), { callback: 'https://x', minSendable: 1000 });
+  });
+  it('returns the object itself for an lnurlPay parse result (details are top-level)', () => {
+    const parsed = { type: 'lnurlPay', callback: 'https://x', minSendable: 1000 };
+    assert.deepEqual(lnurlPayRequestFrom(parsed), parsed);
+  });
+});
+
+describe('spark_send.feeFromPrepare', () => {
+  it('reads a top-level feeSats (LNURL prepare response)', () => {
+    assert.equal(feeFromPrepare({ feeSats: 7 }), 7);
+  });
+  it('reads a nested paymentMethod.feeSats (older builds)', () => {
+    assert.equal(feeFromPrepare({ paymentMethod: { type: 'bolt11Invoice', feeSats: 4 } }), 4);
+  });
+  it('reads bolt11 lightningFeeSats', () => {
+    assert.equal(feeFromPrepare({ paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 6 } }), 6);
+  });
+  it('sums lightningFeeSats + sparkTransferFeeSats when both present', () => {
+    assert.equal(
+      feeFromPrepare({ paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 6, sparkTransferFeeSats: 2 } }),
+      8,
+    );
+  });
+  it('reads a sparkAddress string fee', () => {
+    assert.equal(feeFromPrepare({ paymentMethod: { type: 'sparkAddress', fee: '3' } }), 3);
+  });
+  it('returns null when unknown', () => {
+    assert.equal(feeFromPrepare({}), null);
+    assert.equal(feeFromPrepare(null), null);
+    assert.equal(feeFromPrepare({ paymentMethod: {} }), null);
+  });
+});
+
+// ── spark_send main() branch selection (mocked SDK) ───────────────────────────
+//
+// We inject a fake `_spark_sdk` module into the require cache so spark_send.js
+// runs its full main() against a fake sdk. No real Breez dep, no live calls.
+// This proves a Lightning Address routes through prepareLnurlPay/lnurlPay and a
+// BOLT-11 invoice routes through prepareSendPayment/sendPayment.
+
+describe('spark_send main() destination routing', () => {
+  const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
+  const sparkSendPath = require.resolve('../blink/scripts/spark_send');
+
+  let calls;
+  let savedArgv;
+  let savedLog;
+  let savedErr;
+
+  let lastArgs;
+
+  function installMock({ parseType }) {
+    calls = [];
+    lastArgs = {};
+    const fakeSdk = {
+      async parse() {
+        calls.push('parse');
+        // lightningAddress result nests details under payRequest; lnurlPay is flat.
+        if (parseType === 'lightningAddress') {
+          return { type: parseType, address: 'alice@blink.sv', payRequest: { callback: 'https://blink.sv/cb' } };
+        }
+        return { type: parseType, callback: 'https://blink.sv/cb' };
+      },
+      async prepareLnurlPay(req) {
+        calls.push('prepareLnurlPay');
+        lastArgs.prepareLnurlPay = req;
+        return { feeSats: 2 };
+      },
+      async lnurlPay() {
+        calls.push('lnurlPay');
+        return { payment: { id: 'ln-1', status: 'COMPLETED' } };
+      },
+      async prepareSendPayment(req) {
+        calls.push('prepareSendPayment');
+        lastArgs.prepareSendPayment = req;
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
+      },
+      async sendPayment() {
+        calls.push('sendPayment');
+        return { payment: { id: 'bolt-1', status: 'COMPLETED' } };
+      },
+    };
+    // Replace the cached _spark_sdk module with a fake connect().
+    require.cache[sparkSdkPath] = {
+      id: sparkSdkPath,
+      filename: sparkSdkPath,
+      loaded: true,
+      exports: {
+        async connect() {
+          return { sdk: fakeSdk, disconnect: async () => {} };
+        },
+      },
+    };
+    // Force spark_send to be re-required so it binds to the mocked connect.
+    delete require.cache[sparkSendPath];
+  }
+
+  afterEach(() => {
+    delete require.cache[sparkSendPath];
+    delete require.cache[sparkSdkPath];
+    if (savedArgv) process.argv = savedArgv;
+    if (savedLog) console.log = savedLog;
+    if (savedErr) console.error = savedErr;
+    savedArgv = savedLog = savedErr = null;
+  });
+
+  async function runMain(argv) {
+    savedArgv = process.argv;
+    savedLog = console.log;
+    savedErr = console.error;
+    let out = '';
+    console.log = (s) => {
+      out += s;
+    };
+    console.error = () => {};
+    process.argv = [process.execPath, path.basename(sparkSendPath), ...argv];
+    const { main } = require(sparkSendPath);
+    await main();
+    return out;
+  }
+
+  it('routes a Lightning Address through prepareLnurlPay + lnurlPay', async () => {
+    installMock({ parseType: 'lnUrlPay' });
+    const out = await runMain(['alice@blink.sv', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareLnurlPay', 'lnurlPay']);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.destinationType, 'lnurl');
+    assert.equal(parsed.status, 'COMPLETED');
+    assert.equal(parsed.feeSats, 2);
+  });
+
+  it('routes a BOLT-11 invoice through prepareSendPayment + sendPayment', async () => {
+    installMock({ parseType: 'bolt11Invoice' });
+    const out = await runMain(['lnbc100n1p...', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    // Regression guard for the bug found in the wild: the SDK needs a tagged
+    // PaymentRequest object, NOT a raw string.
+    assert.deepEqual(lastArgs.prepareSendPayment.paymentRequest, { type: 'input', input: 'lnbc100n1p...' });
+    assert.equal(lastArgs.prepareSendPayment.amount, 100n);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.destinationType, 'bolt11');
+    assert.equal(parsed.status, 'COMPLETED');
+    assert.equal(parsed.feeSats, 3); // from lightningFeeSats
+  });
+
+  it('--dry-run prepares but does not send (LNURL)', async () => {
+    installMock({ parseType: 'lightningAddress' });
+    const out = await runMain(['alice@blink.sv', '100', '--dry-run']);
+    assert.deepEqual(calls, ['parse', 'prepareLnurlPay']);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.dryRun, true);
+    assert.equal(parsed.destinationType, 'lnurl');
+  });
+});
