@@ -100,7 +100,9 @@ async function main() {
 
   // ── Budget check ──
   if (!dryRun && !force) {
-    const budgetResult = checkBudget(amountSats);
+    // Explicitly user-initiated payment: an unconfigured budget must not block
+    // it, so opt out of the fail-closed default that guards autonomous spending.
+    const budgetResult = checkBudget(amountSats, { requireConfigured: false });
     if (!budgetResult.allowed) {
       throw new Error(
         `Budget exceeded: ${budgetResult.reason} Use --force to override.`,

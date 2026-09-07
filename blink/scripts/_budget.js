@@ -154,14 +154,19 @@ function sumSpending(log, nowMs) {
  *
  * Returns { allowed: true } or { allowed: false, reason, ... } with details.
  *
- * By default, an unconfigured budget allows the payment (explicit one-shot
- * payments such as pay-invoice remain usable without setup). For autonomous
- * flows (L402 auto-pay), pass `requireConfigured: true` — unconfigured
- * budgets then DENY the payment (fail closed).
+ * Fails closed by default: an unconfigured budget DENIES the payment, matching
+ * checkDomainAllowed. Callers that are explicitly user-initiated — the one-shot
+ * pay-invoice / pay-lnaddress / pay-lnurl commands, and reporting-only readers
+ * such as dry-run output — opt out with `requireConfigured: false`.
+ *
+ * The safe behaviour is the default deliberately. These two functions are the
+ * two halves of one spending guard, so opposite defaults would mean a future
+ * autonomous caller that forgets the flag silently spends without limits.
+ * Opting out is now a visible, greppable decision at each call site.
  *
  * @param {number}  amountSats
  * @param {object}  [opts]
- * @param {boolean} [opts.requireConfigured=false]  Deny when no budget is configured.
+ * @param {boolean} [opts.requireConfigured=true]  Deny when no budget is configured.
  * @param {number}  [opts.nowMs]  Override current time for testing.
  * @returns {{
  *   allowed: boolean,
@@ -176,13 +181,14 @@ function sumSpending(log, nowMs) {
  * }}
  */
 function checkBudget(amountSats, opts = {}) {
+  const requireConfigured = opts.requireConfigured !== false;
   const config = getConfig();
 
-  if (!config.enabled && opts.requireConfigured) {
+  if (!config.enabled && requireConfigured) {
     return {
       allowed: false,
       reason:
-        'NO_BUDGET_CONFIGURED: L402 auto-pay requires explicit spending limits. ' +
+        'NO_BUDGET_CONFIGURED: autonomous payment requires explicit spending limits. ' +
         'Set BLINK_BUDGET_HOURLY_SATS / BLINK_BUDGET_DAILY_SATS (env) or run ' +
         '`blink budget set --hourly <sats> --daily <sats>` before auto-paying.',
       hourlySpent: 0,

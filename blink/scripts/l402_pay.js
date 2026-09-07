@@ -659,7 +659,9 @@ async function main() {
 
   // ── Dry-run: report price and exit ──
   if (args.dryRun) {
-    const budgetInfo = satoshis !== null ? checkBudget(satoshis) : null;
+    // Reporting only — dry-run never spends. Opt out of the fail-closed default
+    // so an unconfigured budget shows remaining limits instead of a denial.
+    const budgetInfo = satoshis !== null ? checkBudget(satoshis, { requireConfigured: false }) : null;
     const output = {
       event: 'l402_dry_run',
       url: args.url,
