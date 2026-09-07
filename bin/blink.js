@@ -253,6 +253,53 @@ commands['create-invoice-usd'] = {
   },
 };
 
+commands['create-invoice-lnaddress'] = {
+  description:
+    'Receive to any Blink Lightning Address (custodial OR non-custodial/Spark) via LNURL-pay — no API key needed',
+  args: [
+    { name: 'address', required: true, description: 'Lightning Address (user@blink.sv) or bare username' },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+    { name: 'memo', required: false, variadic: true, description: 'Optional comment text' },
+  ],
+  options: {
+    timeout: { type: 'string', default: '300' },
+    verify: { type: 'boolean', default: true },
+  },
+  optMeta: {
+    timeout: { description: 'LUD-21 verify-poll timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    verify: { description: 'Poll LUD-21 verify for settlement (use --no-verify to skip)' },
+  },
+  examples: [
+    'blink create-invoice-lnaddress alice@blink.sv 1000',
+    'blink create-invoice-lnaddress alice 5000 "Coffee"',
+    'blink create-invoice-lnaddress alice@blink.sv 1000 --no-verify',
+  ],
+  action: async (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const argv = [String(pos[0]), String(pos[1])];
+    const memo = pos.slice(2);
+    if (memo.length > 0) argv.push(...memo);
+    argv.push('--timeout', String(timeout));
+    if (opts.verify === false) argv.push('--no-verify');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'create_invoice_lnaddress.js'));
+    await main();
+  },
+};
+
+commands['resolve-receiver'] = {
+  description: 'Classify a Blink identifier as custodial or non-custodial (Spark), or report it does not exist',
+  args: [{ name: 'identifier', required: true, description: 'Bare username or user@blink.sv' }],
+  options: {},
+  optMeta: {},
+  examples: ['blink resolve-receiver alice', 'blink resolve-receiver alice@blink.sv'],
+  action: async (pos) => {
+    setProcessArgv([pos[0]]);
+    const { main } = require(path.join(scriptsDir, 'resolve_receiver.js'));
+    await main();
+  },
+};
+
 commands['check-invoice'] = {
   description: 'Check payment status of a Lightning invoice by payment hash',
   args: [

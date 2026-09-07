@@ -186,6 +186,134 @@ async function getAllWallets({ apiKey, apiUrl, timeoutMs }) {
   return data.me.defaultAccount.wallets;
 }
 
+// ── Receiver resolution (custodial vs non-custodial) ─────────────────────────
+//
+// Blink serves LNURL-pay on `blink.sv` for BOTH custodial and non-custodial
+// (Spark) accounts; the blink-lnurl-server routes each recipient to the right
+// provider internally. The account TYPE is not encoded in the domain, so the
+// only way to classify an identifier from the outside is:
+//
+//   1. Custodial probe: query `accountDefaultWallet(username)`.
+//        Returns a wallet id  => the identifier is a CUSTODIAL Blink account.
+//   2. LNURL fallback: fetch `.well-known/lnurlp/{username}` on the same host.
+//        Returns a valid payRequest => the identifier is a NON-CUSTODIAL
+//        (Spark) account served via the LNURL server.
+//   3. Neither => the address does not exist.
+//
+// This mirrors the rule blink-terminal shipped (PR #37). It is the crux of the
+// "does this address exist / which mechanism do I use" question and is exactly
+// where a first-class Blink GraphQL resolution mutation could replace this
+// two-step client dance (see the research findings / issue #940).
+
+const DEFAULT_LN_ADDRESS_DOMAIN = 'blink.sv';
+
+// Only blink.sv is allowed as a resolution target. This is an SSRF guard: the
+// resolver turns a user-supplied identifier into an outbound network request,
+// so an arbitrary domain must never be probed. (Same guard blink-terminal
+// added as a review blocker.)
+const ALLOWED_LN_ADDRESS_DOMAINS = new Set(['blink.sv']);
+
+const ACCOUNT_DEFAULT_WALLET_QUERY = `
+  query AccountDefaultWallet($username: Username!) {
+    accountDefaultWallet(username: $username) {
+      id
+      walletCurrency
+    }
+  }
+`;
+
+/**
+ * Look up a custodial account's default BTC wallet by username.
+ * Returns null when the username is not a custodial Blink account.
+ *
+ * @param {object} opts
+ * @param {string} opts.username
+ * @param {string} [opts.apiKey]
+ * @param {string} [opts.apiUrl]
+ * @param {number} [opts.timeoutMs]
+ * @returns {Promise<{ id: string, walletCurrency: string }|null>}
+ */
+async function getCustodialDefaultWallet({ username, apiKey = null, apiUrl, timeoutMs }) {
+  try {
+    const data = await graphqlRequest({
+      query: ACCOUNT_DEFAULT_WALLET_QUERY,
+      variables: { username },
+      apiKey,
+      apiUrl: apiUrl || DEFAULT_API_URL,
+      timeoutMs,
+    });
+    return (data && data.accountDefaultWallet) || null;
+  } catch {
+    // A GraphQL "account does not exist" error is expected for non-custodial
+    // (Spark) users — treat any failure here as "not a custodial account" and
+    // let the LNURL fallback decide.
+    return null;
+  }
+}
+
+/**
+ * Resolve a receiver identifier to its account type and how to receive to it.
+ *
+ * @param {string} identifier   Bare username or `user@blink.sv`.
+ * @param {object} [opts]
+ * @param {string} [opts.apiKey]        Optional — improves custodial probe.
+ * @param {string} [opts.apiUrl]
+ * @param {string} [opts.defaultDomain] Defaults to blink.sv.
+ * @param {number} [opts.timeoutMs]
+ * @returns {Promise<{ type: 'custodial'|'lnaddress', username: string, domain: string,
+ *                     lightningAddress: string, walletId: string|null }>}
+ */
+async function resolveReceiver(identifier, opts = {}) {
+  // Lazy require to keep _lnurl.js optional for callers that never resolve.
+  const { parseLightningAddress, fetchLnurlPayMetadata } = require('./_lnurl');
+
+  const parsed = parseLightningAddress(identifier);
+  const domain = parsed.domain || opts.defaultDomain || DEFAULT_LN_ADDRESS_DOMAIN;
+
+  // SSRF guard: reject any explicit non-Blink domain before any network call.
+  if (!ALLOWED_LN_ADDRESS_DOMAINS.has(domain)) {
+    throw new Error(`Refusing to resolve non-Blink domain '${domain}'. Only ${[...ALLOWED_LN_ADDRESS_DOMAINS].join(', ')} is allowed.`);
+  }
+
+  const lightningAddress = `${parsed.username}@${domain}`;
+
+  // 1. Custodial probe.
+  const custodialWallet = await getCustodialDefaultWallet({
+    username: parsed.username,
+    apiKey: opts.apiKey || null,
+    apiUrl: opts.apiUrl,
+    timeoutMs: opts.timeoutMs,
+  });
+  if (custodialWallet && custodialWallet.id) {
+    return {
+      type: 'custodial',
+      username: parsed.username,
+      domain,
+      lightningAddress,
+      walletId: custodialWallet.id,
+    };
+  }
+
+  // 2. LNURL fallback (non-custodial / Spark).
+  try {
+    await fetchLnurlPayMetadata(parsed.username, domain, { timeoutMs: opts.timeoutMs });
+    return {
+      type: 'lnaddress',
+      username: parsed.username,
+      domain,
+      lightningAddress,
+      walletId: null,
+    };
+  } catch (err) {
+    if (err.code === 'LNURL_NOT_FOUND') {
+      const e = new Error(`'${lightningAddress}' does not seem to be a Blink address that exists.`);
+      e.code = 'RECEIVER_NOT_FOUND';
+      throw e;
+    }
+    throw err;
+  }
+}
+
 // ── Currency conversion ──────────────────────────────────────────────────────
 
 const CONVERSION_QUERY = `
@@ -541,6 +669,13 @@ module.exports = {
   WALLET_QUERY,
   getWallet,
   getAllWallets,
+
+  // Receiver resolution (custodial vs non-custodial)
+  DEFAULT_LN_ADDRESS_DOMAIN,
+  ALLOWED_LN_ADDRESS_DOMAINS,
+  ACCOUNT_DEFAULT_WALLET_QUERY,
+  getCustodialDefaultWallet,
+  resolveReceiver,
 
   // Currency
   CONVERSION_QUERY,
