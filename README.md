@@ -57,6 +57,37 @@ blink l402-verify --token <macaroon>:<preimage>        # verify a client's payme
 | `blink subscribe-updates`                 | Stream account activity updates via WebSocket (NDJSON)           |
 | `blink qr <bolt11>`                       | Generate a QR code for a Lightning invoice (terminal + PNG file) |
 
+### Non-custodial (Spark) accounts
+
+Blink now offers **self-custodial (Spark)** accounts alongside custodial ones.
+These commands add parity for non-custodial accounts. See
+[`blink/references/non-custodial.md`](blink/references/non-custodial.md) for the
+full model and the API-growth research.
+
+**Receive — no credentials, no seed** (works for _any_ Blink Lightning Address,
+custodial or non-custodial; uses public LNURL-pay on `blink.sv`):
+
+| Command                                              | Description                                                             |
+| ---------------------------------------------------- | ---------------------------------------------------------------------- |
+| `blink resolve-receiver <identifier>`                | Classify a `user@blink.sv` / bare username as custodial or Spark        |
+| `blink create-invoice-lnaddress <addr> <sats> [memo]`| Receive to any Blink address via LNURL-pay + LUD-21 verify (no API key) |
+
+**Balance / send / history / events — require the account seed** via the Breez
+Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
+`SPARK_MNEMONIC` (12/24 BIP39 words — spend authority, keep secret) and
+`BREEZ_API_KEY`:
+
+| Command                                   | Description                                                        |
+| ----------------------------------------- | ----------------------------------------------------------------- |
+| `blink spark-balance`                     | Show a Spark account BTC balance via the SDK                       |
+| `blink spark-send <destination> <sats>`   | Sign & send BTC from a Spark account (`--dry-run` shows fees)      |
+| `blink spark-transactions`                | List Spark account payments (SDK-local history)                   |
+| `blink spark-subscribe`                   | Stream live Spark wallet events                                   |
+
+> **Note:** Non-custodial **send** is BTC-only in this spike and cannot go
+> through the Blink API — it is signed locally with the seed. Only receive works
+> credential-free. USD/Stablesats is out of scope.
+
 ### Swaps
 
 | Command                                   | Description                                         |

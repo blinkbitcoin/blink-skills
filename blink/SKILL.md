@@ -1,5 +1,5 @@
 ---
-name: blink
+name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
 version: 2.0.0
 repository: https://github.com/blinkbitcoin/blink-skill
@@ -7,7 +7,7 @@ metadata:
   oa:
     project: blink
     identifier: blink
-    version: '1.4.6'
+    version: '1.8.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -35,7 +35,12 @@ Bitcoin Lightning wallet operations via the Blink API. Enables agents to check b
 
 ## What is Blink?
 
-Blink is a custodial Bitcoin Lightning wallet with a GraphQL API. Key concepts:
+Blink is a Bitcoin Lightning wallet with a GraphQL API. Accounts are either
+**custodial** (Blink holds the keys; this is the default and what most commands
+target) or **non-custodial (Spark)** (the user holds a seed). See
+`references/non-custodial.md` for the non-custodial commands
+(`resolve-receiver`, `create-invoice-lnaddress`, and the seed-gated `spark-*`
+commands). Key concepts:
 
 - **API Key** — authentication token (format: `blink_...`) with scoped permissions (Read, Receive, Write)
 - **BTC Wallet** — balance denominated in satoshis
@@ -118,7 +123,8 @@ blink --help  # verify
 
 These rules are mandatory for any AI agent using this skill:
 
-1. **Ask before spending.** Never execute `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, or `swap-execute` without explicit user confirmation of the amount and recipient.
+1. **Ask before spending.** Never execute `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `swap-execute`, or `spark-send` without explicit user confirmation of the amount and recipient.
+   - **Non-custodial seed is sacred.** `SPARK_MNEMONIC` grants full spend authority over a self-custodial account. Never log, echo, display, transmit, or write it. It is read only from the environment variable, never from files.
 2. **Dry-run first.** For swaps, always run with `--dry-run` before executing for real unless the user explicitly says to skip it.
 3. **Check balance before sending.** Always run `balance` before any payment or swap to verify sufficient funds.
 4. **Probe fees before paying.** Run `fee-probe` before `pay-invoice` to show the user the fee cost.
@@ -1211,8 +1217,9 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
+- **Fail closed for auto-pay:** `l402-pay` refuses to run unless a budget AND a non-empty domain allowlist are explicitly configured (`NO_BUDGET_CONFIGURED` / `NO_ALLOWLIST_CONFIGURED` errors explain the setup)
 - **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply
-- **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget
+- **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
 
