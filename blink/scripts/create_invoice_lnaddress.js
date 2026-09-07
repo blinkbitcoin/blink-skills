@@ -36,7 +36,13 @@
  * Dependencies: None (uses Node.js built-in fetch).
  */
 
-const { getApiKey, getApiUrl, resolveReceiver, DEFAULT_LN_ADDRESS_DOMAIN } = require('./_blink_client');
+const {
+  getApiKey,
+  getApiUrl,
+  resolveReceiver,
+  DEFAULT_LN_ADDRESS_DOMAIN,
+  ALLOWED_LN_ADDRESS_DOMAINS,
+} = require('./_blink_client');
 const { getInvoiceFromLightningAddress, verifyLnurlPayment } = require('./_lnurl');
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
@@ -85,15 +91,47 @@ function parseArgs(argv) {
 
 // ── LUD-21 verify polling ─────────────────────────────────────────────────────
 
-async function pollVerify(verifyUrl, timeoutSeconds) {
+// Verify-poll failures that will never succeed on retry, so must abort the poll
+// rather than be absorbed into "not settled yet".
+const FATAL_VERIFY_PATTERNS = [/DIFFERENT invoice/, /no `pr` to bind/, /Refusing to fetch/];
+
+/**
+ * Is this verify error a permanent policy rejection rather than a transient fault?
+ * @param {Error} e
+ * @returns {boolean}
+ */
+function isFatalVerifyError(e) {
+  return FATAL_VERIFY_PATTERNS.some((re) => re.test(e && e.message ? e.message : ''));
+}
+
+/**
+ * Poll a LUD-21 verify URL until the invoice settles or the deadline passes.
+ *
+ * `expectedPr` binds the result to the invoice we actually minted, so a
+ * `settled: true` describing some other payment is treated as an error rather
+ * than reported as "you were paid".
+ *
+ * @param {string} verifyUrl
+ * @param {number} timeoutSeconds  0 means no timeout.
+ * @param {string} expectedPr      The BOLT-11 this verify URL belongs to.
+ */
+async function pollVerify(verifyUrl, timeoutSeconds, expectedPr) {
   const intervalMs = 3000;
   const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
 
   for (;;) {
     let status;
     try {
-      status = await verifyLnurlPayment(verifyUrl);
+      status = await verifyLnurlPayment(verifyUrl, {
+        allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
+        expectedPr,
+      });
     } catch (e) {
+      // A transient HTTP fault is worth retrying. A policy rejection — the
+      // response settled a DIFFERENT invoice, or the URL failed the SSRF guard
+      // — is deterministic: retrying only hides it, and with `--timeout 0` the
+      // loop would hide it forever.
+      if (isFatalVerifyError(e)) throw e;
       console.error(`verify poll error (will retry): ${e.message}`);
       status = { settled: false };
     }
@@ -136,6 +174,7 @@ async function main() {
   // 2. Mint the invoice over LNURL-pay (works for both account types).
   const invoice = await getInvoiceFromLightningAddress(receiver.lightningAddress, args.amountSats, args.memo, {
     defaultDomain: DEFAULT_LN_ADDRESS_DOMAIN,
+    allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
   });
 
   const creationResult = {
@@ -165,7 +204,7 @@ async function main() {
   console.error(
     'Note: for non-custodial (Spark) recipients the settled flag is webhook-populated and may lag a few seconds.',
   );
-  const result = await pollVerify(invoice.verify, args.timeoutSeconds);
+  const result = await pollVerify(invoice.verify, args.timeoutSeconds, invoice.paymentRequest);
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.settled ? 0 : 1);
 }
@@ -177,4 +216,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseArgs };
+module.exports = { main, parseArgs, pollVerify, isFatalVerifyError };

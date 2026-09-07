@@ -69,7 +69,8 @@ if (require.main === module) {
     .then(() => {
       // The Breez SDK keeps event-loop handles open after disconnect; force a
       // clean exit so the command returns promptly for the caller/agent.
-      process.exit(0);
+      // Preserves any exit code main() set.
+      process.exit(process.exitCode || 0);
     })
     .catch((e) => {
       console.error('Error:', e.message);

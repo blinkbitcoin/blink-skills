@@ -96,12 +96,20 @@ async function graphqlRequest({
     });
 
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      // Tagged so callers can tell a server/transport failure apart from the
+      // API successfully answering "no". Message format is unchanged.
+      const e = new Error(`HTTP ${res.status}: ${await res.text()}`);
+      e.code = 'HTTP_ERROR';
+      e.status = res.status;
+      throw e;
     }
 
     const json = await res.json();
     if (json.errors && json.errors.length > 0) {
-      throw new Error(`GraphQL error: ${json.errors.map((e) => e.message).join(', ')}`);
+      const e = new Error(`GraphQL error: ${json.errors.map((x) => x.message).join(', ')}`);
+      e.code = 'GRAPHQL_ERROR';
+      e.graphQLErrors = json.errors;
+      throw e;
     }
     return json.data;
   } finally {
@@ -222,9 +230,64 @@ const ACCOUNT_DEFAULT_WALLET_QUERY = `
   }
 `;
 
+// A GraphQL error that genuinely means "there is no such custodial account",
+// as opposed to one that means "the lookup did not happen". Only the former may
+// fall through to the LNURL branch.
+//
+// These patterns are deliberately ANCHORED TO THE ACCOUNT. A bare /not found/
+// would also match "Cannot query field \"accountDefaultWallet\" ... not found"
+// (schema drift) and a gateway's "404 Not Found" — both of which mean the
+// lookup failed, and both of which would then misreport EVERY custodial account
+// as non-custodial. A bare /invalid username/ likewise matches "Invalid
+// username or password", which is an auth failure, not an absent account.
+const NOT_FOUND_PATTERNS = [
+  /account\s+does\s+not\s+exist/i,
+  /(account|user|username)\s+(was\s+)?not\s+found/i,
+  /no\s+account\s+(found\s+)?for/i,
+  /(username|user)\s+does\s+not\s+exist/i,
+  /unknown\s+(user|username|account)/i,
+];
+
+// Structured codes are preferred over prose when the server supplies them.
+const NOT_FOUND_CODES = new Set(['ACCOUNT_NOT_FOUND', 'USERNAME_NOT_FOUND', 'NOT_FOUND', 'USER_NOT_FOUND']);
+
+/**
+ * Does this GraphQL error mean the account is absent, rather than the lookup
+ * having failed?
+ *
+ * Only ever consulted for `GRAPHQL_ERROR`, so transport, timeout and HTTP
+ * failures can never reach these patterns at all.
+ *
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function isAccountNotFoundError(err) {
+  if (!err || err.code !== 'GRAPHQL_ERROR') return false;
+  const errors = err.graphQLErrors || [];
+
+  // Prefer an explicit machine-readable code when one is present.
+  for (const e of errors) {
+    const code = e && ((e.extensions && e.extensions.code) || e.code);
+    if (code && NOT_FOUND_CODES.has(String(code).toUpperCase())) return true;
+  }
+
+  const messages = errors.map((e) => String(e && e.message)).join(' ') || String(err.message);
+  return NOT_FOUND_PATTERNS.some((re) => re.test(messages));
+}
+
 /**
  * Look up a custodial account's default BTC wallet by username.
- * Returns null when the username is not a custodial Blink account.
+ *
+ * Returns null ONLY when the API successfully answered that no such custodial
+ * account exists. Every other failure — transport, timeout, authentication,
+ * 5xx, an unrecognised GraphQL error — is rethrown.
+ *
+ * This distinction is load-bearing. Swallowing all errors here meant a
+ * transient 503 on the custodial probe made a custodial account fall through to
+ * the LNURL branch and get reported as `{ type: "lnaddress", walletId: null }`
+ * — a confident wrong answer about someone's account type, produced by an
+ * outage. Failing loudly is correct: the caller can retry, but it cannot detect
+ * a misclassification.
  *
  * @param {object} opts
  * @param {string} opts.username
@@ -232,6 +295,7 @@ const ACCOUNT_DEFAULT_WALLET_QUERY = `
  * @param {string} [opts.apiUrl]
  * @param {number} [opts.timeoutMs]
  * @returns {Promise<{ id: string, walletCurrency: string }|null>}
+ * @throws {Error} If the lookup itself could not be completed.
  */
 async function getCustodialDefaultWallet({ username, apiKey = null, apiUrl, timeoutMs }) {
   try {
@@ -243,11 +307,15 @@ async function getCustodialDefaultWallet({ username, apiKey = null, apiUrl, time
       timeoutMs,
     });
     return (data && data.accountDefaultWallet) || null;
-  } catch {
-    // A GraphQL "account does not exist" error is expected for non-custodial
-    // (Spark) users — treat any failure here as "not a custodial account" and
-    // let the LNURL fallback decide.
-    return null;
+  } catch (err) {
+    if (isAccountNotFoundError(err)) return null;
+    const e = new Error(
+      `Could not determine whether '${username}' is a custodial Blink account: ${err.message}. ` +
+        'Refusing to guess the account type from a failed lookup.',
+    );
+    e.code = 'CUSTODIAL_PROBE_FAILED';
+    e.cause = err;
+    throw e;
   }
 }
 
@@ -272,7 +340,9 @@ async function resolveReceiver(identifier, opts = {}) {
 
   // SSRF guard: reject any explicit non-Blink domain before any network call.
   if (!ALLOWED_LN_ADDRESS_DOMAINS.has(domain)) {
-    throw new Error(`Refusing to resolve non-Blink domain '${domain}'. Only ${[...ALLOWED_LN_ADDRESS_DOMAINS].join(', ')} is allowed.`);
+    throw new Error(
+      `Refusing to resolve non-Blink domain '${domain}'. Only ${[...ALLOWED_LN_ADDRESS_DOMAINS].join(', ')} is allowed.`,
+    );
   }
 
   const lightningAddress = `${parsed.username}@${domain}`;
@@ -296,7 +366,10 @@ async function resolveReceiver(identifier, opts = {}) {
 
   // 2. LNURL fallback (non-custodial / Spark).
   try {
-    await fetchLnurlPayMetadata(parsed.username, domain, { timeoutMs: opts.timeoutMs });
+    await fetchLnurlPayMetadata(parsed.username, domain, {
+      timeoutMs: opts.timeoutMs,
+      allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
+    });
     return {
       type: 'lnaddress',
       username: parsed.username,
@@ -674,6 +747,7 @@ module.exports = {
   DEFAULT_LN_ADDRESS_DOMAIN,
   ALLOWED_LN_ADDRESS_DOMAINS,
   ACCOUNT_DEFAULT_WALLET_QUERY,
+  isAccountNotFoundError,
   getCustodialDefaultWallet,
   resolveReceiver,
 

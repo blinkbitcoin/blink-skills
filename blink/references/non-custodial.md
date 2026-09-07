@@ -36,12 +36,54 @@ the recipient is custodial or Spark. `create-invoice-lnaddress` does this:
 3. It detects settlement by polling the **LUD-21 `verify`** URL. For Spark
    recipients this flag is webhook-populated and may lag a few seconds.
 
-SSRF guard: only `blink.sv` is an allowed resolution target.
+### SSRF guard
+
+Only `blink.sv` is an allowed target. LNURL is a protocol in which the server
+hands the client further URLs to fetch, so the allowlist is enforced at the
+network boundary — inside the one function every request funnels through — and
+re-checked on **every hop**:
+
+| Hop | Checked |
+| --- | --- |
+| `.well-known/lnurlp/<user>` metadata URL | host allowlist, HTTPS |
+| payRequest `callback` | host allowlist, HTTPS |
+| LUD-21 `verify` | host allowlist, HTTPS |
+| every HTTP redirect | redirects are followed manually, each `Location` re-validated, max 3 |
+
+Being a local address is **not** a licence to be fetched: only the allowlist
+admits a host. Private, loopback and link-local IP literals are refused in every
+spelling — `127.0.0.1`, the integer form `2130706433`, `0x7f000001`, `127.1`,
+`[::1]`, and IPv4-mapped IPv6 (`::ffff:a9fe:a9fe`, which is what `URL` actually
+produces) — including `169.254.0.0/16` cloud metadata. Non-standard ports are
+refused unless the caller listed `host:port` explicitly. Plaintext `http` is
+permitted only for a local host the caller deliberately allowed; the match is
+exact, so `localhost.attacker.example` does not qualify.
+
+**Known limit:** the guard is name-based and does not pin the resolved address,
+so it does not defend against DNS rebinding. Closing that needs resolve-then-pin
+at the socket layer, which Node's `fetch` does not currently expose.
+
+### Response binding
+
+A remote server's answer is checked against the request that produced it:
+
+- The callback's `pr` must decode as a BOLT-11 invoice, on the expected network,
+  for **exactly** the amount requested. Amountless invoices are refused.
+- A LUD-21 `settled: true` is accepted only when its `pr` matches the invoice
+  being polled — otherwise another payment's settlement would read as your own.
 
 ## Balance / send / history / events (require the seed)
 
 These operations need the account seed and run the Breez Spark SDK headless in
 Node (Node 22+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
+
+**Install requirement:** the SDK persists wallet state through `better-sqlite3`,
+a native module compiled at install time (needs `python3`, `make`, a C++
+compiler). Under `--ignore-scripts` the package is unpacked but never built and
+the SDK suppresses the warning, so `require()` still succeeds — `connect()`
+therefore probes `defaultStorage()` up front and fails with
+`SPARK_STORAGE_UNAVAILABLE` and the `npm rebuild better-sqlite3` fix, instead of
+surfacing an opaque bindings error later.
 
 - `spark-balance` → `sdk.getInfo().balanceSats`
 - `spark-send` → classify the destination with `sdk.parse()`, then:
@@ -52,10 +94,22 @@ Node (Node 22+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
 - `spark-transactions` → `sdk.listPayments`
 - `spark-subscribe` → `sdk.addEventListener`
 
+`spark-send` exits **non-zero** when the SDK reports a `failed` payment status,
+so automation cannot read a failed payment as success. `pending` exits zero: it
+is still in flight.
+
 **Security:** the seed grants spend authority. It is read only from
 `SPARK_MNEMONIC` (never from shell rc files), and never logged or written in
 readable form. The SDK's local storage dir is keyed by a non-reversible hash of
 the seed.
+
+The BIP39 checksum check **fails closed**. A word count is not validation:
+twelve arbitrary dictionary words pass it, and one mistyped word then derives a
+*different, valid, empty* wallet — indistinguishable to the user from losing
+their funds. If `bip39` is unavailable the command aborts
+(`MNEMONIC_VALIDATOR_UNAVAILABLE`) rather than continuing unverified, because
+treating "cannot check" as "checked and fine" silently disables the control.
+Neither error echoes the seed.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

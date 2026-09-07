@@ -86,34 +86,52 @@ function requireNode22() {
 }
 
 /**
- * Validate a mnemonic's BIP39 checksum, when the `bip39` package is available.
+ * Validate a mnemonic's BIP39 checksum.
  *
  * A word count alone is not validation: twelve arbitrary dictionary words pass
  * it, and a single mistyped word then derives a DIFFERENT, valid, empty wallet.
  * The user sees a zero balance and no error, which looks like fund loss.
  *
- * `bip39` is an optionalDependency (it rides along with the Spark SDK, which is
- * already optional), so degrade to the word-count check when it is absent
- * rather than hard-failing an optional install.
+ * FAILS CLOSED. This function has exactly two outcomes: it returns true because
+ * the checksum verified, or it throws. It must never return false, and it must
+ * never conflate "the validator could not run" with "the seed is fine" — that
+ * conflation IS the vulnerability, because it silently disables the very
+ * control that prevents deriving the wrong wallet. A missing validator is
+ * therefore a hard error, distinguishable by `e.code`:
+ *
+ *   MNEMONIC_VALIDATOR_UNAVAILABLE — `bip39` is not installed.
+ *   MNEMONIC_INVALID_CHECKSUM      — the phrase is not a valid BIP39 mnemonic.
  *
  * @param {string} mnemonic
- * @returns {boolean} true if validated, false if the validator is unavailable.
- * @throws {Error} If the validator is available and the checksum is invalid.
+ * @returns {true}
+ * @throws {Error} If the validator is unavailable or the checksum is invalid.
  */
 function validateMnemonicChecksum(mnemonic) {
   let bip39;
   try {
     bip39 = require('bip39');
-  } catch {
-    return false;
+  } catch (err) {
+    const e = new Error(
+      'Cannot verify SPARK_MNEMONIC: the `bip39` package is not installed, so the BIP39 ' +
+        'checksum check cannot run. Refusing to continue unverified — an unnoticed typo in ' +
+        'the seed derives a different, valid, EMPTY wallet, which looks exactly like losing ' +
+        'your funds. Install it with:\n' +
+        '    npm install bip39\n' +
+        'Note that `npm install --omit=optional` and `--omit=dev` both skip it.\n' +
+        `Original load error: ${err.message}`,
+    );
+    e.code = 'MNEMONIC_VALIDATOR_UNAVAILABLE';
+    throw e;
   }
   if (!bip39.validateMnemonic(mnemonic)) {
     // Deliberately does not echo the mnemonic or name the offending word.
-    throw new Error(
+    const e = new Error(
       'SPARK_MNEMONIC failed BIP39 checksum validation. The word count is right but the ' +
         'phrase is not a valid BIP39 mnemonic — usually a mistyped or transposed word. ' +
         'Connecting anyway would silently derive a different, empty wallet.',
     );
+    e.code = 'MNEMONIC_INVALID_CHECKSUM';
+    throw e;
   }
   return true;
 }
@@ -122,7 +140,12 @@ function validateMnemonicChecksum(mnemonic) {
  * Read the non-custodial account seed from the environment.
  *
  * SECURITY: env var only — no rc-file scanning for seeds. Never logged.
+ *
+ * Fails closed: the BIP39 checksum MUST verify before the seed is returned. If
+ * the validator cannot run, this throws rather than proceeding unverified.
+ *
  * @returns {string} The BIP39 mnemonic.
+ * @throws {Error} If unset, the wrong length, or the checksum cannot be verified.
  */
 function getMnemonic() {
   const mnemonic = process.env.SPARK_MNEMONIC;
@@ -168,6 +191,46 @@ function storageDirFor(mnemonic, network) {
 }
 
 /**
+ * Verify the SDK's default storage backend can actually be instantiated.
+ *
+ * The Node build of the Spark SDK stores wallet state in SQLite via
+ * `better-sqlite3`, a NATIVE module that must be compiled at install time. When
+ * npm runs with `--ignore-scripts` (common in CI, sandboxes and locked-down
+ * corporate installs) the package is unpacked but never built, and the SDK
+ * SUPPRESSES the resulting warning. `require()` of the SDK then succeeds, so
+ * everything looks installed — and each `spark-*` command instead fails deep
+ * inside `connect()` with `Could not locate the bindings file`.
+ *
+ * Probing here converts that into one actionable error, before we have asked
+ * for the seed.
+ *
+ * @param {object} mod        The loaded SDK module.
+ * @param {string} storageDir
+ * @throws {Error} If default storage cannot be created.
+ */
+function assertStorageAvailable(mod, storageDir) {
+  if (typeof mod.defaultStorage !== 'function') return; // older SDK: nothing to probe
+  try {
+    mod.defaultStorage(storageDir);
+  } catch (err) {
+    const e = new Error(
+      `The Breez Spark SDK is installed but its storage backend is not usable.\n` +
+        `${SPARK_PACKAGE} stores wallet state in SQLite through the native module\n` +
+        `\`better-sqlite3\`, which must be COMPILED during install.\n\n` +
+        `This usually means npm ran with --ignore-scripts, or the machine lacks a\n` +
+        `C++ toolchain. Fix with:\n` +
+        `    npm rebuild better-sqlite3\n` +
+        `or reinstall allowing build scripts to run:\n` +
+        `    npm install --foreground-scripts\n` +
+        `Building it requires python3, make and a C++ compiler (build-essential).\n` +
+        `Original storage error: ${err.message}`,
+    );
+    e.code = 'SPARK_STORAGE_UNAVAILABLE';
+    throw e;
+  }
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
  *
  * @param {object} [opts]
@@ -186,6 +249,9 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
   const storageDir = storageDirFor(mnemonic, network);
   // Ensure the storage dir exists.
   require('fs').mkdirSync(storageDir, { recursive: true });
+
+  // Fail fast with a build-tools message rather than an opaque bindings error.
+  assertStorageAvailable(mod, storageDir);
 
   const sdk = await mod.connect({
     config,
@@ -294,6 +360,7 @@ module.exports = {
   getMnemonic,
   getBreezApiKey,
   storageDirFor,
+  assertStorageAvailable,
   connect,
   normalizeInfo,
   waitForStableBalance,

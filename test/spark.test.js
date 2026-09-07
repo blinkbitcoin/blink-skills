@@ -49,25 +49,57 @@ describe('_spark_sdk.getMnemonic', () => {
     // "abandon" x12 has a valid word count and valid words, but the checksum
     // demands "about" as the 12th. This is the mistyped-word case that would
     // otherwise silently derive a different, empty wallet.
+    //
+    // Review finding #2: this used to accept the seed when `bip39` was absent,
+    // because "validator unavailable" and "seed is fine" were the same return
+    // value. Whichever way the dependency falls, the seed must NOT be accepted.
     const saved = process.env.SPARK_MNEMONIC;
     process.env.SPARK_MNEMONIC = new Array(12).fill('abandon').join(' ');
     try {
-      let bip39Available = true;
-      try {
-        require('bip39');
-      } catch {
-        bip39Available = false;
-      }
-      if (bip39Available) {
-        assert.throws(() => spark.getMnemonic(), /BIP39 checksum/);
-      } else {
-        // Without the optional validator we degrade to the word-count check.
-        assert.equal(spark.getMnemonic().split(' ').length, 12);
-      }
+      assert.throws(
+        () => spark.getMnemonic(),
+        (e) => e.code === 'MNEMONIC_INVALID_CHECKSUM' || e.code === 'MNEMONIC_VALIDATOR_UNAVAILABLE',
+        'an invalid-checksum seed must never be returned, validator present or not',
+      );
     } finally {
       if (saved !== undefined) process.env.SPARK_MNEMONIC = saved;
       else delete process.env.SPARK_MNEMONIC;
     }
+  });
+
+  it('fails closed when the bip39 validator cannot be loaded', (t) => {
+    // Simulate the --omit=optional install: make require('bip39') throw, and
+    // assert we abort rather than proceeding unverified.
+    const Module = require('node:module');
+    const realResolve = Module._resolveFilename;
+    // Resolve (and evict) BEFORE patching — afterwards the path is unresolvable.
+    const bip39Path = require.resolve('bip39');
+    delete require.cache[bip39Path];
+    t.after(() => {
+      Module._resolveFilename = realResolve;
+      delete require.cache[bip39Path];
+    });
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === 'bip39') {
+        const e = new Error("Cannot find module 'bip39'");
+        e.code = 'MODULE_NOT_FOUND';
+        throw e;
+      }
+      return realResolve.call(this, request, ...rest);
+    };
+
+    assert.throws(
+      () => spark.validateMnemonicChecksum('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
+      (e) => e.code === 'MNEMONIC_VALIDATOR_UNAVAILABLE',
+      'a missing validator must abort, not silently pass',
+    );
+  });
+
+  it('never returns false — it returns true or throws', () => {
+    // The vulnerability was a falsy return being treated as "no problem" by the
+    // caller. Pin the contract so it cannot regress into a tri-state.
+    const valid = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+    assert.equal(spark.validateMnemonicChecksum(valid), true);
   });
 
   it('never includes the mnemonic in the checksum failure message', () => {
@@ -322,7 +354,7 @@ describe('spark_send main() destination routing', () => {
 
   let lastArgs;
 
-  function installMock({ parseType }) {
+  function installMock({ parseType, status = 'COMPLETED' }) {
     calls = [];
     lastArgs = {};
     const fakeSdk = {
@@ -341,7 +373,7 @@ describe('spark_send main() destination routing', () => {
       },
       async lnurlPay() {
         calls.push('lnurlPay');
-        return { payment: { id: 'ln-1', status: 'COMPLETED' } };
+        return { payment: { id: 'ln-1', status } };
       },
       async prepareSendPayment(req) {
         calls.push('prepareSendPayment');
@@ -350,7 +382,7 @@ describe('spark_send main() destination routing', () => {
       },
       async sendPayment() {
         calls.push('sendPayment');
-        return { payment: { id: 'bolt-1', status: 'COMPLETED' } };
+        return { payment: { id: 'bolt-1', status } };
       },
     };
     // Replace the cached _spark_sdk module with a fake connect().
@@ -375,6 +407,9 @@ describe('spark_send main() destination routing', () => {
     if (savedLog) console.log = savedLog;
     if (savedErr) console.error = savedErr;
     savedArgv = savedLog = savedErr = null;
+    // main() communicates failure via process.exitCode; leaking it would fail
+    // the whole test run.
+    process.exitCode = undefined;
   });
 
   async function runMain(argv) {
@@ -423,5 +458,89 @@ describe('spark_send main() destination routing', () => {
     const parsed = JSON.parse(out);
     assert.equal(parsed.dryRun, true);
     assert.equal(parsed.destinationType, 'lnurl');
+  });
+
+  // ── exit semantics (review finding #6) ─────────────────────────────────────
+  //
+  // The SDK RESOLVES for a failed payment rather than throwing, so without an
+  // explicit check the command exits 0 and every caller — shell, CI, agent —
+  // reads a payment that did not happen as a success.
+
+  it('exits non-zero when the payment status is failed (bolt11)', async () => {
+    installMock({ parseType: 'bolt11Invoice', status: 'failed' });
+    const out = await runMain(['lnbc100n1p...', '100']);
+    assert.equal(JSON.parse(out).status, 'failed', 'still emits explicit JSON');
+    assert.equal(process.exitCode, 1);
+  });
+
+  it('exits non-zero when the payment status is failed (lnurl)', async () => {
+    installMock({ parseType: 'lnUrlPay', status: 'failed' });
+    await runMain(['alice@blink.sv', '100']);
+    assert.equal(process.exitCode, 1);
+  });
+
+  it('is not fooled by SDK status casing', async () => {
+    installMock({ parseType: 'bolt11Invoice', status: 'FAILED' });
+    await runMain(['lnbc100n1p...', '100']);
+    assert.equal(process.exitCode, 1);
+  });
+
+  it('exits zero for a pending payment, which is still in flight', async () => {
+    installMock({ parseType: 'bolt11Invoice', status: 'pending' });
+    await runMain(['lnbc100n1p...', '100']);
+    assert.ok(!process.exitCode, 'pending is not a failure');
+  });
+
+  it('exits zero for a completed payment', async () => {
+    installMock({ parseType: 'bolt11Invoice', status: 'COMPLETED' });
+    await runMain(['lnbc100n1p...', '100']);
+    assert.ok(!process.exitCode);
+  });
+});
+
+// ── isFailedStatus ───────────────────────────────────────────────────────────
+
+describe('spark_send.isFailedStatus', () => {
+  const { isFailedStatus } = require('../blink/scripts/spark_send');
+
+  it('matches failed in any casing', () => {
+    assert.equal(isFailedStatus('failed'), true);
+    assert.equal(isFailedStatus('FAILED'), true);
+    assert.equal(isFailedStatus('Failed'), true);
+  });
+
+  it('does not match the non-failure statuses', () => {
+    for (const s of ['completed', 'COMPLETED', 'pending', 'SUBMITTED', '', null, undefined]) {
+      assert.equal(isFailedStatus(s), false, `${s} must not count as failed`);
+    }
+  });
+});
+
+// ── storage preflight (review finding #1) ────────────────────────────────────
+
+describe('_spark_sdk.assertStorageAvailable', () => {
+  it('passes when default storage can be created', () => {
+    const mod = { defaultStorage: () => ({}) };
+    assert.doesNotThrow(() => spark.assertStorageAvailable(mod, '/tmp/whatever'));
+  });
+
+  it('converts a native bindings failure into an actionable error', () => {
+    const mod = {
+      defaultStorage() {
+        throw new Error('Could not locate the bindings file. Tried: .../better_sqlite3.node');
+      },
+    };
+    assert.throws(
+      () => spark.assertStorageAvailable(mod, '/tmp/whatever'),
+      (e) =>
+        e.code === 'SPARK_STORAGE_UNAVAILABLE' &&
+        /better-sqlite3/.test(e.message) &&
+        /npm rebuild/.test(e.message) &&
+        /ignore-scripts/.test(e.message),
+    );
+  });
+
+  it('is a no-op on an SDK build with no defaultStorage', () => {
+    assert.doesNotThrow(() => spark.assertStorageAvailable({}, '/tmp/whatever'));
   });
 });

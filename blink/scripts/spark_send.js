@@ -158,6 +158,25 @@ async function prepareBolt(sdk, destination, amountSats) {
   return { prepareResponse, feeSats: feeFromPrepare(prepareResponse) };
 }
 
+/**
+ * Does this SDK payment status mean the payment did not go through?
+ *
+ * Compared case-insensitively because the SDK's casing has moved between
+ * versions (`failed` vs `FAILED`), and a casing mismatch here would silently
+ * restore the exit-0-on-failure bug.
+ *
+ * @param {string} status
+ * @returns {boolean}
+ */
+function isFailedStatus(status) {
+  // Accept both a plain string and a tagged variant ({ type: 'failed' }), which
+  // is how the SDK models several other enums and could plausibly become the
+  // shape here. `String({...})` is "[object Object]", which would quietly
+  // reinstate exit-0-on-failure.
+  const value = status && typeof status === 'object' ? status.type || status.status : status;
+  return String(value || '').toLowerCase() === 'failed';
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.destination || args.amountSats === null) {
@@ -205,12 +224,13 @@ async function main() {
     // 3. Send (signs locally) via the matching path.
     const result = lnurl ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
     const payment = result && result.payment ? result.payment : result;
+    const status = (payment && payment.status) || 'SUBMITTED';
 
     console.log(
       JSON.stringify(
         {
           event: 'send_result',
-          status: (payment && payment.status) || 'SUBMITTED',
+          status,
           destination: args.destination,
           destinationType: lnurl ? 'lnurl' : 'bolt11',
           amountSats: args.amountSats,
@@ -222,6 +242,15 @@ async function main() {
         2,
       ),
     );
+
+    // The SDK resolves rather than throws for a payment that FAILED, so exiting
+    // 0 here would tell every caller — shell, CI, agent — that a payment which
+    // did not happen succeeded. `pending` is not a failure: it is in flight and
+    // may yet complete, so it keeps a zero exit.
+    if (isFailedStatus(status)) {
+      process.exitCode = 1;
+      console.error(`Payment reported status '${status}'. Exiting non-zero.`);
+    }
   } finally {
     await disconnect();
   }
@@ -229,10 +258,17 @@ async function main() {
 
 if (require.main === module) {
   main()
-    .then(() => {
+    .then(async () => {
       // The Breez SDK keeps event-loop handles open after disconnect; force a
       // clean exit so the command returns promptly for the caller/agent.
-      process.exit(0);
+      // Drain stdout first — process.exit() can truncate a pending write when
+      // stdout is a pipe, and the JSON result is this command's whole product.
+      // Preserves any exit code main() set (e.g. 1 for a failed payment).
+      await new Promise((resolve) => {
+        if (process.stdout.writableLength === 0) return resolve();
+        process.stdout.write('', () => resolve());
+      });
+      process.exit(process.exitCode || 0);
     })
     .catch((e) => {
       console.error('Error:', e.message);
@@ -240,4 +276,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, feeFromPrepare, isLnurlPayInput, lnurlPayRequestFrom };
+module.exports = { main, parseArgs, feeFromPrepare, isLnurlPayInput, lnurlPayRequestFrom, isFailedStatus };

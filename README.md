@@ -88,6 +88,31 @@ Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 > through the Blink API — it is signed locally with the seed. Only receive works
 > credential-free. USD/Stablesats is out of scope.
 
+#### Installing the Spark dependencies
+
+The `spark-*` commands need two optional packages. Neither is required for any
+custodial command, and neither is loaded unless a `spark-*` command runs:
+
+```bash
+npm install   # installs optionalDependencies by default
+```
+
+- **`@breeztech/breez-sdk-spark`** (Node 22+) stores wallet state in SQLite via
+  **`better-sqlite3`, a native module that is compiled during install.** It
+  needs `python3`, `make` and a C++ compiler (`build-essential` on Debian/Ubuntu,
+  Xcode command line tools on macOS).
+- **`bip39`** validates the seed's BIP39 checksum.
+
+Two install flags will leave you with a broken Spark setup:
+
+| Flag | Effect |
+| --- | --- |
+| `--ignore-scripts` | `better-sqlite3` is unpacked but never built. The SDK suppresses the warning, so the install *looks* fine and every `spark-*` command then fails at connect time. Fix with `npm rebuild better-sqlite3`. |
+| `--omit=optional` | Skips both packages. `spark-*` commands refuse to run rather than proceeding without seed validation. |
+
+Both cases are detected at runtime and reported with the fix, rather than
+failing obscurely or — worse — continuing unvalidated.
+
 ### Swaps
 
 | Command                                   | Description                                         |

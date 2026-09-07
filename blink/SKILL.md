@@ -6,7 +6,7 @@ repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
     project: blink
-    identifier: blink
+    identifier: blink-wallet
     version: '1.8.0'
     expires_at_unix: 1798761600
     capabilities:
@@ -15,18 +15,21 @@ metadata:
       - filesystem:write
   openclaw:
     requires:
-      env: [BLINK_API_KEY]
+      # No env var is required skill-wide: `resolve-receiver` and
+      # `create-invoice-lnaddress` work with no credentials at all. Each command
+      # states its own requirement — BLINK_API_KEY for custodial operations,
+      # SPARK_MNEMONIC + BREEZ_API_KEY for the seed-gated spark-* commands.
       bins: [node]
-    optionalEnv: [BLINK_API_URL, BLINK_WS_URL, BLINK_L402_ROOT_KEY, BLINK_BUDGET_HOURLY_SATS, BLINK_BUDGET_DAILY_SATS, BLINK_L402_ALLOWED_DOMAINS]
+    optionalEnv: [BLINK_API_KEY, BLINK_API_URL, BLINK_WS_URL, BLINK_L402_ROOT_KEY, BLINK_BUDGET_HOURLY_SATS, BLINK_BUDGET_DAILY_SATS, BLINK_L402_ALLOWED_DOMAINS, SPARK_MNEMONIC, BREEZ_API_KEY, SPARK_NETWORK]
     primaryEnv: BLINK_API_KEY
     emoji: '⚡'
     homepage: 'https://github.com/blinkbitcoin/blink-skill'
     security:
-      secrets: ['BLINK_API_KEY']
-      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions'
-      filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json'
-      persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention)'
-      notes: 'Zero npm runtime dependencies. Only Node.js built-in modules used. No global installs required — scripts run standalone via node. BLINK_API_KEY is read from the environment only; shell rc files are never read.'
+      secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
+      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands only'
+      filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command is used'
+      persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
+      notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
 ---
 
 # Blink Skill
