@@ -15,7 +15,7 @@
 
 'use strict';
 
-const { describe, it, before, after, afterEach } = require('node:test');
+const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const os = require('node:os');
@@ -1171,5 +1171,218 @@ describe('runFeeProbe', () => {
     });
 
     assert.ok(capturedBody.query.includes('lnUsdInvoiceFeeProbe'), 'Expected USD mutation');
+  });
+});
+
+// ── l402_pay enforcement on the real (non-dry-run) payment path ──────────────
+
+/**
+ * These exercise the fail-closed guards on the path that actually spends.
+ * The dry-run tests above never reach them.
+ *
+ * Every denial case asserts that no request was made to the Blink GraphQL API.
+ * All network traffic — the L402 resource fetch and the Blink mutation alike —
+ * goes through global.fetch, so recording requested URLs is sufficient proof
+ * that the payment mutation was never reached.
+ */
+describe('l402_pay enforcement (non-dry-run)', () => {
+  const payPath = path.join(scriptsDir, 'l402_pay.js');
+  const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+  const storePath = path.join(scriptsDir, 'l402_store.js');
+  const budgetPath = path.join(scriptsDir, '_budget.js');
+  const clientPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_blink_client.js');
+
+  const BLINK_API = 'https://api.test.blink.sv/graphql';
+  // lnbc1000u = 100_000 sats
+  const INVOICE_100K = 'lnbc1000u1p0enforce';
+  // No digits in the human-readable part: decodeBolt11AmountSats returns null.
+  const INVOICE_NO_AMOUNT = 'lnbc1p0noamount';
+
+  const originalEnv = { ...process.env };
+  const originalArgv = [...process.argv];
+  const originalFetch = global.fetch;
+  const originalStdout = console.log;
+  const originalStderr = console.error;
+  const originalHomedir = os.homedir;
+
+  let stdoutLines = [];
+  let requestedUrls = [];
+  let tmpDir;
+
+  before(() => {
+    process.env.BLINK_API_KEY = 'blink_test_key';
+    process.env.BLINK_API_URL = BLINK_API;
+    console.log = (...args) => stdoutLines.push(args.join(' '));
+    console.error = () => {};
+  });
+
+  after(() => {
+    process.env = originalEnv;
+    process.argv = originalArgv;
+    global.fetch = originalFetch;
+    console.log = originalStdout;
+    console.error = originalStderr;
+    os.homedir = originalHomedir;
+  });
+
+  beforeEach(() => {
+    // Redirect ~/.blink to a temp dir so budget config never touches the
+    // developer's real files, and starts unconfigured for every test.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-enforce-'));
+    os.homedir = () => tmpDir;
+    delete process.env.BLINK_BUDGET_HOURLY_SATS;
+    delete process.env.BLINK_BUDGET_DAILY_SATS;
+    delete process.env.BLINK_L402_ALLOWED_DOMAINS;
+    stdoutLines = [];
+    requestedUrls = [];
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    os.homedir = originalHomedir;
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+    for (const p of [payPath, discoverPath, storePath, budgetPath, clientPath]) {
+      delete require.cache[require.resolve(p)];
+    }
+  });
+
+  /** Mock a 402 challenge carrying `invoice`, recording every requested URL. */
+  function mock402(invoice) {
+    global.fetch = async (url, _opts) => {
+      requestedUrls.push(String(url));
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (name) =>
+            name.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${invoice}"` : null,
+        },
+        text: async () => '',
+      };
+    };
+  }
+
+  /** Run l402_pay main() with process.exit trapped; returns the exit code. */
+  async function runPay(argv) {
+    process.argv = ['node', 'l402_pay.js', ...argv];
+    const { main } = require(payPath);
+    let exitCode = null;
+    const originalExit = process.exit;
+    process.exit = (code) => {
+      exitCode = code;
+      throw new Error(`process.exit(${code})`);
+    };
+    try {
+      await main();
+    } catch {
+      /* swallow the trapped exit */
+    } finally {
+      process.exit = originalExit;
+    }
+    return exitCode;
+  }
+
+  function output() {
+    return JSON.parse(stdoutLines.join('\n'));
+  }
+
+  function blinkApiWasCalled() {
+    return requestedUrls.some((u) => u.includes('api.test.blink.sv'));
+  }
+
+  it('denies when the domain allowlist is empty, without calling the payment mutation', async () => {
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_domain_blocked');
+    assert.match(out.message, /NO_ALLOWLIST_CONFIGURED/);
+    assert.equal(blinkApiWasCalled(), false, 'must not reach the Blink payment mutation');
+  });
+
+  it('denies when the domain is allowlisted but no budget is configured', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.match(out.message, /NO_BUDGET_CONFIGURED/);
+    assert.equal(blinkApiWasCalled(), false, 'must not reach the Blink payment mutation');
+  });
+
+  it('denies when the invoice amount cannot be decoded', async () => {
+    // Both controls configured: the only reason to refuse is the unknown amount.
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    process.env.BLINK_BUDGET_HOURLY_SATS = '1000000';
+    process.env.BLINK_BUDGET_DAILY_SATS = '1000000';
+    mock402(INVOICE_NO_AMOUNT);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_amount_undecodable');
+    assert.equal(blinkApiWasCalled(), false, 'must not reach the Blink payment mutation');
+  });
+
+  it('--force does not bypass the domain allowlist', async () => {
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--force']);
+
+    assert.equal(code, 1);
+    assert.equal(output().event, 'l402_domain_blocked');
+    assert.equal(blinkApiWasCalled(), false, 'must not reach the Blink payment mutation');
+  });
+
+  it('--force does not bypass the budget requirement', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--force']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.match(out.message, /NO_BUDGET_CONFIGURED/);
+    assert.equal(blinkApiWasCalled(), false, 'must not reach the Blink payment mutation');
+  });
+
+  it('proceeds past enforcement to the payment stack once both controls are configured', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    process.env.BLINK_BUDGET_HOURLY_SATS = '1000000';
+    process.env.BLINK_BUDGET_DAILY_SATS = '1000000';
+    mock402(INVOICE_100K);
+
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+
+    // The mock serves 402 to every request including the GraphQL call, so the
+    // payment cannot succeed. What matters is that enforcement did NOT stop it:
+    // no denial event was emitted, and the Blink API was reached.
+    const emitted = stdoutLines.join('\n');
+    assert.equal(emitted.includes('l402_domain_blocked'), false);
+    assert.equal(emitted.includes('l402_budget_exceeded'), false);
+    assert.equal(emitted.includes('l402_amount_undecodable'), false);
+    assert.equal(blinkApiWasCalled(), true, 'enforcement should have allowed the payment attempt');
+    // The exit code is deliberately not asserted: how far the payment gets past
+    // enforcement depends on the mocked backend, and that is not what this
+    // test is pinning down.
+    void code;
+  });
+
+  it('dry-run still reports an undecodable amount instead of refusing', async () => {
+    mock402(INVOICE_NO_AMOUNT);
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
+
+    // Dry-run never spends, so it is not subject to the fail-closed guards.
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_dry_run');
+    assert.equal(out.satoshis, null);
+    assert.equal(blinkApiWasCalled(), false);
   });
 });
