@@ -1,7 +1,7 @@
 ---
 name: blink
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 1.7.0
+version: 2.0.0
 repository: https://github.com/blinkbitcoin/blink-skill
 metadata:
   oa:
