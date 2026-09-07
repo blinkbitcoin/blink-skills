@@ -8,10 +8,6 @@
  * Zero external dependencies — Node.js 18+ built-ins only.
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_API_URL = 'https://api.blink.sv/graphql';
@@ -21,57 +17,22 @@ const MUTATION_TIMEOUT_MS = 30_000;
 // ── Config helpers ───────────────────────────────────────────────────────────
 
 /**
- * Resolve the Blink API key.
+ * Resolve the Blink API key from the environment.
  *
- * Resolution order:
- *   1. process.env.BLINK_API_KEY
- *   2. Shell rc files: ~/.profile, ~/.bashrc, ~/.bash_profile, ~/.zshrc
- *
- * The regex handles common shell export formats:
- *   BLINK_API_KEY=value
- *   BLINK_API_KEY="value"
- *   BLINK_API_KEY='value'
- *   export BLINK_API_KEY=value
- *   export BLINK_API_KEY="value"
- *   export BLINK_API_KEY='value'
+ * Only `process.env.BLINK_API_KEY` is read — the key is sent exclusively as
+ * the X-API-KEY header to api.blink.sv (or a user-configured BLINK_API_URL).
+ * No filesystem fallback: shell rc files are never read.
  *
  * @param {object}  [opts]
  * @param {boolean} [opts.required=true]  Throw if the key is not found.
  * @returns {string|null}
  */
-const RC_FILES = ['.profile', '.bashrc', '.bash_profile', '.zshrc'];
-const API_KEY_RE = /(?:^|\n)\s*(?:export\s+)?BLINK_API_KEY\s*=\s*["']?([a-zA-Z0-9_]+)["']?/;
-
 function getApiKey({ required = true } = {}) {
-  // [security] Reading BLINK_API_KEY from the environment so it can be sent as
-  // the X-API-KEY request header to api.blink.sv only.  This is the standard,
-  // recommended way to supply credentials to the Blink wallet API; no other
-  // host ever receives this value.
-  let key = process.env.BLINK_API_KEY;
-  if (!key) {
-    const home = os.homedir();
-    for (const rc of RC_FILES) {
-      try {
-        // [security] Reading shell rc files (~/.bashrc etc.) solely to extract
-        // BLINK_API_KEY via a narrow regex (API_KEY_RE).  Only that one token
-        // is used; the full file content is never transmitted anywhere.  This
-        // fallback helps users who set the key in their shell environment
-        // without re-exporting it to the current process.
-        const content = fs.readFileSync(path.join(home, rc), 'utf8');
-        const match = content.match(API_KEY_RE);
-        if (match) {
-          key = match[1];
-          break;
-        }
-      } catch {
-        // file not readable — try next
-      }
-    }
-  }
+  const key = process.env.BLINK_API_KEY;
   if (!key && required) {
     throw new Error(
-      'BLINK_API_KEY not found. Set it as an environment variable or in one of: ' +
-        RC_FILES.map((f) => `~/${f}`).join(', '),
+      'BLINK_API_KEY not found. Set it as an environment variable, e.g.:\n' +
+        '  export BLINK_API_KEY="blink_..."',
     );
   }
   return key || null;
