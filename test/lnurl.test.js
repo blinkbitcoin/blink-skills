@@ -76,6 +76,14 @@ function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA, buildOpts = {}) 
   } else if (!buildOpts.omitDescription) {
     tags.push(23, (52 >> 5) & 31, 52 & 31, ...descWords);
   }
+  // `s` payment secret (type 16, 52 words) — now mandatory under BOLT #11.
+  if (!buildOpts.omitPaymentSecret) {
+    const sHash = crypto
+      .createHash('sha256')
+      .update('secret:' + (buildOpts.paymentSeed || 'seed'))
+      .digest();
+    tags.push(16, (52 >> 5) & 31, 52 & 31, ...bech32.toWords(sHash));
+  }
   // `x` expiry (type 6) when given.
   if (buildOpts.expirySeconds !== undefined) {
     const exp = buildOpts.expirySeconds;
@@ -88,7 +96,32 @@ function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA, buildOpts = {}) 
     tags.push(6, (expWords.length >> 5) & 31, expWords.length & 31, ...expWords);
   }
 
-  const words = [...tsWords, ...tags, ...new Array(104).fill(0)];
+  // Signature region: 104 words = 65 bytes (64-byte sig + recovery id). The
+  // default is all-zero, i.e. recovery id 0 (valid). buildOpts.recoveryByte
+  // overrides the last byte for the boundary tests.
+  const sigWords = new Array(104).fill(0);
+  if (buildOpts.recoveryByte !== undefined) {
+    // Recovery id is byte 64 of the 65-byte sig = the low 5 bits of word 103
+    // plus the high 3 bits of word 102... simplest: build bytes, set, reconvert.
+    const sigBytes = new Array(65).fill(0);
+    sigBytes[64] = buildOpts.recoveryByte;
+    // 8-bit bytes back to 5-bit words.
+    let acc = 0;
+    let bits = 0;
+    const out = [];
+    for (const b of sigBytes) {
+      acc = (acc << 8) | b;
+      bits += 8;
+      while (bits >= 5) {
+        bits -= 5;
+        out.push((acc >>> bits) & 31);
+      }
+    }
+    if (bits > 0) out.push((acc << (5 - bits)) & 31);
+    for (let k = 0; k < 104; k++) sigWords[k] = out[k];
+  }
+
+  const words = [...tsWords, ...tags, ...sigWords];
   return bech32.encode(hrp, words, 20000);
 }
 
@@ -233,6 +266,33 @@ describe('fetchLnurlPayMetadata', () => {
     assert.equal(isLnurlNotFoundReason('temporarily overloaded'), false);
     assert.equal(isLnurlNotFoundReason('rate limited, retry later'), false);
     assert.equal(isLnurlNotFoundReason('internal error'), false);
+  });
+
+  // The EXACT production Blink body for a nonexistent address is verb-first.
+  // Confirmed live: {"reason":"Couldn't find user 'x'.","status":"ERROR"}.
+  it('classifies the live production missing-user body as not-found', async () => {
+    stubFetch(() => ({ json: { status: 'ERROR', reason: "Couldn't find user 'nonexistentprobezz'." } }));
+    await assert.rejects(
+      () => fetchLnurlPayMetadata('nonexistentprobezz', 'blink.sv'),
+      (e) => e.code === 'LNURL_NOT_FOUND',
+    );
+  });
+
+  it('maps the production missing-user body to RECEIVER_NOT_FOUND in resolveReceiver', async () => {
+    stubFetch((url) => {
+      if (url.includes('/graphql')) return { json: { data: { accountDefaultWallet: null } } };
+      return { json: { status: 'ERROR', reason: "Couldn't find user 'nonexistentprobezz'." } };
+    });
+    await assert.rejects(
+      () => resolveReceiver('nonexistentprobezz@blink.sv', {}),
+      (e) => e.code === 'RECEIVER_NOT_FOUND',
+    );
+  });
+
+  it('a generic NOT_FOUND code does not override contradictory transient prose', () => {
+    assert.equal(isLnurlNotFoundReason('backend temporarily overloaded', 'NOT_FOUND'), false);
+    assert.equal(isLnurlNotFoundReason('user not found', 'NOT_FOUND'), true);
+    assert.equal(isLnurlNotFoundReason('whatever', 'USER_NOT_FOUND'), true);
   });
 
   // Review finding: an unrestricted /not found/ matched infrastructure errors,
@@ -895,6 +955,60 @@ describe('decodeBolt11', () => {
     assert.match(d.paymentHash, /^[0-9a-f]{64}$/);
     assert.ok(d.timestampSeconds > 0);
     assert.equal(d.expirySeconds, 3600);
+  });
+
+  // ── payment-secret (s) tag and signature recovery id (BOLT #11 reader rules) ──
+
+  it('rejects an invoice with no payment-secret (s) tag', () => {
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { omitPaymentSecret: true });
+    assert.throws(() => decodeBolt11(inv), /missing payment-secret/);
+  });
+
+  it('accepts the in-range recovery ids 0 and 3', () => {
+    for (const rid of [0, 3]) {
+      const inv = bolt11(1000, 'bc', TEST_METADATA, { recoveryByte: rid });
+      assert.equal(decodeBolt11(inv).recoveryId, rid);
+    }
+  });
+
+  it('rejects out-of-range recovery ids 4 and 255', () => {
+    for (const rid of [4, 255]) {
+      const inv = bolt11(1000, 'bc', TEST_METADATA, { recoveryByte: rid });
+      assert.throws(() => decodeBolt11(inv), /recovery id .* out of range/);
+    }
+  });
+
+  it('rejects a duplicate payment-secret tag', () => {
+    // Build manually: two s tags.
+    const sHash = crypto.createHash('sha256').update('secret:x').digest();
+    const sWords = bech32.toWords(sHash);
+    const pHash = crypto.createHash('sha256').update('payment:x').digest();
+    const hHash = crypto.createHash('sha256').update(TEST_METADATA, 'utf8').digest();
+    const ts = Math.floor(Date.now() / 1000);
+    const tsWords = [];
+    for (let w = 6; w >= 0; w--) tsWords.push(Math.floor(ts / Math.pow(32, w)) % 32);
+    const words = [
+      ...tsWords,
+      1,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(pHash),
+      16,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...sWords,
+      16,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...sWords, // duplicate s
+      23,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(hHash),
+      ...new Array(104).fill(0),
+    ];
+    const inv = bech32.encode('lnbc10n', words, 20000);
+    assert.throws(() => decodeBolt11(inv), /duplicate tag type 16/);
   });
 });
 

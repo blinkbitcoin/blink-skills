@@ -38,10 +38,19 @@ the recipient is custodial or Spark. `create-invoice-lnaddress` does this:
 
 ### SSRF guard
 
-Only `blink.sv` is an allowed target. LNURL is a protocol in which the server
-hands the client further URLs to fetch, so the allowlist is enforced at the
-network boundary — inside the one function every request funnels through — and
-re-checked on **every hop**:
+Two distinct allowlists, because the user-supplied address and the
+server-supplied follow-up URLs are different trust surfaces:
+
+| Set            | Governs                                                   | Contents                      |
+| -------------- | --------------------------------------------------------- | ----------------------------- |
+| Address domain | the user-supplied `user@domain` — the narrow SSRF surface | `blink.sv` only               |
+| Service hosts  | server-supplied `callback`, `verify`, redirect targets    | `blink.sv` + `lnurl.blink.sv` |
+
+Blink serves its LNURL callbacks from a dedicated host (`lnurl.blink.sv`),
+distinct from the address domain — confirmed against live production metadata.
+LNURL is a protocol in which the server hands the client further URLs to fetch,
+so the service-host allowlist is enforced at the network boundary — inside the
+one function every request funnels through — and re-checked on **every hop**:
 
 | Hop                                      | Checked                                                              |
 | ---------------------------------------- | -------------------------------------------------------------------- |

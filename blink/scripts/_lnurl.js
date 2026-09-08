@@ -422,6 +422,7 @@ const BOLT11_NETWORK_PREFIXES = {
 const TAG_PAYMENT_HASH = 1; // p — 256-bit SHA-256 payment hash (52 words)
 const TAG_EXPIRY = 6; // x — expiry in seconds (variable length)
 const TAG_DESCRIPTION = 13; // d — free-form description
+const TAG_PAYMENT_SECRET = 16; // s — 256-bit payment secret (52 words)
 const TAG_DESCRIPTION_HASH = 23; // h — 256-bit description hash (52 words)
 
 const BOLT11_DEFAULT_EXPIRY_SECONDS = 3600; // per BOLT-11 when no `x` tag
@@ -498,6 +499,7 @@ function decodeBolt11(paymentRequest, opts = {}) {
 
   let paymentHash = null;
   let descriptionHash = null;
+  let paymentSecret = null;
   let hasDescription = false;
   let expirySeconds = BOLT11_DEFAULT_EXPIRY_SECONDS;
   // BOLT-11 forbids repeated tag types outright. Track sightedness per tag so a
@@ -513,7 +515,11 @@ function decodeBolt11(paymentRequest, opts = {}) {
     if (start + len > data.length - sigWords) break; // malformed; stop scanning
 
     const isKnownUnique =
-      type === TAG_PAYMENT_HASH || type === TAG_DESCRIPTION_HASH || type === TAG_DESCRIPTION || type === TAG_EXPIRY;
+      type === TAG_PAYMENT_HASH ||
+      type === TAG_DESCRIPTION_HASH ||
+      type === TAG_DESCRIPTION ||
+      type === TAG_EXPIRY ||
+      type === TAG_PAYMENT_SECRET;
     if (isKnownUnique) {
       if (seen.has(type)) {
         throw new Error(`Not a valid BOLT-11 invoice (duplicate tag type ${type}).`);
@@ -528,6 +534,16 @@ function decodeBolt11(paymentRequest, opts = {}) {
         if (bytes.length === 32) paymentHash = Buffer.from(bytes).toString('hex');
       } catch {
         // malformed body: leave null, the required-tag check below rejects it
+      }
+    } else if (type === TAG_PAYMENT_SECRET) {
+      // `s` — payment secret (prevents probing by forwarding nodes). Exactly 52
+      // words / 32 bytes. A malformed body leaves it null; the required-tag
+      // check below then rejects it, fail-closed.
+      try {
+        const bytes = convertBits(data.slice(start, start + len), 5, 8, false);
+        if (bytes.length === 32) paymentSecret = Buffer.from(bytes).toString('hex');
+      } catch {
+        // malformed tag body: leave paymentSecret null
       }
     } else if (type === TAG_DESCRIPTION_HASH) {
       // `h` — description hash. A malformed body leaves the hash null; the
@@ -555,12 +571,30 @@ function decodeBolt11(paymentRequest, opts = {}) {
     throw new Error('Not a valid BOLT-11 invoice (trailing garbage before the signature).');
   }
 
+  // The signature region: 104 words = 520 bits = 65 bytes = 64-byte compact
+  // signature + 1-byte recovery id. The recovery id MUST be in {0,1,2,3}; an
+  // out-of-range value is a structurally invalid signature a compliant payer
+  // must reject.
+  const sigBytes = convertBits(data.slice(data.length - sigWords), 5, 8, false);
+  if (sigBytes.length !== 65) {
+    throw new Error('Not a valid BOLT-11 invoice (signature region is not 65 bytes).');
+  }
+  const recoveryId = sigBytes[64];
+  if (recoveryId < 0 || recoveryId > 3) {
+    throw new Error(`Not a valid BOLT-11 invoice (signature recovery id ${recoveryId} out of range 0-3).`);
+  }
+
   // Required structure. A payment hash is mandatory: without it the invoice is
   // unpayable and there is nothing to verify a payment against. Exactly one
   // description form must be present — not both (a `d`+`h` pair is a protocol
   // violation that lets two descriptions coexist), not neither.
   if (paymentHash === null) {
     throw new Error('Not a valid BOLT-11 invoice (missing payment-hash tag).');
+  }
+  // A payment secret is mandatory under current BOLT #11: without it a
+  // compliant payer cannot safely route without exposing the recipient.
+  if (paymentSecret === null) {
+    throw new Error('Not a valid BOLT-11 invoice (missing payment-secret tag).');
   }
   if (hasDescription && descriptionHash !== null) {
     throw new Error('Not a valid BOLT-11 invoice (both d and h description tags present).');
@@ -574,7 +608,16 @@ function decodeBolt11(paymentRequest, opts = {}) {
     throw new Error('Not a valid BOLT-11 invoice (invoice has expired).');
   }
 
-  return { network, amountMsats, descriptionHash, paymentHash, timestampSeconds, expirySeconds };
+  return {
+    network,
+    amountMsats,
+    descriptionHash,
+    paymentHash,
+    paymentSecret,
+    timestampSeconds,
+    expirySeconds,
+    recoveryId,
+  };
 }
 
 /**
@@ -646,8 +689,11 @@ function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet'
 // convert into a confident RECEIVER_NOT_FOUND. That conversion is the
 // outage-as-identity-answer bug, one layer below the now-fixed GraphQL probe.
 // Structured codes are preferred over prose when the server supplies them.
-const LNURL_NOT_FOUND_CODES = new Set([
-  'NOT_FOUND',
+// Receiver-SPECIFIC codes name the absent resource and are honoured
+// unconditionally. A bare NOT_FOUND says nothing about WHICH resource, so it
+// only counts alongside receiver-anchored prose — otherwise a generic
+// NOT_FOUND would override contradictory transient wording.
+const LNURL_NOT_FOUND_SPECIFIC_CODES = new Set([
   'USER_NOT_FOUND',
   'ACCOUNT_NOT_FOUND',
   'ADDRESS_NOT_FOUND',
@@ -664,6 +710,13 @@ const LNURL_NOT_FOUND_PATTERNS = [
   /no\s+(such\s+)?(user|account|username|address)/i,
   /(user|account|username|address|identifier)\s+does\s+not\s+exist/i,
   /unknown\s+(user|account|username|address|identifier)/i,
+  // The exact production Blink response for a nonexistent address is verb-first:
+  // {"reason":"Couldn't find user 'x'."}. Anchored to the receiver noun so it
+  // cannot match an infrastructure "couldn't find <route|resource>" error. The
+  // `address` noun is ambiguous (it also names network infrastructure), so for
+  // it alone we require the quoted-subject form Blink actually emits.
+  /(couldn'?t|could\s+not|cannot)\s+find\s+(the\s+)?(user|account|username|identifier)/i,
+  /(couldn'?t|could\s+not|cannot)\s+find\s+(the\s+)?address\s+'/i,
 ];
 
 /**
@@ -674,8 +727,11 @@ const LNURL_NOT_FOUND_PATTERNS = [
  * @returns {boolean}
  */
 function isLnurlNotFoundReason(reason, code) {
-  if (code && LNURL_NOT_FOUND_CODES.has(String(code).toUpperCase())) return true;
-  return LNURL_NOT_FOUND_PATTERNS.some((re) => re.test(String(reason || '')));
+  const prose = LNURL_NOT_FOUND_PATTERNS.some((re) => re.test(String(reason || '')));
+  // Receiver-SPECIFIC codes are unconditional; a generic NOT_FOUND and an absent
+  // code both fall back to the receiver-anchored prose.
+  if (code && LNURL_NOT_FOUND_SPECIFIC_CODES.has(String(code).toUpperCase())) return true;
+  return prose;
 }
 
 // ── LNURL-pay metadata ───────────────────────────────────────────────────────

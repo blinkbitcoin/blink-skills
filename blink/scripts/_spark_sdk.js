@@ -295,22 +295,60 @@ function storageUnavailableError(err) {
  */
 function ensureOwnerOnlyDir(dir) {
   const fs = require('fs');
+  const path = require('path');
 
-  // Reject a symlink/non-directory BEFORE creating, using lstat so we see the
-  // link itself rather than following it.
+  const refuse = (message) => {
+    const e = new Error(message);
+    e.code = 'SPARK_STORAGE_PERMISSIONS';
+    return e;
+  };
+
+  // Reject symlinks at the target and within the MANAGED ancestor chain —
+  // ~/.blink and ~/.blink/spark — but no higher. Walking to the filesystem root
+  // would hard-refuse on systems where a high-level ancestor is legitimately a
+  // symlink (/home -> /usr/home on some distros, managed /Users on macOS), which
+  // is not attacker-controlled wallet state. The chain the tool itself manages
+  // starts at the home directory's first Blink-owned component.
+  //
+  // (TOCTOU note: a symlink swapped in AFTER these lstat checks but before chmod
+  // is an advisory-only gap against an active local attacker — closing it needs
+  // fd-based O_NOFOLLOW, which is out of scope here.)
+  const home = os.homedir();
+  const managed = [];
+  let cur = path.resolve(dir);
+  // Walk up until we reach the home directory (exclusive) or the root.
+  while (cur && cur !== home && cur !== path.dirname(cur)) {
+    managed.push(cur);
+    cur = path.dirname(cur);
+  }
+  // The leaf is `managed[0]`; the rest are the managed ancestors (~/.blink,
+  // ~/.blink/spark). Reject a symlink at any of them.
+  for (const p of managed) {
+    let lst;
+    try {
+      lst = fs.lstatSync(p);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue; // not created yet
+      throw err;
+    }
+    if (lst.isSymbolicLink()) {
+      const isLeaf = p === managed[0];
+      throw refuse(
+        `Refusing to use wallet-state path '${dir}': ${isLeaf ? 'the path' : `ancestor '${p}'`} is a symlink, which could redirect seed-controlled wallet state. Remove it or point storage elsewhere.`,
+      );
+    }
+  }
+
+  // Reject a non-directory AT the target.
   try {
     const lst = fs.lstatSync(dir);
-    if (lst.isSymbolicLink() || !lst.isDirectory()) {
-      const e = new Error(
-        `Refusing to use wallet-state path '${dir}': it exists but is a ${lst.isSymbolicLink() ? 'symlink' : 'non-directory'}. ` +
-          'Remove it or point the storage elsewhere; a pre-placed symlink could redirect wallet state.',
+    if (!lst.isDirectory()) {
+      throw refuse(
+        `Refusing to use wallet-state path '${dir}': it exists but is not a directory. Remove it or point the storage elsewhere.`,
       );
-      e.code = 'SPARK_STORAGE_PERMISSIONS';
-      throw e;
     }
   } catch (err) {
     if (err && err.code === 'SPARK_STORAGE_PERMISSIONS') throw err;
-    // ENOENT: doesn't exist yet — fall through to create.
     if (!err || err.code !== 'ENOENT') throw err;
   }
 
@@ -318,23 +356,29 @@ function ensureOwnerOnlyDir(dir) {
   try {
     fs.chmodSync(dir, 0o700);
   } catch (err) {
-    const e = new Error(
+    // A chmod failure is only fatal if the dir is NOT already owner-only. On
+    // filesystems where chmod is unsupported (some network FS) an already-0700
+    // dir must be usable; a permissive one must still fail closed.
+    let mode = null;
+    try {
+      mode = fs.statSync(dir).mode & 0o777;
+    } catch {
+      /* fall through to the throw below */
+    }
+    if (mode !== null && (mode & 0o077) === 0) return; // already secure
+    throw refuse(
       `Could not make the wallet-state dir owner-only at '${dir}': ${err.message}. ` +
         'Wallet state belongs to a seed-controlled account and must not be group/world accessible.',
     );
-    e.code = 'SPARK_STORAGE_PERMISSIONS';
-    throw e;
   }
 
   // Verify the postcondition rather than trusting the calls above.
   const mode = fs.statSync(dir).mode & 0o777;
   if ((mode & 0o077) !== 0) {
-    const e = new Error(
+    throw refuse(
       `Wallet-state dir '${dir}' has mode ${mode.toString(8)} after hardening; group/world bits must be 0. ` +
         'Refusing to write seed-controlled wallet state there.',
     );
-    e.code = 'SPARK_STORAGE_PERMISSIONS';
-    throw e;
   }
 }
 

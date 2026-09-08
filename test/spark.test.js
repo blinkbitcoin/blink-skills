@@ -221,6 +221,67 @@ describe('_spark_sdk.ensureOwnerOnlyDir', () => {
       (e) => e.code === 'SPARK_STORAGE_PERMISSIONS',
     );
   });
+
+  // A symlink in the MANAGED ANCESTOR chain (e.g. ~/.blink/spark -> elsewhere)
+  // would redirect the wallet leaf through the link. lstat must catch it.
+  it('rejects a symlink in an ancestor directory', (t) => {
+    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    const elsewhere = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkelse-'));
+    t.after(() => {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    });
+    const blink = pathMod.join(base, '.blink');
+    fs.mkdirSync(blink);
+    fs.symlinkSync(elsewhere, pathMod.join(blink, 'spark')); // spark -> elsewhere
+    const leaf = pathMod.join(blink, 'spark', 'mainnet-abc123');
+    assert.throws(
+      () => spark.ensureOwnerOnlyDir(leaf),
+      (e) => e.code === 'SPARK_STORAGE_PERMISSIONS' && /symlink/.test(e.message),
+    );
+    assert.equal(
+      fs.existsSync(pathMod.join(elsewhere, 'mainnet-abc123')),
+      false,
+      'leaf must not be created through the link',
+    );
+  });
+
+  // On a filesystem where chmod is unsupported, an already-secure (0700) dir
+  // must remain usable; only a permissive one should fail closed.
+  it('continues when chmod is unsupported but the dir is already owner-only', (t) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.chmodSync(dir, 0o700); // already secure
+
+    const realChmod = fs.chmodSync;
+    t.after(() => {
+      fs.chmodSync = realChmod;
+    });
+    fs.chmodSync = () => {
+      throw new Error('EPERM: operation not supported');
+    };
+
+    assert.doesNotThrow(() => spark.ensureOwnerOnlyDir(dir));
+  });
+
+  it('still fails closed when chmod is unsupported AND the dir is permissive', (t) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.chmodSync(dir, 0o777);
+
+    const realChmod = fs.chmodSync;
+    t.after(() => {
+      fs.chmodSync = realChmod;
+    });
+    fs.chmodSync = () => {
+      throw new Error('EPERM: operation not supported');
+    };
+
+    assert.throws(
+      () => spark.ensureOwnerOnlyDir(dir),
+      (e) => e.code === 'SPARK_STORAGE_PERMISSIONS',
+    );
+  });
 });
 
 // ── loadSdkModule (optional dep may or may not be present) ───────────────────
