@@ -130,9 +130,11 @@ availability failure) but cannot redirect funds.
     MUST use the LNURL path — `prepareSendPayment` does not accept it.
   - The classification is an **exhaustive allowlist**: the SDK's `parse()`
     recognizes more types than we pay to (on-chain Bitcoin addresses, BOLT-12
-    offers, cross-chain destinations, ...). Everything outside the four
-    supported types is rejected with `UNSUPPORTED_DESTINATION` instead of
-    falling into a payment path it was never validated for.
+    offers, cross-chain destinations, receive-side methods like
+    `sparkInvoice`). Everything outside the four supported types is rejected
+    with `UNSUPPORTED_DESTINATION` instead of falling into a payment path it
+    was never validated for. Widening the list is a deliberate decision, not
+    a default.
 - `spark-transactions` → `sdk.listPayments`
 - `spark-subscribe` → `sdk.addEventListener`
 
@@ -168,12 +170,13 @@ the custodial commands:
   a 100-sat send with a 3-sat fee passes with 100 sats remaining and records
   100. The fee is known at check time; counting it would diverge from the
   custodial pay commands' convention.
-- **Check/record is not atomic across processes.** The budget is checked
-  before signing and the spend recorded after settlement; two concurrent
-  sends can each observe the same remaining budget, and a crash between send
-  and record loses the entry. `_budget.js` mitigates the record half with a
-  lockfile-guarded read-modify-write and an atomic (temp+rename) log write;
-  the cross-send window is inherent to a CLI and accepted.
+- **Enforcement is reservation-based.** `reserveBudget` decides AND reserves
+  under one lock before the send executes, so concurrent sends can never
+  jointly exceed a limit. Success/pending finalizes the reservation; failure
+  releases it. A crash between payment and finalization leaves the
+  reservation counting (fail-closed) until the 25h prune; a failed recording
+  after settlement keeps blocking conservatively rather than letting the next
+  send through.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

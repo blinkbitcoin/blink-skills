@@ -217,6 +217,8 @@ describe('create_invoice_lnaddress main()', () => {
     assert.equal(j.lightningAddress, 'alice@blink.sv');
     assert.equal(j.paymentRequest, PR);
     assert.equal(j.verifyUrl, 'https://blink.sv/verify/abc');
+    assert.equal(j.satoshis, 1000);
+    assert.equal(j.walletId, null);
   });
 
   it('--qr merges QR fields into invoice_created and writes the PNG', async () => {

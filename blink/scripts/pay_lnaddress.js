@@ -34,7 +34,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { checkBudget, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
 
 const PAY_LN_ADDRESS_MUTATION = `
   mutation LnAddressPaymentSend($input: LnAddressPaymentSendInput!) {
@@ -100,15 +100,40 @@ async function main() {
     `Sending ${amountSats} sats to ${lnAddress} from ${walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`,
   );
 
-  // ── Budget check ──
+  // ── Budget reservation ──
+  // The limit decision AND the reservation append happen under one lock, so
+  // two concurrent payments can never both pass the same remaining budget.
+  let reservationId = null;
   if (!dryRun && !force) {
     // Explicitly user-initiated payment: an unconfigured budget must not block
     // it, so opt out of the fail-closed default that guards autonomous spending.
-    const budgetResult = checkBudget(amountSats, { requireConfigured: false });
-    if (!budgetResult.allowed) {
-      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+    const reservation = reserveBudget(
+      { sats: amountSats, command: 'pay-lnaddress', domain: null },
+      { requireConfigured: false },
+    );
+    if (!reservation.allowed) {
+      throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
     }
+    reservationId = reservation.id;
   }
+
+  const releaseReservationQuietly = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch {
+        /* an orphaned reservation counts conservatively until pruned */
+      }
+    }
+  };
+  const recordOrFinalize = () => {
+    try {
+      if (reservationId) finalizeReservation(reservationId);
+      else recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
+    } catch (e) {
+      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+    }
+  };
 
   // ── Dry-run: resolve everything, show details, exit without sending ──
   if (dryRun) {
@@ -134,17 +159,24 @@ async function main() {
     amount: amountSats,
   };
 
-  const data = await graphqlRequest({
-    query: PAY_LN_ADDRESS_MUTATION,
-    variables: { input },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  let data;
+  try {
+    data = await graphqlRequest({
+      query: PAY_LN_ADDRESS_MUTATION,
+      variables: { input },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    releaseReservationQuietly();
+    throw e;
+  }
   const result = data.lnAddressPaymentSend;
 
   if (result.errors && result.errors.length > 0) {
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationQuietly();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -163,20 +195,13 @@ async function main() {
 
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
-    try {
-      recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
-    } catch {
-      /* non-fatal */
-    }
+    recordOrFinalize();
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
-    try {
-      recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
-    } catch {
-      /* non-fatal */
-    }
+    recordOrFinalize();
   } else {
     console.error(`Payment status: ${result.status}`);
+    releaseReservationQuietly();
   }
 
   console.log(JSON.stringify(output, null, 2));

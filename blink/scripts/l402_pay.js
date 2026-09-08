@@ -57,7 +57,14 @@ const {
 
 const { saveToken, getToken } = require('./l402_store');
 
-const { checkBudget, checkDomainAllowed, recordSpend } = require('./_budget');
+const {
+  reserveBudget,
+  finalizeReservation,
+  releaseReservation,
+  recordSpend,
+  checkBudget,
+  checkDomainAllowed,
+} = require('./_budget');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -589,6 +596,21 @@ async function main() {
     console.error(`Payment required: ${satoshis} sats`);
   }
 
+  // Budget reservation state at function scope: the reservation happens inside
+  // the enforcement block below, but the pay section that follows must be able
+  // to finalize it (success) or release it (failure) — and max-amount refusals
+  // in between must release it too.
+  let reservationId = null;
+  const releaseReservationQuietly = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch {
+        /* an orphaned reservation counts conservatively until pruned */
+      }
+    }
+  };
+
   // ── Payment enforcement (fail closed) ──
   // A payment is about to be made: require an explicitly configured domain
   // allowlist and budget. --force refreshes the token but never bypasses
@@ -630,23 +652,30 @@ async function main() {
       process.exit(1);
     }
 
-    const budgetResult = checkBudget(satoshis, { requireConfigured: true });
-    if (!budgetResult.allowed) {
+    // ── Budget reservation (fail closed for autonomous auto-pay) ──
+    // The limit decision AND the reservation append happen under one lock, so
+    // two concurrent payments can never both pass the same remaining budget.
+    // (reservationId and its release helper live at function scope because the
+    // pay section below must be able to finalize or release.)
+    const reservation = reserveBudget({ sats: satoshis, command: 'l402-pay', domain }, { requireConfigured: true });
+    if (!reservation.allowed) {
       const output = {
         event: 'l402_budget_exceeded',
         url: args.url,
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         satoshis,
-        ...budgetResult,
-        message: budgetResult.reason,
+        ...reservation,
+        message: reservation.reason,
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(1);
     }
+    reservationId = reservation.id;
   }
 
   // ── Per-request max-amount check ──
   if (args.maxAmount !== null && satoshis !== null && satoshis > args.maxAmount) {
+    releaseReservationQuietly();
     const output = {
       event: 'l402_budget_exceeded',
       url: args.url,
@@ -692,13 +721,24 @@ async function main() {
   }
 
   // ── Pay the invoice ──
+  // Every throw between here and a successful payment must release the
+  // budget reservation — the payment did not happen. After SUCCESS the
+  // reservation is finalized instead (funds moved, even if a later step fails).
   const apiKey = getApiKey();
   const apiUrl = getApiUrl();
 
-  const wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
+  let wallet;
+  let payData;
+  try {
+    wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
+  } catch (e) {
+    releaseReservationQuietly();
+    throw e;
+  }
   console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
 
   if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
+    releaseReservationQuietly();
     throw new Error('Insufficient balance: BTC wallet has 0 sats.');
   }
 
@@ -726,22 +766,29 @@ async function main() {
 
   console.error(`Paying ${satoshis ?? '?'} sats via Blink...`);
 
-  const payData = await graphqlRequest({
-    query: PAY_INVOICE_MUTATION,
-    variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  try {
+    payData = await graphqlRequest({
+      query: PAY_INVOICE_MUTATION,
+      variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    releaseReservationQuietly();
+    throw e;
+  }
 
   const payResult = payData.lnInvoicePaymentSend;
 
   if (payResult.errors && payResult.errors.length > 0) {
     const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationQuietly();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
   if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
+    releaseReservationQuietly();
     throw new Error(`Payment not successful: status=${payResult.status}`);
   }
 
@@ -801,9 +848,13 @@ async function main() {
   }
 
   // ── Record spend in budget log ──
+  // Finalize the reservation (funds moved) — or, when no budget is configured
+  // (nothing was reserved), record the spend directly so the log stays
+  // complete for unconfigured users too.
   if (satoshis !== null) {
     try {
-      recordSpend({ sats: satoshis, command: 'l402-pay', domain });
+      if (reservationId) finalizeReservation(reservationId);
+      else recordSpend({ sats: satoshis, command: 'l402-pay', domain });
     } catch (err) {
       console.error(`Warning: could not record spend: ${err.message}`);
     }

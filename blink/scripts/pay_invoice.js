@@ -32,7 +32,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { checkBudget, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
 const { decodeBolt11AmountSats } = require('./l402_discover');
 
 const PAY_INVOICE_MUTATION = `
@@ -93,29 +93,53 @@ async function main() {
     throw new Error(`Insufficient balance: BTC wallet has 0 sats. Use --force to attempt anyway.`);
   }
 
-  // ── Budget check ──
+  // ── Budget reservation ──
+  // The limit decision AND the reservation append happen under one lock, so
+  // two concurrent payments can never both pass the same remaining budget.
   const invoiceSats = decodeBolt11AmountSats(paymentRequest);
+  let reservationId = null;
   if (invoiceSats !== null && !force) {
     // Explicitly user-initiated payment: an unconfigured budget must not block
     // it, so opt out of the fail-closed default that guards autonomous spending.
-    const budgetResult = checkBudget(invoiceSats, { requireConfigured: false });
-    if (!budgetResult.allowed) {
-      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+    const reservation = reserveBudget(
+      { sats: invoiceSats, command: 'pay-invoice', domain: null },
+      { requireConfigured: false },
+    );
+    if (!reservation.allowed) {
+      throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
     }
+    reservationId = reservation.id;
   }
+
+  const releaseReservationQuietly = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch {
+        /* an orphaned reservation counts conservatively until pruned */
+      }
+    }
+  };
 
   const input = {
     walletId: wallet.id,
     paymentRequest,
   };
 
-  const data = await graphqlRequest({
-    query: PAY_INVOICE_MUTATION,
-    variables: { input },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  let data;
+  try {
+    data = await graphqlRequest({
+      query: PAY_INVOICE_MUTATION,
+      variables: { input },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    // The payment did not happen — do not let the reservation keep blocking.
+    releaseReservationQuietly();
+    throw e;
+  }
   const result = data.lnInvoicePaymentSend;
 
   if (result.errors && result.errors.length > 0) {
@@ -125,12 +149,14 @@ async function main() {
         (e.message && e.message.toLowerCase().includes('self')),
     );
     if (isSelfPay) {
+      releaseReservationQuietly();
       throw new Error(
         'Cannot pay your own invoice (CANT_PAY_SELF). ' +
           'L402 round-trip testing requires a second Blink account or a separate wallet.',
       );
     }
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationQuietly();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -145,28 +171,31 @@ async function main() {
     output.balanceBeforeFormatted = `$${(wallet.balance / 100).toFixed(2)}`;
   }
 
+  const recordOrFinalize = () => {
+    try {
+      if (reservationId) finalizeReservation(reservationId);
+      else recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+    } catch (e) {
+      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+    }
+  };
+
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
     if (invoiceSats !== null) {
-      try {
-        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
-      } catch {
-        /* non-fatal */
-      }
+      recordOrFinalize();
     }
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
     if (invoiceSats !== null) {
-      try {
-        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
-      } catch {
-        /* non-fatal */
-      }
+      recordOrFinalize();
     }
   } else if (result.status === 'ALREADY_PAID') {
     console.error('Invoice was already paid.');
+    releaseReservationQuietly();
   } else {
     console.error(`Payment status: ${result.status}`);
+    releaseReservationQuietly();
   }
 
   console.log(JSON.stringify(output, null, 2));

@@ -38,7 +38,7 @@ metadata:
     homepage: 'https://github.com/blinkbitcoin/blink-skills'
     security:
       secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
-      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands only'
+      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient''s address/callback hosts during SDK parse/prepare (before a budget rejection)'
       filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command is used'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
       notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
@@ -1451,6 +1451,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### How Budget Enforcement Works
 
 - **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send` (after fee resolution, before signing)
+- **Reserved, not just checked:** the amount is **reserved** under the budget lock before the payment executes, then finalized (success/pending) or released (failure) — two concurrent payments can never both pass the same remaining budget. A crash between payment and finalization leaves the reservation counting (fail-closed) until the 25h prune; reserved entries appear in `budget log` with `"state": "reserved"`.
 - **Principal only:** budgets count the payment amount, not the routing fee — for the custodial commands and `spark-send` alike
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay

@@ -869,6 +869,25 @@ describe('spark_send budget integration', () => {
     }
   });
 
+  it('a failed finalization leaves the reservation counting (fail-closed) and warns', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    installMock({});
+    const savedFinalize = budget.finalizeReservation;
+    budget.finalizeReservation = () => {
+      throw new Error('disk full');
+    };
+    try {
+      const out = await runMain(['lnbc100n1p...', '100']);
+      assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
+      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+      const log = budget.readLog();
+      assert.equal(log.length, 1);
+      assert.equal(log[0].state, 'reserved', 'the orphaned reservation must keep blocking the budget');
+    } finally {
+      budget.finalizeReservation = savedFinalize;
+    }
+  });
+
   it('an unconfigured budget allows an explicit send and records the spend', async () => {
     installMock({});
     const out = await runMain(['lnbc100n1p...', '100']);

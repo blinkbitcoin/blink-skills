@@ -31,7 +31,10 @@
  *   - Budget controls: BLINK_BUDGET_HOURLY_SATS / BLINK_BUDGET_DAILY_SATS are
  *     enforced when configured (like the custodial pay commands); an
  *     unconfigured budget does not block this explicit one-shot payment.
- *     Successful/pending sends are recorded in the spending log.
+ *     The amount is RESERVED under the budget lock before sending and
+ *     finalized (or released on failure) after, so concurrent sends cannot
+ *     jointly exceed a limit. Successful/pending sends are recorded in the
+ *     spending log.
  *   - --force bypasses the budget check for an over-limit send.
  *   - The seed (SPARK_MNEMONIC) is never logged.
  *
@@ -45,7 +48,7 @@
  */
 
 const { connect } = require('./_spark_sdk');
-const { checkBudget, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
 
 function parseArgs(argv) {
   let destination = null;
@@ -230,7 +233,9 @@ async function main() {
     // does not pay to (on-chain, BOLT-12, cross-chain, ...) is rejected here,
     // before any prepare or budget interaction.
     const dest = classifyDestination(parsed);
-    console.error(`Destination classified as ${dest.type === 'lnurl' ? 'Lightning Address / LNURL-pay' : dest.type === 'spark' ? 'Spark address' : 'BOLT-11 invoice'}.`);
+    console.error(
+      `Destination classified as ${dest.type === 'lnurl' ? 'Lightning Address / LNURL-pay' : dest.type === 'spark' ? 'Spark address' : 'BOLT-11 invoice'}.`,
+    );
 
     // 2. Prepare (resolves fees) via the matching path.
     const { prepareResponse, feeSats } =
@@ -259,23 +264,43 @@ async function main() {
       return;
     }
 
-    // ── Budget check ──
-    // Same treatment as the custodial one-shot payments (pay-invoice & co): the
+    // ── Budget reservation ──
+    // The limit decision AND the reservation append happen under one lock, so
+    // two concurrent sends can never both pass the same remaining budget. Same
+    // treatment as the custodial one-shot payments (pay-invoice & co): the
     // budget is enforced when configured, but an unconfigured budget must not
     // block an explicitly user-initiated payment, so opt out of the fail-closed
     // default that guards autonomous L402 auto-pay. --force overrides.
     // Budgets count the payment PRINCIPAL, not the routing fee — same
     // convention as the custodial pay commands.
+    let reservationId = null;
     if (!args.force) {
-      const budgetResult = checkBudget(args.amountSats, { requireConfigured: false });
-      if (!budgetResult.allowed) {
-        throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+      const reservation = reserveBudget(
+        { sats: args.amountSats, command: 'spark-send', domain: null },
+        { requireConfigured: false },
+      );
+      if (!reservation.allowed) {
+        throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
       }
+      reservationId = reservation.id; // null when no budget is configured
     }
 
-    // 3. Send (signs locally) via the matching path.
-    const result =
-      dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
+    // 3. Send (signs locally) via the matching path. A throw after the send
+    // started must release the reservation — the payment did not happen.
+    let result;
+    try {
+      result =
+        dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
+    } catch (e) {
+      if (reservationId) {
+        try {
+          releaseReservation(reservationId);
+        } catch {
+          /* the orphaned reservation counts conservatively until pruned */
+        }
+      }
+      throw e;
+    }
     const payment = result && result.payment ? result.payment : result;
     const status = (payment && payment.status) || 'SUBMITTED';
 
@@ -285,9 +310,17 @@ async function main() {
     // log would make later budget checks overestimate what is left.
     if (!isFailedStatus(status)) {
       try {
-        recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
+        if (reservationId) finalizeReservation(reservationId);
+        else recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
       } catch (e) {
         console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+      }
+    } else if (reservationId) {
+      // The payment did not happen — do not let the reservation keep blocking.
+      try {
+        releaseReservation(reservationId);
+      } catch {
+        /* orphaned reservation counts conservatively until pruned */
       }
     }
 

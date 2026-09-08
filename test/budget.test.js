@@ -426,6 +426,182 @@ describe('recordSpend and log pruning', () => {
   });
 });
 
+// ── lock ownership / timeouts (review: fail-open and lock-takeover paths) ────
+
+describe('spending-log lock ownership', () => {
+  let mod;
+  let lockPath;
+  before(() => {
+    setupTempDir();
+    saveEnv();
+    patchHomedir();
+    delete require.cache[require.resolve(path.join(scriptsDir, '_budget.js'))];
+    mod = require(path.join(scriptsDir, '_budget.js'));
+    lockPath = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
+  });
+  after(() => {
+    restoreHomedir();
+    restoreEnv();
+    cleanupTempDir();
+  });
+  afterEach(() => {
+    mod.setLockTiming({ acquireTimeoutMs: 2000, staleMs: 5000 });
+    try { fs.rmSync(lockPath, { force: true }); } catch { /* ok */ }
+    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+  });
+
+  it('throws BUDGET_LOCK_TIMEOUT against a live foreign lock and never deletes it', () => {
+    mod.setLockTiming({ acquireTimeoutMs: 60, staleMs: 60_000 });
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, 'foreign-owner', 'utf8');
+    assert.throws(
+      () => mod.recordSpend({ sats: 1, command: 'x' }),
+      (e) => e.code === 'BUDGET_LOCK_TIMEOUT',
+      'refusing to mutate the log unlocked must be loud, not fail-open',
+    );
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), 'foreign-owner', 'the foreign lock must survive');
+  });
+
+  it('releaseLogLock never deletes a lock acquired by someone else', () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const token = mod.acquireLogLock();
+    try {
+      fs.writeFileSync(lockPath, 'successor-owner', 'utf8'); // takeover while we hold
+      mod.releaseLogLock(token);
+      assert.equal(
+        fs.readFileSync(lockPath, 'utf8'),
+        'successor-owner',
+        'a slow holder declared stale must not unlink its replacement',
+      );
+    } finally {
+      fs.rmSync(lockPath, { force: true });
+    }
+  });
+
+  it('throws BUDGET_LOCK_UNLINK_FAILED instead of spinning when a stale lock cannot be broken', () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, 'crashed-process', 'utf8');
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, old, old); // unmistakably stale
+
+    const realUnlink = fs.unlinkSync;
+    fs.unlinkSync = () => {
+      const err = new Error('EACCES: immutable file');
+      err.code = 'EACCES';
+      throw err;
+    };
+    try {
+      assert.throws(
+        () => mod.recordSpend({ sats: 1, command: 'x' }),
+        (e) => e.code === 'BUDGET_LOCK_UNLINK_FAILED',
+        'an unlink that keeps failing must surface, not spin forever',
+      );
+    } finally {
+      fs.unlinkSync = realUnlink;
+    }
+  });
+});
+
+// ── reservations (review: reserve the amount before the payment executes) ────
+
+describe('reserveBudget / finalizeReservation / releaseReservation', () => {
+  let mod;
+  before(() => {
+    setupTempDir();
+    saveEnv();
+    patchHomedir();
+    delete require.cache[require.resolve(path.join(scriptsDir, '_budget.js'))];
+    mod = require(path.join(scriptsDir, '_budget.js'));
+  });
+  after(() => {
+    restoreHomedir();
+    restoreEnv();
+    cleanupTempDir();
+  });
+  beforeEach(() => {
+    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try { fs.unlinkSync(mod.CONFIG_FILE); } catch { /* ok */ }
+  });
+
+  it('with no budget configured: allowed with id null (nothing to finalize)', () => {
+    const r = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    assert.equal(r.allowed, true);
+    assert.equal(r.id, null);
+  });
+
+  it('requireConfigured denies an unconfigured budget (autonomous callers)', () => {
+    const r = mod.reserveBudget({ sats: 100, command: 'x' });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /NO_BUDGET_CONFIGURED/);
+  });
+
+  it('a reservation blocks a concurrent reservation of the same remaining budget', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    const r1 = mod.reserveBudget({ sats: 60, command: 'send-a' }, { requireConfigured: false });
+    assert.equal(r1.allowed, true);
+    assert.ok(r1.id, 'a configured reservation must have an id');
+    const r2 = mod.reserveBudget({ sats: 60, command: 'send-b' }, { requireConfigured: false });
+    assert.equal(r2.allowed, false, '60 + 60 must exceed the 100-sat limit');
+    assert.match(r2.reason, /Daily budget exceeded/);
+    const r3 = mod.reserveBudget({ sats: 40, command: 'send-c' }, { requireConfigured: false });
+    assert.equal(r3.allowed, true, 'the remaining 40 sats are still reservable');
+  });
+
+  it('reserved entries count against checkBudget and getStatus', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    assert.equal(mod.getStatus().dailySpent, 60);
+    assert.equal(mod.checkBudget(50, { requireConfigured: false }).allowed, false);
+    assert.equal(mod.checkBudget(40, { requireConfigured: false }).allowed, true);
+  });
+
+  it('finalizeReservation converts the reservation into a normal spend entry', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    assert.equal(mod.finalizeReservation(r.id), true);
+    const log = mod.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 60);
+    assert.equal(log[0].command, 'x');
+    assert.equal(log[0].state, undefined, 'the final entry must not carry reservation state');
+    assert.equal(log[0].id, undefined);
+  });
+
+  it('releaseReservation removes the reservation and frees the budget', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    assert.equal(mod.releaseReservation(r.id), true);
+    assert.deepEqual(mod.readLog(), []);
+    const again = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    assert.equal(again.allowed, true, 'the full limit must be available after release');
+  });
+
+  it('an orphaned reservation keeps blocking (fail-closed) and self-heals via pruning', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    // Simulate a crash after payment: reserve with a 26h-old timestamp and
+    // never finalize it.
+    const orphan = mod.reserveBudget(
+      { sats: 60, command: 'crashed' },
+      { requireConfigured: false, nowMs: Date.now() - 26 * 60 * 60 * 1000 },
+    );
+    assert.equal(orphan.allowed, true);
+    // While it is inside the window it blocks; the PRUNE removes it because it
+    // is older than 25h, so the next mutation heals the log.
+    const next = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    assert.equal(next.allowed, true, 'the pruned orphan must no longer count');
+    const log = mod.readLog();
+    assert.equal(log.some((e) => e.id === orphan.id), false, 'the orphan was pruned away');
+  });
+
+  it('resetLog clears reservations too and returns the count', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    mod.recordSpend({ sats: 10, command: 'y' });
+    assert.equal(mod.resetLog(), 2);
+    assert.deepEqual(mod.readLog(), []);
+  });
+});
+
 // ── getLog / resetLog ────────────────────────────────────────────────────────
 
 describe('getLog and resetLog', () => {
