@@ -26,7 +26,7 @@
  */
 
 const { connect } = require('./_spark_sdk');
-const { parseArgs, isLnurlPayInput, prepareLnurl, prepareBolt } = require('./spark_send');
+const { parseArgs, classifyDestination, prepareLnurl, prepareBolt } = require('./spark_send');
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -37,21 +37,22 @@ async function main() {
 
   const { sdk, disconnect } = await connect({ network: args.network });
   try {
-    // 1. Classify the destination (same routing rule as spark-send).
+    // 1. Classify the destination (same exhaustive rule as spark-send).
     const parsed = await sdk.parse(args.destination);
-    const lnurl = isLnurlPayInput(parsed);
+    const dest = classifyDestination(parsed);
 
     // 2. Prepare only — resolves fees, moves nothing, signs nothing.
-    const { feeSats } = lnurl
-      ? await prepareLnurl(sdk, parsed, args.amountSats)
-      : await prepareBolt(sdk, args.destination, args.amountSats);
+    const { feeSats } =
+      dest.type === 'lnurl'
+        ? await prepareLnurl(sdk, dest.parsed, args.amountSats)
+        : await prepareBolt(sdk, args.destination, args.amountSats);
 
     console.log(
       JSON.stringify(
         {
           event: 'fee_probe',
           destination: args.destination,
-          destinationType: lnurl ? 'lnurl' : 'bolt11',
+          destinationType: dest.type,
           amountSats: args.amountSats,
           feeSats,
           network: args.network,
@@ -67,9 +68,15 @@ async function main() {
 
 if (require.main === module) {
   main()
-    .then(() => {
+    .then(async () => {
       // The Breez SDK keeps event-loop handles open after disconnect; force a
       // clean exit so the command returns promptly for the caller/agent.
+      // Drain stdout first — process.exit() can truncate a pending write when
+      // stdout is a pipe, and the JSON result is this command's whole product.
+      await new Promise((resolve) => {
+        if (process.stdout.writableLength === 0) return resolve();
+        process.stdout.write('', () => resolve());
+      });
       process.exit(process.exitCode || 0);
     })
     .catch((e) => {

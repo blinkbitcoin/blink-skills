@@ -95,6 +95,69 @@ function writeConfig(config) {
 
 // ── Spending log I/O ─────────────────────────────────────────────────────────
 
+const LOG_LOCK_FILE = path.join(BLINK_DIR, '.spending-log.lock');
+const LOCK_STALE_MS = 5000;
+
+/**
+ * Synchronous sleep that does not spin the CPU where supported.
+ * Atomics.wait throws on the main thread in some environments; busy-wait then.
+ */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      /* spin */
+    }
+  }
+}
+
+/**
+ * Acquire an inter-process lock for spending-log updates (check-and-record
+ * spans two processes only via this file). Uses O_EXCL creation as the mutex;
+ * a lock older than LOCK_STALE_MS is treated as abandoned by a crashed process
+ * and broken. Returns false instead of wedging a payment command when the lock
+ * cannot be obtained in time.
+ *
+ * @returns {boolean} true when the lock is held (must be released), false when
+ *   the caller should proceed unlocked rather than block.
+ */
+function acquireLogLock() {
+  fs.mkdirSync(BLINK_DIR, { recursive: true });
+  const deadline = Date.now() + LOCK_STALE_MS;
+  for (;;) {
+    try {
+      const fd = fs.openSync(LOG_LOCK_FILE, 'wx');
+      fs.closeSync(fd);
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - fs.statSync(LOG_LOCK_FILE).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(LOG_LOCK_FILE);
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between stat and our next attempt
+      }
+      if (Date.now() >= deadline) return false;
+      sleepSync(10);
+    }
+  }
+}
+
+/**
+ * Release the spending-log lock. Best effort: a missing lock file is fine.
+ */
+function releaseLogLock() {
+  try {
+    fs.unlinkSync(LOG_LOCK_FILE);
+  } catch {
+    /* already gone */
+  }
+}
+
 /**
  * Read the spending log from disk.
  * Returns an empty array if the file does not exist.
@@ -112,7 +175,13 @@ function readLog() {
 }
 
 /**
- * Write the spending log to disk, pruning entries older than 25 hours.
+ * Write the spending log, pruning entries older than 25 hours.
+ *
+ * The write is ATOMIC: content goes to a temp file that is renamed over the
+ * log. A concurrent reader therefore never sees a half-written file, and a
+ * crash cannot leave a truncated log behind. (This closes the torn-read half
+ * of the race; the read-modify-write half is handled by acquireLogLock in
+ * recordSpend.)
  *
  * @param {Array} entries
  */
@@ -120,7 +189,9 @@ function writeLog(entries) {
   const cutoff = Date.now() - PRUNE_THRESHOLD_MS;
   const pruned = entries.filter((e) => e.ts > cutoff);
   fs.mkdirSync(BLINK_DIR, { recursive: true });
-  fs.writeFileSync(LOG_FILE, JSON.stringify(pruned, null, 2), 'utf8');
+  const tmp = `${LOG_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(pruned, null, 2), 'utf8');
+  fs.renameSync(tmp, LOG_FILE);
 }
 
 // ── Budget check ─────────────────────────────────────────────────────────────
@@ -327,15 +398,25 @@ function checkDomainAllowed(domain, opts = {}) {
 /**
  * Record a successful outbound payment in the spending log.
  *
+ * The read-modify-write runs under the inter-process lock so two concurrent
+ * payment commands cannot overwrite each other's entry. Throws on failure —
+ * callers decide whether a failed recording is fatal for them (payment
+ * commands surface it as a warning; the payment itself already happened).
+ *
  * @param {object}  entry
  * @param {number}  entry.sats     Amount spent in satoshis.
- * @param {string}  entry.command  Command name (e.g. 'pay-invoice', 'l402-pay').
+ * @param {string}  entry.command  Command name (e.g. 'pay-invoice', 'spark-send').
  * @param {string|null} entry.domain  Domain (for L402 payments) or null.
  */
 function recordSpend({ sats, command, domain = null }) {
-  const log = readLog();
-  log.push({ ts: Date.now(), sats, command, domain });
-  writeLog(log);
+  const locked = acquireLogLock();
+  try {
+    const log = readLog();
+    log.push({ ts: Date.now(), sats, command, domain });
+    writeLog(log);
+  } finally {
+    if (locked) releaseLogLock();
+  }
 }
 
 // ── Log management ───────────────────────────────────────────────────────────

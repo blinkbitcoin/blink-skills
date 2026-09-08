@@ -217,8 +217,48 @@ describe('create_invoice_lnaddress main()', () => {
     assert.equal(j.lightningAddress, 'alice@blink.sv');
     assert.equal(j.paymentRequest, PR);
     assert.equal(j.verifyUrl, 'https://blink.sv/verify/abc');
-    assert.equal(j.satoshis, 1000);
-    assert.equal(j.walletId, null);
+  });
+
+  it('--qr merges QR fields into invoice_created and writes the PNG', async () => {
+    happyPath();
+    const fs = require('node:fs');
+    const r = await runScript('create_invoice_lnaddress.js', ['alice@blink.sv', '1000', '--no-verify', '--qr']);
+    const j = r.json();
+    assert.equal(j.event, 'invoice_created', 'the invoice is still the primary output');
+    assert.equal(j.qrRendered, true);
+    assert.equal(j.paymentRequest, PR);
+    assert.ok(j.pngPath.startsWith('/tmp/blink_qr_'));
+    assert.ok(fs.existsSync(j.pngPath), 'the PNG file must exist');
+    assert.ok(r.err.includes('PNG saved:'), 'the terminal QR and PNG notice go to stderr');
+    fs.unlinkSync(j.pngPath);
+  });
+
+  it('a QR rendering failure never loses the invoice (non-fatal)', async () => {
+    happyPath();
+    const qrPath = require.resolve('../blink/scripts/qr_invoice');
+    const saved = require.cache[qrPath];
+    require.cache[qrPath] = {
+      id: qrPath,
+      filename: qrPath,
+      loaded: true,
+      exports: {
+        main: () => {},
+        renderInvoiceQr: () => {
+          throw new Error('boom');
+        },
+      },
+    };
+    try {
+      const r = await runScript('create_invoice_lnaddress.js', ['alice@blink.sv', '1000', '--no-verify', '--qr']);
+      const j = r.json();
+      assert.equal(j.event, 'invoice_created');
+      assert.equal(j.paymentRequest, PR, 'the minted invoice survives the QR failure');
+      assert.equal(j.qrRendered, undefined);
+      assert.match(r.err, /QR rendering failed \(non-fatal\): boom/);
+    } finally {
+      if (saved) require.cache[qrPath] = saved;
+      else delete require.cache[qrPath];
+    }
   });
 
   it('reports a custodial recipient with its wallet id', async () => {

@@ -128,6 +128,11 @@ availability failure) but cannot redirect funds.
   - BOLT-11 invoice / Spark address → `sdk.prepareSendPayment` (fees) then `sdk.sendPayment` (signs)
   - A Lightning Address (e.g. `alice@blink.sv`) is an LNURL-pay destination and
     MUST use the LNURL path — `prepareSendPayment` does not accept it.
+  - The classification is an **exhaustive allowlist**: the SDK's `parse()`
+    recognizes more types than we pay to (on-chain Bitcoin addresses, BOLT-12
+    offers, cross-chain destinations, ...). Everything outside the four
+    supported types is rejected with `UNSUPPORTED_DESTINATION` instead of
+    falling into a payment path it was never validated for.
 - `spark-transactions` → `sdk.listPayments`
 - `spark-subscribe` → `sdk.addEventListener`
 
@@ -155,6 +160,20 @@ signing — the last possible moment before funds move; an unconfigured budget
 does not block an explicit one-shot send; successful/pending sends are recorded
 in the spending log; `--force` overrides the check. `spark-fee-probe` and
 `--dry-run` move nothing and are never budget-gated.
+
+Two scope notes, both inherited from the shared budget module and identical to
+the custodial commands:
+
+- **Principal only.** Budgets count the payment amount, not the routing fee —
+  a 100-sat send with a 3-sat fee passes with 100 sats remaining and records
+  100. The fee is known at check time; counting it would diverge from the
+  custodial pay commands' convention.
+- **Check/record is not atomic across processes.** The budget is checked
+  before signing and the spend recorded after settlement; two concurrent
+  sends can each observe the same remaining budget, and a crash between send
+  and record loses the entry. `_budget.js` mitigates the record half with a
+  lockfile-guarded read-modify-write and an atomic (temp+rename) log write;
+  the cross-send window is inherent to a CLI and accepted.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

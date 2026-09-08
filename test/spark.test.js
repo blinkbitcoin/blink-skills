@@ -526,6 +526,45 @@ describe('spark_send.feeFromPrepare', () => {
   });
 });
 
+// ── spark_send.classifyDestination ───────────────────────────────────────────
+
+describe('spark_send.classifyDestination', () => {
+  const { classifyDestination } = require('../blink/scripts/spark_send');
+
+  it('routes lnUrlPay and lightningAddress to the lnurl path', () => {
+    assert.equal(classifyDestination({ type: 'lnUrlPay' }).type, 'lnurl');
+    assert.equal(classifyDestination({ type: 'lightningAddress' }).type, 'lnurl');
+  });
+
+  it('routes bolt11Invoice', () => {
+    assert.equal(classifyDestination({ type: 'bolt11Invoice' }).type, 'bolt11');
+  });
+
+  it('routes sparkAddress', () => {
+    assert.equal(classifyDestination({ type: 'sparkAddress' }).type, 'spark');
+  });
+
+  it('is case-insensitive on the discriminant', () => {
+    assert.equal(classifyDestination({ type: 'BOLT11INVOICE' }).type, 'bolt11');
+  });
+
+  it('rejects every other SDK input type by name', () => {
+    for (const t of ['bitcoinAddress', 'bolt12Invoice', 'crossChainAddress', 'url', 'lnurlWithdraw']) {
+      assert.throws(
+        () => classifyDestination({ type: t }),
+        (e) => e.code === 'UNSUPPORTED_DESTINATION' && e.message.includes(`'${t.toLowerCase()}'`),
+        `${t} must not fall into a payment path`,
+      );
+    }
+  });
+
+  it('rejects malformed parse results rather than guessing', () => {
+    for (const bad of [null, undefined, {}, { type: '' }, 'bolt11Invoice']) {
+      assert.throws(() => classifyDestination(bad), (e) => e.code === 'UNSUPPORTED_DESTINATION');
+    }
+  });
+});
+
 // ── spark_send main() branch selection (mocked SDK) ───────────────────────────
 //
 // We inject a fake `_spark_sdk` module into the require cache so spark_send.js
@@ -686,6 +725,34 @@ describe('spark_send main() destination routing', () => {
     await runMain(['lnbc100n1p...', '100']);
     assert.ok(!process.exitCode);
   });
+
+  // ── destination classification (review finding: exhaustive allowlist) ──────
+
+  it('rejects an unsupported SDK destination type before any prepare call', async () => {
+    installMock({ parseType: 'bitcoinAddress' });
+    await assert.rejects(() => runMain(['bc1qxyz', '100']), (e) => {
+      assert.match(e.message, /Unsupported destination type 'bitcoinaddress'/);
+      assert.equal(e.code, 'UNSUPPORTED_DESTINATION');
+      return true;
+    });
+    assert.deepEqual(calls, ['parse'], 'must stop after parse, before any prepare/send');
+  });
+
+  it('routes a Spark address through prepareSendPayment and labels it spark', async () => {
+    installMock({ parseType: 'sparkAddress' });
+    const out = await runMain(['spark1qxyz', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.destinationType, 'spark');
+    assert.equal(parsed.status, 'COMPLETED');
+  });
+
+  it('dry-run to a Spark address labels destinationType spark', async () => {
+    installMock({ parseType: 'sparkAddress' });
+    const out = await runMain(['spark1qxyz', '100', '--dry-run']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment']);
+    assert.equal(JSON.parse(out).destinationType, 'spark');
+  });
 });
 
 // ── spark_send budget integration (mocked SDK + isolated budget) ─────────────
@@ -706,6 +773,7 @@ describe('spark_send budget integration', () => {
   let savedArgv;
   let savedLog;
   let savedErr;
+  let lastErr;
 
   before(() => {
     // The mocked routing tests above also record spends; start this suite clean.
@@ -772,15 +840,34 @@ describe('spark_send budget integration', () => {
     savedLog = console.log;
     savedErr = console.error;
     let out = '';
+    lastErr = '';
     console.log = (s) => {
       out += s;
     };
-    console.error = () => {};
+    console.error = (s) => {
+      lastErr += s + '\n';
+    };
     process.argv = [process.execPath, path.basename(sparkSendPath), ...argv];
     const { main } = require(sparkSendPath);
     await main();
     return out;
   }
+
+  it('a failed budget-log recording warns on stderr but never masks the payment', async () => {
+    installMock({});
+    const savedRecord = budget.recordSpend;
+    budget.recordSpend = () => {
+      throw new Error('disk full');
+    };
+    try {
+      const out = await runMain(['lnbc100n1p...', '100']);
+      assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
+      assert.ok(!process.exitCode);
+      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+    } finally {
+      budget.recordSpend = savedRecord;
+    }
+  });
 
   it('an unconfigured budget allows an explicit send and records the spend', async () => {
     installMock({});

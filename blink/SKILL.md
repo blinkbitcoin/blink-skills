@@ -71,7 +71,7 @@ commands). Key concepts:
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
 - **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
@@ -210,7 +210,7 @@ These rules are mandatory for any AI agent using this skill:
 - Resolve a `user@blink.sv` recipient with `blink resolve-receiver` (credential-free).
 - Receive with `blink create-invoice-lnaddress` (credential-free, works for both account types).
 - Balance / send / history / events need `SPARK_MNEMONIC` + `BREEZ_API_KEY` (Node 22+).
-- Dry-run `spark-send` first; it is **not** covered by budget controls.
+- Probe fees with `spark-fee-probe` (or `spark-send --dry-run`) first; budget limits apply when configured.
 
 8. Apply safety constraints:
 
@@ -479,9 +479,9 @@ Reads the BTC balance of a self-custodial (Spark) account directly from the wall
 blink spark-send <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
 ```
 
-Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
+Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destinations are classified **exhaustively**: only BOLT-11 invoices, Spark addresses, Lightning Addresses, and LNURL-pay URLs are accepted (a Lightning Address uses the LNURL-pay path). Anything else the SDK recognizes — on-chain Bitcoin addresses, BOLT-12 offers, cross-chain destinations — is rejected with `UNSUPPORTED_DESTINATION` before any prepare or budget interaction, and `destinationType` in the output is `bolt11`, `spark`, or `lnurl` accordingly. The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
 
-Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log. `--force` bypasses the budget check for an over-limit send.
+Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log (a failed recording warns on stderr but never masks the payment result). `--force` bypasses the budget check for an over-limit send. **Budgets count the payment principal (the amount), not the routing fee** — the same convention as the custodial pay commands.
 
 > **AGENT:** This command spends self-custodial funds irreversibly. Probe the fee (`spark-fee-probe` or `--dry-run`) first, then confirm the amount and destination with the user before executing.
 
@@ -491,7 +491,7 @@ Subject to the same budget controls as the custodial pay commands: configured li
 blink spark-fee-probe <destination> <amount_sats> [--network mainnet|regtest]
 ```
 
-Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded.
+Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Same exhaustive destination allowlist as `spark-send`. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded.
 
 ### Spark Transactions
 
@@ -1451,6 +1451,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### How Budget Enforcement Works
 
 - **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send` (after fee resolution, before signing)
+- **Principal only:** budgets count the payment amount, not the routing fee — for the custodial commands and `spark-send` alike
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
 - **Fail closed for auto-pay:** `l402-pay` refuses to run unless a budget AND a non-empty domain allowlist are explicitly configured (`NO_BUDGET_CONFIGURED` / `NO_ALLOWLIST_CONFIGURED` errors explain the setup)
@@ -1476,8 +1477,8 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
 - **L402 requests** go directly to the third-party URL you provide to `l402-discover` or `l402-pay`. The Blink API is contacted only when a payment is needed.
 - **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts the Blink API host (`BLINK_API_URL`) for an **unauthenticated `accountDefaultWallet` classification probe**, then `blink.sv` and its LNURL service host `lnurl.blink.sv` — all allowlisted, every redirect re-validated. A transport/5xx failure of the probe aborts (`CUSTODIAL_PROBE_FAILED`) rather than assuming the recipient is non-custodial; only an authoritative "no such custodial account" answer falls through to LNURL. Blocking the GraphQL host therefore breaks both credential-free commands.
-- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). Signing happens locally; the seed never leaves the machine.
-- **No other network calls.** Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
+- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). `spark-send` and `spark-fee-probe` with a Lightning Address or LNURL destination also contact the **recipient's LNURL service** — the address domain and its callback host — during SDK parse/prepare. Note this happens *before* a configured budget can reject an over-limit send. Signing happens locally; the seed never leaves the machine.
+- **No other network calls** beyond those listed here. Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
 
 ### Filesystem Access
 

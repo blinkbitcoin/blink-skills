@@ -395,6 +395,35 @@ describe('recordSpend and log pruning', () => {
     assert.equal(log.length, 1);
     assert.equal(log[0].command, 'recent');
   });
+
+  // ── atomicity / locking (review finding: non-atomic check-and-record) ──────
+
+  it('writeLog is atomic: the log is replaced by rename, leaving no temp file', () => {
+    mod.writeLog([{ ts: Date.now(), sats: 1, command: 'x' }]);
+    const dir = path.dirname(mod.LOG_FILE);
+    const leftovers = fs.readdirSync(dir).filter((f) => f.includes('.tmp'));
+    assert.deepEqual(leftovers, [], 'a crash-resilient write must not leave temp files behind');
+    assert.equal(mod.readLog().length, 1, 'the renamed log is valid JSON with the entry');
+  });
+
+  it('breaks a stale lock left by a crashed process and still records', () => {
+    fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
+    const lock = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
+    fs.writeFileSync(lock, '', 'utf8');
+    // Backdate far past the staleness threshold so the lock is immediately broken.
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, old, old);
+    mod.recordSpend({ sats: 7, command: 'stale-lock-test' });
+    const log = mod.readLog();
+    assert.equal(log.length, 1, 'the stale lock must not wedge recording');
+    assert.equal(fs.existsSync(lock), false, 'the broken lock must be released');
+  });
+
+  it('releases the lock after a successful record', () => {
+    const lock = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
+    mod.recordSpend({ sats: 3, command: 'lock-release-test' });
+    assert.equal(fs.existsSync(lock), false);
+  });
 });
 
 // ── getLog / resetLog ────────────────────────────────────────────────────────

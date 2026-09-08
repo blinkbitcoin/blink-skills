@@ -197,6 +197,36 @@ describe('CLI: spark-send exit code reflects payment outcome', () => {
   });
 });
 
+// ── destination classification ───────────────────────────────────────────────
+
+describe('CLI: exhaustive destination classification', () => {
+  it('spark-send rejects an unsupported SDK destination before any prepare call', async () => {
+    const { code, stderr } = await runCli(['spark-send', 'bc1qxyz', '100'], {
+      env: { HOME: cliHome, SPARK_STUB_PARSE_TYPE: 'bitcoinAddress' },
+    });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /Unsupported destination type/);
+  });
+
+  it('spark-fee-probe rejects the same unsupported destinations', async () => {
+    const { code, stderr } = await runCli(['spark-fee-probe', 'bc1qxyz', '100'], {
+      env: { SPARK_STUB_PARSE_TYPE: 'bolt12Invoice' },
+    });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /Unsupported destination type/);
+  });
+
+  it('a Spark address is routed and labeled spark (not bolt11)', async () => {
+    const { code, stdout } = await runCli(['spark-fee-probe', 'spark1qxyz', '100'], {
+      env: { SPARK_STUB_PARSE_TYPE: 'sparkAddress' },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.destinationType, 'spark');
+    assert.equal(j.feeSats, 3);
+  });
+});
+
 // ── budget enforcement (parity with the custodial pay commands) ──────────────
 
 describe('CLI: spark-send budget enforcement', () => {
@@ -265,6 +295,11 @@ describe('CLI: spark-transactions pagination and filtering', () => {
   it('forwards --offset to the SDK listPayments call', async () => {
     const { stderr } = await runCli(['spark-transactions', '--offset', '40'], { env: { SPARK_STUB_ECHO: '1' } });
     assert.match(stderr, /STUB_OFFSET=40/);
+  });
+
+  it('passes --type to the SDK as a native typeFilter (pagination over the filtered stream)', async () => {
+    const { stderr } = await runCli(['spark-transactions', '--type', 'receive'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.match(stderr, /STUB_TYPEFILTER=receive/);
   });
 
   it('filters by --type receive', async () => {

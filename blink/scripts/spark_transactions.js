@@ -54,10 +54,17 @@ async function main() {
   const { sdk, disconnect } = await connect({ network: args.network });
   try {
     // listPayments signature varies slightly by SDK version; pass a request
-    // object with a limit and normalize whatever comes back.
-    const raw = await sdk.listPayments({ limit: args.limit, offset: args.offset });
+    // object with a limit and normalize whatever comes back. The SDK supports
+    // a native typeFilter — use it so pagination runs over the FILTERED
+    // stream (client-side filtering after paging would return empty pages
+    // while older matches exist).
+    const request = { limit: args.limit, offset: args.offset };
+    if (args.type) request.typeFilter = [args.type];
+    const raw = await sdk.listPayments(request);
     const payments = Array.isArray(raw) ? raw : raw && raw.payments ? raw.payments : [];
     let normalized = payments.map(normalizePayment);
+    // Defense in depth for SDK versions that ignore typeFilter: apply the
+    // same filter client-side. When the SDK did filter, this is a no-op.
     if (args.type) normalized = normalized.filter((p) => p.type === args.type);
     console.log(
       JSON.stringify(

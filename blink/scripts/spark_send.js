@@ -105,6 +105,31 @@ function feeFromPrepare(prepareResponse) {
 }
 
 /**
+ * Classify an SDK parse() result into one of the routing targets this skill
+ * supports. EXHAUSTIVE by design: the SDK recognizes more destination types
+ * than we can pay to (on-chain Bitcoin addresses, BOLT-12 offers, cross-chain
+ * addresses, URLs, ...), and a boolean LNURL-vs-everything-else check would
+ * let any future SDK input type silently fall into the generic
+ * prepareSendPayment path without ever having been validated for it. Only the
+ * four types below are allowed; everything else is rejected by name.
+ *
+ * @param {object} parsed  Result of sdk.parse(destination).
+ * @returns {{ type: 'lnurl'|'bolt11'|'spark', parsed: object }}
+ * @throws {Error} code UNSUPPORTED_DESTINATION for any unrecognized type.
+ */
+function classifyDestination(parsed) {
+  const t = parsed && typeof parsed.type === 'string' ? parsed.type.toLowerCase() : '';
+  if (t === 'lnurlpay' || t === 'lightningaddress') return { type: 'lnurl', parsed };
+  if (t === 'bolt11invoice') return { type: 'bolt11', parsed };
+  if (t === 'sparkaddress') return { type: 'spark', parsed };
+  const e = new Error(
+    `Unsupported destination type '${t || 'unknown'}'. Supported: BOLT-11 invoice, Spark address, Lightning Address, LNURL-pay URL.`,
+  );
+  e.code = 'UNSUPPORTED_DESTINATION';
+  throw e;
+}
+
+/**
  * Determine whether a parsed input is an LNURL-pay / Lightning-address
  * destination (as opposed to a BOLT-11 invoice or Spark address).
  *
@@ -201,15 +226,17 @@ async function main() {
   try {
     // 1. Classify the destination.
     const parsed = await sdk.parse(args.destination);
-    const lnurl = isLnurlPayInput(parsed);
-    console.error(
-      `Destination classified as ${lnurl ? 'Lightning Address / LNURL-pay' : 'BOLT-11 invoice / Spark address'}.`,
-    );
+    // Exhaustive classification: anything the SDK recognizes but this skill
+    // does not pay to (on-chain, BOLT-12, cross-chain, ...) is rejected here,
+    // before any prepare or budget interaction.
+    const dest = classifyDestination(parsed);
+    console.error(`Destination classified as ${dest.type === 'lnurl' ? 'Lightning Address / LNURL-pay' : dest.type === 'spark' ? 'Spark address' : 'BOLT-11 invoice'}.`);
 
     // 2. Prepare (resolves fees) via the matching path.
-    const { prepareResponse, feeSats } = lnurl
-      ? await prepareLnurl(sdk, parsed, args.amountSats)
-      : await prepareBolt(sdk, args.destination, args.amountSats);
+    const { prepareResponse, feeSats } =
+      dest.type === 'lnurl'
+        ? await prepareLnurl(sdk, dest.parsed, args.amountSats)
+        : await prepareBolt(sdk, args.destination, args.amountSats);
 
     console.error(`Prepared payment. Estimated fee: ${feeSats === null ? 'unknown' : `${feeSats} sats`}.`);
 
@@ -220,7 +247,7 @@ async function main() {
             event: 'send_prepared',
             dryRun: true,
             destination: args.destination,
-            destinationType: lnurl ? 'lnurl' : 'bolt11',
+            destinationType: dest.type,
             amountSats: args.amountSats,
             feeSats,
             network: args.network,
@@ -237,6 +264,8 @@ async function main() {
     // budget is enforced when configured, but an unconfigured budget must not
     // block an explicitly user-initiated payment, so opt out of the fail-closed
     // default that guards autonomous L402 auto-pay. --force overrides.
+    // Budgets count the payment PRINCIPAL, not the routing fee — same
+    // convention as the custodial pay commands.
     if (!args.force) {
       const budgetResult = checkBudget(args.amountSats, { requireConfigured: false });
       if (!budgetResult.allowed) {
@@ -245,18 +274,20 @@ async function main() {
     }
 
     // 3. Send (signs locally) via the matching path.
-    const result = lnurl ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
+    const result =
+      dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
     const payment = result && result.payment ? result.payment : result;
     const status = (payment && payment.status) || 'SUBMITTED';
 
     // Record the spend unless the SDK says the payment failed — same rule as
     // the custodial pay commands ("only successful/pending payments are
-    // logged"). Non-fatal: a logging failure must not mask the payment result.
+    // logged"). Non-fatal, but never silent: a spend that escapes the budget
+    // log would make later budget checks overestimate what is left.
     if (!isFailedStatus(status)) {
       try {
         recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
-      } catch {
-        /* non-fatal */
+      } catch (e) {
+        console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
       }
     }
 
@@ -266,7 +297,7 @@ async function main() {
           event: 'send_result',
           status,
           destination: args.destination,
-          destinationType: lnurl ? 'lnurl' : 'bolt11',
+          destinationType: dest.type,
           amountSats: args.amountSats,
           feeSats,
           paymentId: (payment && (payment.id || payment.paymentHash)) || null,
@@ -317,6 +348,7 @@ module.exports = {
   isLnurlPayInput,
   lnurlPayRequestFrom,
   isFailedStatus,
+  classifyDestination,
   prepareLnurl,
   prepareBolt,
 };
