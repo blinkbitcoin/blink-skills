@@ -456,10 +456,13 @@ Classifies a Blink identifier (bare username or `user@blink.sv`) as `custodial` 
 blink create-invoice-lnaddress <lightning_address> <amount_sats> [memo...] [--timeout <seconds>] [--no-verify]
 ```
 
-Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay — **no API key and no seed required**, and it works whether the recipient is custodial or non-custodial (Spark); the LNURL server routes internally. Outputs two JSON objects: `invoice_created` immediately, then `verify_result` (`PAID`/`TIMEOUT`) once the LUD-21 verify URL reports settlement. For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
+Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay — **no API key and no seed required**, and it works whether the recipient is custodial or non-custodial (Spark); the LNURL server routes internally. Classification first sends an unauthenticated `accountDefaultWallet` request to the Blink API host (`BLINK_API_URL`); if that probe fails at the transport level, the command aborts (`CUSTODIAL_PROBE_FAILED`) instead of guessing the account type. It outputs `invoice_created` immediately; a second JSON object follows **only when settlement polling is active** (see below). For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
 
 - `--timeout <seconds>` — verify-poll timeout (default: 300, 0 = no timeout)
 - `--no-verify` — skip settlement polling; just create the invoice and exit
+
+**Output cardinality is conditional.** `invoice_created` is always emitted. The second object (`verify_result`, `PAID`/`TIMEOUT`) follows only if polling is active: `--no-verify` was **not** passed **and** the first JSON contains a `verifyUrl`. Check `verifyUrl` in the first JSON before waiting — when it is absent, the command emits exactly one object and exits.
+
 - `--qr` — render a terminal QR (stderr) and a PNG in /tmp for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
 
 ### Spark Balance
@@ -476,7 +479,7 @@ Reads the BTC balance of a self-custodial (Spark) account directly from the wall
 blink spark-send <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
 ```
 
-Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). Fees are always resolved and printed before sending; `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
+Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
 
 Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log. `--force` bypasses the budget check for an over-limit send.
 
@@ -530,35 +533,35 @@ Streams account updates in real time. Each event is output as a JSON line (NDJSO
 
 ## API Reference
 
-| Operation          | GraphQL                                     | Scope Required    |
-| ------------------ | ------------------------------------------- | ----------------- |
-| Check balance      | `query me` + `currencyConversionEstimation` | Read              |
-| Create BTC invoice | `mutation lnInvoiceCreate`                  | Receive           |
-| Create USD invoice | `mutation lnUsdInvoiceCreate`               | Receive           |
-| Check invoice      | `query invoiceByPaymentHash`                | Read              |
-| Pay invoice        | `mutation lnInvoicePaymentSend`             | Write             |
-| Pay LN address     | `mutation lnAddressPaymentSend`             | Write             |
-| Pay LNURL          | `mutation lnurlPaymentSend`                 | Write             |
-| Fee estimate (BTC) | `mutation lnInvoiceFeeProbe`                | Read              |
-| Fee estimate (USD) | `mutation lnUsdInvoiceFeeProbe`             | Read              |
-| Swap BTC→USD       | `mutation intraLedgerPaymentSend`           | Write             |
-| Swap USD→BTC       | `mutation intraLedgerUsdPaymentSend`        | Write             |
-| Transactions       | `query transactions`                        | Read              |
-| Price / convert    | `query currencyConversionEstimation`        | **None (public)** |
-| Price history      | `query btcPriceList`                        | **None (public)** |
-| Currency list      | `query currencyList`                        | **None (public)** |
-| Realtime price     | `query realtimePrice`                       | **None (public)** |
-| Account info       | `query me` + `currencyConversionEstimation` | Read              |
-| Subscribe invoice  | `subscription lnInvoicePaymentStatus`       | Read              |
-| Subscribe updates  | `subscription myUpdates`                    | Read              |
-| L402 discover      | external HTTP (no Blink API)                | **None**          |
-| L402 pay           | `mutation lnInvoicePaymentSend` (on 402)    | Write             |
-| Resolve receiver   | `query accountDefaultWallet` + `.well-known/lnurlp` (public HTTP) | **None (public)** |
-| Invoice via LNURL  | LNURL-pay (LUD-06/16/21, no Blink API)      | **None (public)** |
-| Spark balance      | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark send         | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark transactions | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark subscribe    | Breez Spark SDK events (no Blink API)       | **Seed** (`SPARK_MNEMONIC`) |
+| Operation          | GraphQL                                                                                           | Scope Required              |
+| ------------------ | ------------------------------------------------------------------------------------------------- | --------------------------- |
+| Check balance      | `query me` + `currencyConversionEstimation`                                                       | Read                        |
+| Create BTC invoice | `mutation lnInvoiceCreate`                                                                        | Receive                     |
+| Create USD invoice | `mutation lnUsdInvoiceCreate`                                                                     | Receive                     |
+| Check invoice      | `query invoiceByPaymentHash`                                                                      | Read                        |
+| Pay invoice        | `mutation lnInvoicePaymentSend`                                                                   | Write                       |
+| Pay LN address     | `mutation lnAddressPaymentSend`                                                                   | Write                       |
+| Pay LNURL          | `mutation lnurlPaymentSend`                                                                       | Write                       |
+| Fee estimate (BTC) | `mutation lnInvoiceFeeProbe`                                                                      | Read                        |
+| Fee estimate (USD) | `mutation lnUsdInvoiceFeeProbe`                                                                   | Read                        |
+| Swap BTC→USD       | `mutation intraLedgerPaymentSend`                                                                 | Write                       |
+| Swap USD→BTC       | `mutation intraLedgerUsdPaymentSend`                                                              | Write                       |
+| Transactions       | `query transactions`                                                                              | Read                        |
+| Price / convert    | `query currencyConversionEstimation`                                                              | **None (public)**           |
+| Price history      | `query btcPriceList`                                                                              | **None (public)**           |
+| Currency list      | `query currencyList`                                                                              | **None (public)**           |
+| Realtime price     | `query realtimePrice`                                                                             | **None (public)**           |
+| Account info       | `query me` + `currencyConversionEstimation`                                                       | Read                        |
+| Subscribe invoice  | `subscription lnInvoicePaymentStatus`                                                             | Read                        |
+| Subscribe updates  | `subscription myUpdates`                                                                          | Read                        |
+| L402 discover      | external HTTP (no Blink API)                                                                      | **None**                    |
+| L402 pay           | `mutation lnInvoicePaymentSend` (on 402)                                                          | Write                       |
+| Resolve receiver   | unauthenticated `accountDefaultWallet` probe (Blink GraphQL) + `.well-known/lnurlp` (public HTTP) | **None (public)**           |
+| Invoice via LNURL  | unauthenticated `accountDefaultWallet` probe (Blink GraphQL) + LNURL-pay (LUD-06/16/21)           | **None (public)**           |
+| Spark balance      | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark send         | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark transactions | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark subscribe    | Breez Spark SDK events (no Blink API)                                                             | **Seed** (`SPARK_MNEMONIC`) |
 
 **API Endpoint:** `https://api.blink.sv/graphql` (production)
 **Authentication:** `X-API-KEY` header
@@ -802,7 +805,7 @@ Second JSON (when payment resolves):
 }
 ```
 
-**create-invoice-lnaddress (two-phase):** first JSON is `invoice_created` (`accountType`, `lightningAddress`, `paymentRequest`, `verifyUrl`, `satoshis`); second JSON is `verify_result` with `status` `"PAID"` or `"TIMEOUT"` — only for non-custodial recipients that return a LUD-21 verify URL.
+**create-invoice-lnaddress (two-phase):** first JSON is `invoice_created` (`accountType`, `lightningAddress`, `paymentRequest`, `verifyUrl`, `satoshis`); second JSON is `verify_result` with `status` `"PAID"` or `"TIMEOUT"` — emitted **only when polling is active**: `--no-verify` was not passed and `verifyUrl` is present in the first JSON. Inspect `verifyUrl` before waiting; without it, exactly one object is emitted.
 
 ## Typical Agent Workflows
 
@@ -861,7 +864,9 @@ blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 # → First JSON: {"event": "invoice_created", "accountType": "lnaddress", "paymentRequest": "lnbc...", "verifyUrl": "https://...", ...}
 # Generate QR from paymentRequest (blink qr works on any BOLT-11) and send to the payer
 
-# 3. Second JSON when settled: {"event": "verify_result", "status": "PAID", ...}
+# 3. If verifyUrl was present (and --no-verify was not passed), wait for the second JSON:
+# → {"event": "verify_result", "status": "PAID", ...}
+# If verifyUrl is absent, the command already emitted its only JSON object and exited.
 # For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
 ```
 
@@ -1470,7 +1475,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Outbound HTTPS** to `api.blink.sv` (or `BLINK_API_URL` override) for all GraphQL queries and mutations.
 - **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
 - **L402 requests** go directly to the third-party URL you provide to `l402-discover` or `l402-pay`. The Blink API is contacted only when a payment is needed.
-- **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts `blink.sv` and its LNURL service host `lnurl.blink.sv` only — both allowlisted, every redirect re-validated.
+- **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts the Blink API host (`BLINK_API_URL`) for an **unauthenticated `accountDefaultWallet` classification probe**, then `blink.sv` and its LNURL service host `lnurl.blink.sv` — all allowlisted, every redirect re-validated. A transport/5xx failure of the probe aborts (`CUSTODIAL_PROBE_FAILED`) rather than assuming the recipient is non-custodial; only an authoritative "no such custodial account" answer falls through to LNURL. Blocking the GraphQL host therefore breaks both credential-free commands.
 - **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). Signing happens locally; the seed never leaves the machine.
 - **No other network calls.** Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
 

@@ -111,13 +111,14 @@ function stubFetch(handler) {
 }
 
 /** Replace _spark_sdk with a fake connect() returning `fakeSdk`. */
-function mockSparkSdk(fakeSdk, { onDisconnect } = {}) {
+function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
   require.cache[sparkSdkPath] = {
     id: sparkSdkPath,
     filename: sparkSdkPath,
     loaded: true,
     exports: {
-      async connect() {
+      async connect(connectOpts) {
+        if (onConnect) onConnect(connectOpts || {});
         return {
           sdk: fakeSdk,
           disconnect: async () => {
@@ -468,6 +469,35 @@ describe('spark_balance main()', () => {
     );
     await assert.rejects(() => runScript('spark_balance.js', []), /sync failed/);
     assert.equal(disconnected, true);
+  });
+
+  it('passes the --network flag through to connect() (direct-script parity)', async () => {
+    // Regression: spark_balance.js used to read only SPARK_NETWORK from the
+    // environment, so `node spark_balance.js --network regtest` silently
+    // stayed on mainnet. The flag must reach connect() when the script is
+    // invoked directly, not just through the CLI dispatcher.
+    let connectedNetwork = null;
+    mockSparkSdk(
+      {
+        async getInfo() {
+          return { balanceSats: 1n };
+        },
+      },
+      {
+        onConnect: (opts) => {
+          connectedNetwork = opts.network;
+        },
+      },
+    );
+    const saved = process.env.SPARK_NETWORK;
+    delete process.env.SPARK_NETWORK;
+    try {
+      await runScript('spark_balance.js', ['--network', 'regtest']);
+    } finally {
+      if (saved === undefined) delete process.env.SPARK_NETWORK;
+      else process.env.SPARK_NETWORK = saved;
+    }
+    assert.equal(connectedNetwork, 'regtest');
   });
 });
 

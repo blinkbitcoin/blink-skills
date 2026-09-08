@@ -883,6 +883,54 @@ describe('spark_transactions.parseArgs', () => {
   });
 });
 
+// ── spark_balance.parseArgs ──────────────────────────────────────────────────
+
+describe('spark_balance.parseArgs', () => {
+  const { parseArgs } = require('../blink/scripts/spark_balance');
+  const savedEnv = process.env.SPARK_NETWORK;
+
+  const restoreEnv = () => {
+    if (savedEnv === undefined) delete process.env.SPARK_NETWORK;
+    else process.env.SPARK_NETWORK = savedEnv;
+  };
+
+  it('defaults to mainnet with no args and no env var', () => {
+    delete process.env.SPARK_NETWORK;
+    try {
+      assert.equal(parseArgs([]).network, 'mainnet');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('falls back to SPARK_NETWORK when the flag is absent', () => {
+    process.env.SPARK_NETWORK = 'regtest';
+    try {
+      assert.equal(parseArgs([]).network, 'regtest');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('parses --network and lets the flag win over the env var', () => {
+    process.env.SPARK_NETWORK = 'mainnet';
+    try {
+      assert.equal(parseArgs(['--network', 'regtest']).network, 'regtest');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('ignores a trailing --network without a value', () => {
+    delete process.env.SPARK_NETWORK;
+    try {
+      assert.equal(parseArgs(['--network']).network, 'mainnet');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
 // ── storage preflight (review finding #1) ────────────────────────────────────
 //
 // The probe must require better-sqlite3 DIRECTLY and open a database, because

@@ -22,8 +22,19 @@
 
 const { connect, waitForStableBalance } = require('./_spark_sdk');
 
+function parseArgs(argv) {
+  let network = process.env.SPARK_NETWORK || 'mainnet';
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--network' && i + 1 < argv.length) {
+      network = argv[i + 1];
+      i++;
+    }
+  }
+  return { network };
+}
+
 async function main() {
-  const network = process.env.SPARK_NETWORK || 'mainnet';
+  const { network } = parseArgs(process.argv.slice(2));
   const { sdk, disconnect } = await connect({ network });
   try {
     // Wait for a stable balance to avoid reporting a mid-sync transient right
@@ -60,4 +71,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs };
