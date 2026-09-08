@@ -21,7 +21,7 @@ credentials you need differ.
 
 |                         | **Custodial**                       | **Non-custodial (Spark)**                                   |
 | ----------------------- | ----------------------------------- | ---------------------------------------------------------- |
-| **Who holds the keys**  | Blink                               | **You** (a 12/24-word seed)                                |
+| **Who holds the keys**  | Blink                               | **You** (a 12-word seed)                                |
 | **You need**            | `BLINK_API_KEY`                     | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
 | **Runtime deps**        | None (Node 18+ built-ins)           | Two optional packages, **Node 22+**                        |
 | **Balance / history**   | Blink API                           | Local, via the Breez SDK (not on the Blink API)            |
