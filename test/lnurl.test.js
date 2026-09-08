@@ -48,13 +48,48 @@ const TEST_METADATA_HASH = crypto.createHash('sha256').update(TEST_METADATA, 'ut
  * @param {string} [prefix]  'bc' mainnet, 'tb' testnet, 'bcrt' regtest.
  * @param {string} [metadata]  LUD-06 metadata the desc-hash commits to.
  */
-function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA) {
+function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA, buildOpts = {}) {
   const hrp = `ln${prefix}${amountSuffix(msats)}`;
   const hash = crypto.createHash('sha256').update(metadata, 'utf8').digest();
-  const hashWords = bech32.toWords(hash);
-  // 7-word timestamp + h tag (type 23, 52-word length) + 104-word signature.
-  const words = [...new Array(7).fill(0), 23, (52 >> 5) & 31, 52 & 31, ...hashWords, ...new Array(104).fill(0)];
-  return bech32.encode(hrp, words, 2000);
+
+  // Timestamp: 35 bits big-endian as 7 five-bit words. A real (non-zero,
+  // unexpired) timestamp is now required, so fixtures must carry one.
+  const ts = buildOpts.timestampSeconds !== undefined ? buildOpts.timestampSeconds : Math.floor(Date.now() / 1000);
+  const tsWords = [];
+  for (let w = 6; w >= 0; w--) tsWords.push(Math.floor(ts / Math.pow(32, w)) % 32);
+
+  const tags = [];
+  // `p` payment hash (type 1, 52 words) — now mandatory.
+  if (!buildOpts.omitPaymentHash) {
+    const pHash = crypto
+      .createHash('sha256')
+      .update('payment:' + (buildOpts.paymentSeed || 'seed'))
+      .digest();
+    tags.push(1, (52 >> 5) & 31, 52 & 31, ...bech32.toWords(pHash));
+  }
+  // Description form: h (type 23) or d (type 13), or both for the dup test.
+  const descWords = bech32.toWords(hash);
+  if (buildOpts.bothDescriptions) {
+    const dBytes = bech32.toWords(Buffer.from('desc', 'utf8'));
+    tags.push(13, (dBytes.length >> 5) & 31, dBytes.length & 31, ...dBytes);
+    tags.push(23, (52 >> 5) & 31, 52 & 31, ...descWords);
+  } else if (!buildOpts.omitDescription) {
+    tags.push(23, (52 >> 5) & 31, 52 & 31, ...descWords);
+  }
+  // `x` expiry (type 6) when given.
+  if (buildOpts.expirySeconds !== undefined) {
+    const exp = buildOpts.expirySeconds;
+    const expWords = [];
+    let v = exp;
+    while (v > 0) {
+      expWords.unshift(v % 32);
+      v = Math.floor(v / 32);
+    }
+    tags.push(6, (expWords.length >> 5) & 31, expWords.length & 31, ...expWords);
+  }
+
+  const words = [...tsWords, ...tags, ...new Array(104).fill(0)];
+  return bech32.encode(hrp, words, 20000);
 }
 
 /** The `<digits><multiplier>` HRP suffix for a msat amount. */
@@ -174,8 +209,8 @@ describe('fetchLnurlPayMetadata', () => {
     );
   });
 
-  it('throws LNURL_NOT_FOUND on LNURL ERROR body with a not-found reason', async () => {
-    stubFetch(() => ({ json: { status: 'ERROR', reason: 'not found' } }));
+  it('throws LNURL_NOT_FOUND on LNURL ERROR body with a receiver-anchored not-found reason', async () => {
+    stubFetch(() => ({ json: { status: 'ERROR', reason: 'user not found' } }));
     await assert.rejects(
       () => fetchLnurlPayMetadata('nobody', 'blink.sv'),
       (e) => e.code === 'LNURL_NOT_FOUND',
@@ -198,6 +233,29 @@ describe('fetchLnurlPayMetadata', () => {
     assert.equal(isLnurlNotFoundReason('temporarily overloaded'), false);
     assert.equal(isLnurlNotFoundReason('rate limited, retry later'), false);
     assert.equal(isLnurlNotFoundReason('internal error'), false);
+  });
+
+  // Review finding: an unrestricted /not found/ matched infrastructure errors,
+  // letting them be misreported as receiver-absence. These must stay SERVICE.
+  it('does not classify infrastructure or payment "not found" as receiver-absence', () => {
+    for (const reason of [
+      'upstream route not found',
+      'backend service not found',
+      'invoice not found',
+      'page not found',
+      'resource not found',
+    ]) {
+      assert.equal(isLnurlNotFoundReason(reason), false, `"${reason}" must not read as receiver-absence`);
+    }
+    // The receiver-anchored forms still do.
+    for (const reason of ['user not found', 'account not found', 'username does not exist', 'unknown address']) {
+      assert.equal(isLnurlNotFoundReason(reason), true, `"${reason}" should read as receiver-absence`);
+    }
+  });
+
+  it('honours a structured not-found code on the LUD-06 error body', () => {
+    assert.equal(isLnurlNotFoundReason('whatever', 'USER_NOT_FOUND'), true);
+    assert.equal(isLnurlNotFoundReason('whatever', 'RATE_LIMITED'), false);
   });
 
   // A single transient 404 (proxy/WAF/rolling deploy) must not be relayed as
@@ -289,6 +347,61 @@ describe('getInvoiceFromLightningAddress', () => {
     await assert.rejects(
       () => getInvoiceFromLightningAddress('alice@blink.sv', 1),
       (e) => e.code === 'AMOUNT_TOO_LOW',
+    );
+  });
+
+  // Production topology regression (review finding): the live blink.sv metadata
+  // returns its callback on lnurl.blink.sv, NOT blink.sv. The address domain and
+  // the LNURL service host are different sets, and conflating them breaks the
+  // whole credential-free receive path.
+  it('accepts a callback on the lnurl.blink.sv service host (production topology)', async () => {
+    const { ALLOWED_LN_ADDRESS_DOMAINS, ALLOWED_LNURL_SERVICE_HOSTS } = require('../blink/scripts/_blink_client');
+    const pr = bolt11(1000 * 1000);
+    stubFetch((url) => {
+      if (url.includes('/.well-known/lnurlp/')) {
+        return {
+          json: {
+            tag: 'payRequest',
+            callback: 'https://lnurl.blink.sv/lnurlp/blink.sv/alice/invoice',
+            minSendable: 1000,
+            maxSendable: 1e9,
+            metadata: TEST_METADATA,
+          },
+        };
+      }
+      return { json: { pr, verify: 'https://lnurl.blink.sv/verify/abc' } };
+    });
+    const inv = await getInvoiceFromLightningAddress('alice@blink.sv', 1000, undefined, {
+      allowedAddressDomains: ALLOWED_LN_ADDRESS_DOMAINS,
+      allowedHosts: ALLOWED_LNURL_SERVICE_HOSTS,
+    });
+    assert.equal(inv.paymentRequest, pr);
+    assert.equal(inv.verify, 'https://lnurl.blink.sv/verify/abc');
+  });
+
+  it('still refuses a callback on an arbitrary host even when the service set is wide', async () => {
+    const { ALLOWED_LN_ADDRESS_DOMAINS, ALLOWED_LNURL_SERVICE_HOSTS } = require('../blink/scripts/_blink_client');
+    stubFetch((url) => {
+      if (url.includes('/.well-known/lnurlp/')) {
+        return {
+          json: {
+            tag: 'payRequest',
+            callback: 'https://evil.example/cb',
+            minSendable: 1000,
+            maxSendable: 1e9,
+            metadata: TEST_METADATA,
+          },
+        };
+      }
+      return { json: { pr: bolt11(1000 * 1000) } };
+    });
+    await assert.rejects(
+      () =>
+        getInvoiceFromLightningAddress('alice@blink.sv', 1000, undefined, {
+          allowedAddressDomains: ALLOWED_LN_ADDRESS_DOMAINS,
+          allowedHosts: ALLOWED_LNURL_SERVICE_HOSTS,
+        }),
+      /non-Blink host/,
     );
   });
 });
@@ -720,8 +833,68 @@ describe('decodeBolt11', () => {
   });
 
   it('rejects a sub-millisatoshi amount', () => {
-    // 1p = 0.1 msat is not a whole msat.
-    assert.throws(() => decodeBolt11('lnbc1p' + '1' + 'pq'.repeat(6)), /sub-millisatoshi|checksum|bech32/);
+    // Build a real 1p invoice: 1 pico = 0.1 msat is not a whole msat.
+    const hrp = 'lnbc1p';
+    const pHash = crypto.createHash('sha256').update('p').digest();
+    const ts = Math.floor(Date.now() / 1000);
+    const tsWords = [];
+    for (let w = 6; w >= 0; w--) tsWords.push(Math.floor(ts / Math.pow(32, w)) % 32);
+    const words = [
+      ...tsWords,
+      1,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(pHash),
+      23,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(crypto.createHash('sha256').update(TEST_METADATA, 'utf8').digest()),
+      ...new Array(104).fill(0),
+    ];
+    const inv = bech32.encode(hrp, words, 20000);
+    assert.throws(() => decodeBolt11(inv), /sub-millisatoshi/);
+  });
+
+  // ── structural validity (payment hash, description, timestamp, expiry) ─────
+
+  it('rejects an invoice with no payment-hash tag', () => {
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { omitPaymentHash: true });
+    assert.throws(() => decodeBolt11(inv), /missing payment-hash/);
+  });
+
+  it('rejects an invoice with both d and h description tags', () => {
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { bothDescriptions: true });
+    assert.throws(() => decodeBolt11(inv), /both d and h/);
+  });
+
+  it('rejects a zero timestamp', () => {
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { timestampSeconds: 0 });
+    assert.throws(() => decodeBolt11(inv), /zero timestamp/);
+  });
+
+  it('rejects an expired invoice', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { timestampSeconds: now - 7200, expirySeconds: 3600 });
+    assert.throws(() => decodeBolt11(inv, { nowSeconds: now }), /expired/);
+  });
+
+  it('applies the 3600s default expiry when no x tag is present', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { timestampSeconds: now - 7200 }); // no expiry tag
+    assert.throws(() => decodeBolt11(inv, { nowSeconds: now }), /expired/);
+  });
+
+  it('accepts a current invoice within its expiry window', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const inv = bolt11(1000, 'bc', TEST_METADATA, { timestampSeconds: now - 60, expirySeconds: 3600 });
+    assert.doesNotThrow(() => decodeBolt11(inv, { nowSeconds: now }));
+  });
+
+  it('exposes the payment hash and timestamp', () => {
+    const d = decodeBolt11(bolt11(1000));
+    assert.match(d.paymentHash, /^[0-9a-f]{64}$/);
+    assert.ok(d.timestampSeconds > 0);
+    assert.equal(d.expirySeconds, 3600);
   });
 });
 
@@ -744,12 +917,11 @@ describe('assertInvoiceMatches', () => {
   });
 
   it('rejects an invoice with no description-hash tag when metadata is required', () => {
-    // Build an invoice with no `h` tag.
-    const words = [...new Array(7).fill(0), ...new Array(104).fill(0)];
-    const inv = bech32.encode('lnbc10u', words, 2000);
+    // Valid payment hash + timestamp, but no `h` and no `d` either.
+    const inv = bolt11(1000000, 'bc', TEST_METADATA, { omitDescription: true });
     assert.throws(
       () => assertInvoiceMatches(inv, { amountMsats: 1000000, metadata: TEST_METADATA }),
-      /no description-hash/,
+      /no description or description-hash/,
     );
   });
 

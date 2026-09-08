@@ -43,12 +43,12 @@ hands the client further URLs to fetch, so the allowlist is enforced at the
 network boundary — inside the one function every request funnels through — and
 re-checked on **every hop**:
 
-| Hop | Checked |
-| --- | --- |
-| `.well-known/lnurlp/<user>` metadata URL | host allowlist, HTTPS |
-| payRequest `callback` | host allowlist, HTTPS |
-| LUD-21 `verify` | host allowlist, HTTPS |
-| every HTTP redirect | redirects are followed manually, each `Location` re-validated, max 3 |
+| Hop                                      | Checked                                                              |
+| ---------------------------------------- | -------------------------------------------------------------------- |
+| `.well-known/lnurlp/<user>` metadata URL | host allowlist, HTTPS                                                |
+| payRequest `callback`                    | host allowlist, HTTPS                                                |
+| LUD-21 `verify`                          | host allowlist, HTTPS                                                |
+| every HTTP redirect                      | redirects are followed manually, each `Location` re-validated, max 3 |
 
 Being a local address is **not** a licence to be fetched: only the allowlist
 admits a host. Private, loopback and link-local IP literals are refused in every
@@ -80,10 +80,24 @@ Node (Node 22+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
 **Install requirement:** the SDK persists wallet state through `better-sqlite3`,
 a native module compiled at install time (needs `python3`, `make`, a C++
 compiler). Under `--ignore-scripts` the package is unpacked but never built and
-the SDK suppresses the warning, so `require()` still succeeds — `connect()`
-therefore probes `defaultStorage()` up front and fails with
-`SPARK_STORAGE_UNAVAILABLE` and the `npm rebuild better-sqlite3` fix, instead of
-surfacing an opaque bindings error later.
+the SDK suppresses the warning, so `require()` still succeeds. The SDK's own
+`defaultStorage()` factory is _lazy_ — it returns an object without opening a
+database — so probing it cannot catch this. `connect()` therefore requires
+`better-sqlite3` directly and opens an in-memory database, failing with
+`SPARK_STORAGE_UNAVAILABLE` and the package-manager-specific build-script
+approval step (`npm rebuild better-sqlite3`, `pnpm approve-builds` then
+`pnpm rebuild`, `yarn rebuild`). Verify a fix by opening a database, not by
+trusting a rebuild exit code — a rebuild can exit 0 without producing a binding.
+
+**Invoice validation scope (receive path):** the BOLT-11 check verifies
+**structure and request-binding**, not the cryptographic signature. It confirms
+the bech32 checksum, network, exact amount, a mandatory payment-hash tag,
+exactly one description form, a current non-expired timestamp, and that the
+description-hash matches `sha256(LUD-06 metadata)`. It does **not** verify the
+secp256k1 signature — that attests the payee node signed the invoice, not that
+the invoice matches our request, which is what we are checking. The signature is
+verified by the paying wallet before it signs the HTLC, so an unsigned invoice
+is unpayable (an availability failure) but cannot redirect funds.
 
 - `spark-balance` → `sdk.getInfo().balanceSats`
 - `spark-send` → classify the destination with `sdk.parse()`, then:
@@ -105,7 +119,7 @@ the seed.
 
 The BIP39 checksum check **fails closed**. A word count is not validation:
 twelve arbitrary dictionary words pass it, and one mistyped word then derives a
-*different, valid, empty* wallet — indistinguishable to the user from losing
+_different, valid, empty_ wallet — indistinguishable to the user from losing
 their funds. If `bip39` is unavailable the command aborts
 (`MNEMONIC_VALIDATOR_UNAVAILABLE`) rather than continuing unverified, because
 treating "cannot check" as "checked and fine" silently disables the control.

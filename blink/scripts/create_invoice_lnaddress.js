@@ -42,6 +42,7 @@ const {
   resolveReceiver,
   DEFAULT_LN_ADDRESS_DOMAIN,
   ALLOWED_LN_ADDRESS_DOMAINS,
+  ALLOWED_LNURL_SERVICE_HOSTS,
 } = require('./_blink_client');
 const { getInvoiceFromLightningAddress, verifyLnurlPayment } = require('./_lnurl');
 
@@ -123,7 +124,7 @@ async function pollVerify(verifyUrl, timeoutSeconds, expectedPr) {
     let status;
     try {
       status = await verifyLnurlPayment(verifyUrl, {
-        allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
+        allowedHosts: ALLOWED_LNURL_SERVICE_HOSTS,
         expectedPr,
       });
     } catch (e) {
@@ -174,7 +175,10 @@ async function main() {
   // 2. Mint the invoice over LNURL-pay (works for both account types).
   const invoice = await getInvoiceFromLightningAddress(receiver.lightningAddress, args.amountSats, args.memo, {
     defaultDomain: DEFAULT_LN_ADDRESS_DOMAIN,
-    allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
+    // The address domain stays on the narrow set; the server-supplied
+    // callback/verify URLs may live on Blink's LNURL service host.
+    allowedAddressDomains: ALLOWED_LN_ADDRESS_DOMAINS,
+    allowedHosts: ALLOWED_LNURL_SERVICE_HOSTS,
   });
 
   const creationResult = {

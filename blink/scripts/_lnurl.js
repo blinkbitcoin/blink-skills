@@ -418,20 +418,40 @@ const BOLT11_NETWORK_PREFIXES = {
   sb: 'signet',
 };
 
+// BOLT-11 tag type constants (from the spec).
+const TAG_PAYMENT_HASH = 1; // p — 256-bit SHA-256 payment hash (52 words)
+const TAG_EXPIRY = 6; // x — expiry in seconds (variable length)
+const TAG_DESCRIPTION = 13; // d — free-form description
+const TAG_DESCRIPTION_HASH = 23; // h — 256-bit description hash (52 words)
+
+const BOLT11_DEFAULT_EXPIRY_SECONDS = 3600; // per BOLT-11 when no `x` tag
+
 /**
  * Decode a BOLT-11 invoice: verify the bech32 checksum, read the HRP
- * (network + amount) and parse the tagged fields to find the description-hash.
+ * (network + amount) and parse the tagged fields — payment hash, description /
+ * description-hash, expiry, and the timestamp.
  *
- * This does NOT verify the secp256k1 signature — that would be a much larger
- * dependency, and the signature attests the invoice was signed by the payee
- * node, not that it matches our request, which is what we are checking.
+ * SCOPE BOUNDARY: this validates STRUCTURE and binds the invoice to our
+ * request (network, amount, description). It does NOT verify the secp256k1
+ * signature. The signature attests the invoice was signed by the payee node;
+ * it does not establish that the invoice matches the request we made — which is
+ * the property we are checking here. The signature is verified downstream by
+ * the paying wallet before it signs the HTLC, so an unsigned or badly-signed
+ * invoice is unpayable but cannot redirect funds. Verifying it here would pull
+ * a secp256k1 dependency into a receive-only path for an availability (not
+ * fund-loss) property. The signature's PRESENCE and SHAPE (104 words) are still
+ * required, so a string with no signature region is rejected as malformed.
  *
  * @param {string} paymentRequest
- * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null }}
- *          amountMsats is null for an amountless invoice; descriptionHash is a
- *          lowercase hex string when the `h` tag is present.
+ * @param {object} [opts]
+ * @param {number} [opts.nowSeconds]  Current time for the expiry check
+ *        (injectable for testing; default Date.now()/1000).
+ * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null,
+ *             paymentHash: string, timestampSeconds: number, expirySeconds: number }}
  */
-function decodeBolt11(paymentRequest) {
+function decodeBolt11(paymentRequest, opts = {}) {
+  const nowSeconds = opts.nowSeconds !== undefined ? opts.nowSeconds : Math.floor(Date.now() / 1000);
+
   const pr = String(paymentRequest || '').trim();
   if (!pr) throw new Error('Empty payment request.');
 
@@ -462,35 +482,99 @@ function decodeBolt11(paymentRequest) {
   // Tagged fields. The data part is: 35-bit timestamp (7 words) + tags + 520-bit
   // signature (104 words). Each tag is: 5-bit type, 10-bit length (2 words),
   // then `length` 5-bit words of data.
-  let descriptionHash = null;
-  let i = 7; // skip the 7-word timestamp
   const sigWords = 104;
+  if (data.length < 7 + sigWords) {
+    throw new Error('Not a valid BOLT-11 invoice (too short for timestamp + signature).');
+  }
+
+  // Timestamp: leading 7 words, big-endian 35 bits.
+  let timestampSeconds = 0;
+  for (let w = 0; w < 7; w++) {
+    timestampSeconds = timestampSeconds * 32 + data[w];
+  }
+  if (timestampSeconds === 0) {
+    throw new Error('Not a valid BOLT-11 invoice (zero timestamp).');
+  }
+
+  let paymentHash = null;
+  let descriptionHash = null;
+  let hasDescription = false;
+  let expirySeconds = BOLT11_DEFAULT_EXPIRY_SECONDS;
+  // BOLT-11 forbids repeated tag types outright. Track sightedness per tag so a
+  // duplicate is a hard failure regardless of whether its body parsed — a
+  // malformed first `h` body must not let a second `h` slip in uncounted.
+  const seen = new Set();
+
+  let i = 7;
   while (i + 3 <= data.length - sigWords) {
     const type = data[i];
     const len = (data[i + 1] << 5) | data[i + 2];
     const start = i + 3;
     if (start + len > data.length - sigWords) break; // malformed; stop scanning
-    if (type === 23) {
-      // `h` — description hash. BOLT-11 forbids duplicate tags, and a last-wins
-      // read would bind to a description other than the one verified, so a
-      // second `h` is a hard failure. A malformed body leaves the hash null —
-      // the binding check then refuses it, fail-closed.
-      if (descriptionHash !== null) {
-        throw new Error('Not a valid BOLT-11 invoice (duplicate description-hash tag).');
+
+    const isKnownUnique =
+      type === TAG_PAYMENT_HASH || type === TAG_DESCRIPTION_HASH || type === TAG_DESCRIPTION || type === TAG_EXPIRY;
+    if (isKnownUnique) {
+      if (seen.has(type)) {
+        throw new Error(`Not a valid BOLT-11 invoice (duplicate tag type ${type}).`);
       }
+      seen.add(type);
+    }
+
+    if (type === TAG_PAYMENT_HASH) {
+      // `p` — payment hash. Exactly 52 words (32 bytes as 5-bit groups).
       try {
         const bytes = convertBits(data.slice(start, start + len), 5, 8, false);
-        if (bytes.length === 32) {
-          descriptionHash = Buffer.from(bytes).toString('hex');
-        }
+        if (bytes.length === 32) paymentHash = Buffer.from(bytes).toString('hex');
+      } catch {
+        // malformed body: leave null, the required-tag check below rejects it
+      }
+    } else if (type === TAG_DESCRIPTION_HASH) {
+      // `h` — description hash. A malformed body leaves the hash null; the
+      // binding check then refuses it, fail-closed.
+      try {
+        const bytes = convertBits(data.slice(start, start + len), 5, 8, false);
+        if (bytes.length === 32) descriptionHash = Buffer.from(bytes).toString('hex');
       } catch {
         // malformed tag body: leave descriptionHash null
       }
+    } else if (type === TAG_DESCRIPTION) {
+      hasDescription = true;
+    } else if (type === TAG_EXPIRY) {
+      // `x` — expiry seconds, big-endian 5-bit words.
+      let v = 0;
+      for (let k = start; k < start + len; k++) v = v * 32 + data[k];
+      expirySeconds = v;
     }
     i = start + len;
   }
 
-  return { network, amountMsats, descriptionHash };
+  // A well-formed invoice's tags end exactly where the signature begins. A gap
+  // means garbage words between them, which is malformed structure.
+  if (i !== data.length - sigWords) {
+    throw new Error('Not a valid BOLT-11 invoice (trailing garbage before the signature).');
+  }
+
+  // Required structure. A payment hash is mandatory: without it the invoice is
+  // unpayable and there is nothing to verify a payment against. Exactly one
+  // description form must be present — not both (a `d`+`h` pair is a protocol
+  // violation that lets two descriptions coexist), not neither.
+  if (paymentHash === null) {
+    throw new Error('Not a valid BOLT-11 invoice (missing payment-hash tag).');
+  }
+  if (hasDescription && descriptionHash !== null) {
+    throw new Error('Not a valid BOLT-11 invoice (both d and h description tags present).');
+  }
+  if (!hasDescription && descriptionHash === null) {
+    throw new Error('Not a valid BOLT-11 invoice (no description or description-hash tag).');
+  }
+
+  // Expiry: an already-expired invoice is unpayable and must not be emitted.
+  if (timestampSeconds + expirySeconds <= nowSeconds) {
+    throw new Error('Not a valid BOLT-11 invoice (invoice has expired).');
+  }
+
+  return { network, amountMsats, descriptionHash, paymentHash, timestampSeconds, expirySeconds };
 }
 
 /**
@@ -504,12 +588,13 @@ function decodeBolt11(paymentRequest) {
  * @param {string} [expected.network]   Default "mainnet".
  * @param {string} [expected.metadata]  The exact LUD-06 metadata string. When
  *        given, the invoice's `h` tag must equal sha256(metadata).
+ * @param {number} [expected.nowSeconds]  Current time for the expiry check.
  * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null }}
  */
-function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet', metadata } = {}) {
+function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet', metadata, nowSeconds } = {}) {
   let decoded;
   try {
-    decoded = decodeBolt11(paymentRequest);
+    decoded = decodeBolt11(paymentRequest, { nowSeconds });
   } catch (err) {
     throw new Error(`LNURL-pay callback returned something that is not a BOLT-11 invoice: ${err.message}`);
   }
@@ -560,19 +645,36 @@ function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet'
 // malformed amount — is a SERVICE failure that the caller should retry, not
 // convert into a confident RECEIVER_NOT_FOUND. That conversion is the
 // outage-as-identity-answer bug, one layer below the now-fixed GraphQL probe.
+// Structured codes are preferred over prose when the server supplies them.
+const LNURL_NOT_FOUND_CODES = new Set([
+  'NOT_FOUND',
+  'USER_NOT_FOUND',
+  'ACCOUNT_NOT_FOUND',
+  'ADDRESS_NOT_FOUND',
+  'USERNAME_NOT_FOUND',
+]);
+
+// Message patterns are a FALLBACK, and every one is anchored to the receiver
+// noun. An unrestricted /not found/ would match "upstream route not found",
+// "backend service not found", and "invoice not found" — all of which describe
+// infrastructure or a payment, not the receiver, and all of which would then be
+// misreported as "this address does not exist" (the outage-as-identity bug).
 const LNURL_NOT_FOUND_PATTERNS = [
-  /not\s+found/i,
-  /does\s+not\s+exist/i,
-  /no\s+(such\s+)?(user|account|username)/i,
-  /unknown\s+(user|username|account|identifier)/i,
+  /(user|account|username|address|identifier)\s+(was\s+)?not\s+found/i,
+  /no\s+(such\s+)?(user|account|username|address)/i,
+  /(user|account|username|address|identifier)\s+does\s+not\s+exist/i,
+  /unknown\s+(user|account|username|address|identifier)/i,
 ];
 
 /**
- * Is this LUD-06 error reason an unambiguous "the address does not exist"?
- * @param {string} reason
+ * Is this LUD-06 error an unambiguous "the receiver address does not exist"?
+ *
+ * @param {string} reason    The LUD-06 `reason` string.
+ * @param {string} [code]    An optional structured error code, when supplied.
  * @returns {boolean}
  */
-function isLnurlNotFoundReason(reason) {
+function isLnurlNotFoundReason(reason, code) {
+  if (code && LNURL_NOT_FOUND_CODES.has(String(code).toUpperCase())) return true;
   return LNURL_NOT_FOUND_PATTERNS.some((re) => re.test(String(reason || '')));
 }
 
@@ -617,7 +719,7 @@ async function fetchLnurlPayMetadata(username, domain, opts = {}) {
   if (body.status === 'ERROR') {
     const reason = body.reason || 'unknown reason';
     const e = new Error(`LNURL-pay error: ${reason}`);
-    e.code = isLnurlNotFoundReason(reason) ? 'LNURL_NOT_FOUND' : 'LNURL_SERVICE_ERROR';
+    e.code = isLnurlNotFoundReason(reason, body.code) ? 'LNURL_NOT_FOUND' : 'LNURL_SERVICE_ERROR';
     throw e;
   }
 
@@ -715,8 +817,12 @@ async function requestInvoiceFromCallback(callback, amountMsats, comment, opts =
  * @param {string} [memo]       Optional comment (used if the server allows it).
  * @param {object} [opts]
  * @param {string} [opts.defaultDomain]  Domain to use when a bare username is given.
- * @param {Set<string>|string[]} [opts.allowedHosts]  Host allowlist. Callers that
- *        receive a user-supplied address MUST pass this; see resolveReceiver.
+ * @param {Set<string>|string[]} [opts.allowedHosts]  Allowlist for SERVER-SUPPLIED
+ *        URLs (callback, verify, redirects). Must include Blink's LNURL service
+ *        host, which differs from the address domain; see ALLOWED_LNURL_SERVICE_HOSTS.
+ * @param {Set<string>|string[]} [opts.allowedAddressDomains]  Narrower allowlist
+ *        for the user-supplied address domain itself (the SSRF surface). Falls
+ *        back to `allowedHosts` when not given.
  * @param {string} [opts.network]  Expected invoice network (default "mainnet").
  * @returns {Promise<{ paymentRequest: string, verify: string|null, lightningAddress: string, amountSats: number }>}
  */
@@ -725,11 +831,13 @@ async function getInvoiceFromLightningAddress(address, amountSats, memo, opts = 
   const domain = parsed.domain || opts.defaultDomain;
   if (!domain) throw new Error('No domain: supply a full user@domain address or a defaultDomain option.');
 
-  // Check the address domain up front, before any network call. The per-hop
-  // guard inside fetchWithRetry would catch it anyway, but failing here gives
-  // the caller an error naming the address rather than a derived URL.
-  if (opts.allowedHosts) {
-    assertAllowedUrl(`https://${domain}`, opts.allowedHosts, `Lightning Address domain for '${address}'`);
+  // Check the ADDRESS domain up front against the narrow set, before any
+  // network call. This is the SSRF surface: a user-controlled string becoming
+  // an outbound request. The wider service-host allowlist is applied to the
+  // server-supplied callback/verify/redirect URLs downstream.
+  const addressDomains = opts.allowedAddressDomains || opts.allowedHosts;
+  if (addressDomains) {
+    assertAllowedUrl(`https://${domain}`, addressDomains, `Lightning Address domain for '${address}'`);
   }
 
   const lightningAddress = `${parsed.username}@${domain}`;

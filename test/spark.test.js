@@ -175,6 +175,52 @@ describe('_spark_sdk.ensureOwnerOnlyDir', () => {
     spark.ensureOwnerOnlyDir(dir);
     assert.equal(modeOf(dir), 0o700, 'must repair a pre-existing permissive dir');
   });
+
+  // Fail-closed: a chmod failure must NOT be swallowed while the dir stays
+  // permissive — connect() would then write seed-controlled state into it.
+  it('fails closed when chmod cannot make the dir owner-only', (t) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.chmodSync(dir, 0o777); // permissive starting point
+
+    const realChmod = fs.chmodSync;
+    t.after(() => {
+      fs.chmodSync = realChmod;
+    });
+    fs.chmodSync = () => {
+      throw new Error('EPERM: operation not permitted');
+    };
+
+    assert.throws(
+      () => spark.ensureOwnerOnlyDir(dir),
+      (e) => e.code === 'SPARK_STORAGE_PERMISSIONS',
+      'a chmod failure on a permissive dir must be a hard error, not a silent pass',
+    );
+  });
+
+  it('rejects a symlink at the wallet-state path', (t) => {
+    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    const real = pathMod.join(base, 'real');
+    fs.mkdirSync(real);
+    const link = pathMod.join(base, 'wallet');
+    fs.symlinkSync(real, link);
+    assert.throws(
+      () => spark.ensureOwnerOnlyDir(link),
+      (e) => e.code === 'SPARK_STORAGE_PERMISSIONS' && /symlink/.test(e.message),
+    );
+  });
+
+  it('rejects a non-directory at the wallet-state path', (t) => {
+    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    const file = pathMod.join(base, 'wallet');
+    fs.writeFileSync(file, 'x');
+    assert.throws(
+      () => spark.ensureOwnerOnlyDir(file),
+      (e) => e.code === 'SPARK_STORAGE_PERMISSIONS',
+    );
+  });
 });
 
 // ── loadSdkModule (optional dep may or may not be present) ───────────────────

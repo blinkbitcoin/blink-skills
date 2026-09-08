@@ -215,11 +215,23 @@ async function getAllWallets({ apiKey, apiUrl, timeoutMs }) {
 
 const DEFAULT_LN_ADDRESS_DOMAIN = 'blink.sv';
 
-// Only blink.sv is allowed as a resolution target. This is an SSRF guard: the
-// resolver turns a user-supplied identifier into an outbound network request,
-// so an arbitrary domain must never be probed. (Same guard blink-terminal
-// added as a review blocker.)
+// Two distinct trust sets, kept deliberately separate:
+//
+// ALLOWED_LN_ADDRESS_DOMAINS — the ADDRESS DOMAIN the user supplies in
+//   `user@domain`. This is the narrow SSRF surface: a user-controlled string
+//   that becomes an outbound request. Only `blink.sv` is a valid Blink
+//   Lightning-address domain, so nothing else is ever probed.
+//
+// ALLOWED_LNURL_SERVICE_HOSTS — the hosts a SERVER-SUPPLIED URL may point at:
+//   the LNURL-pay callback, the LUD-21 verify URL, and any redirect target.
+//   Blink serves those from a dedicated LNURL service host (lnurl.blink.sv),
+//   distinct from the address domain. Confirmed against live production
+//   topology: https://blink.sv/.well-known/lnurlp/<user> returns a callback on
+//   https://lnurl.blink.sv/... — a blink.sv-only allowlist rejects it and
+//   breaks the credential-free receive path. Arbitrary user-supplied domains
+//   and private-address redirects stay blocked regardless.
 const ALLOWED_LN_ADDRESS_DOMAINS = new Set(['blink.sv']);
+const ALLOWED_LNURL_SERVICE_HOSTS = new Set(['blink.sv', 'lnurl.blink.sv']);
 
 const ACCOUNT_DEFAULT_WALLET_QUERY = `
   query AccountDefaultWallet($username: Username!) {
@@ -392,11 +404,13 @@ async function resolveReceiver(identifier, opts = {}) {
     };
   }
 
-  // 2. LNURL fallback (non-custodial / Spark).
+  // 2. LNURL fallback (non-custodial / Spark). The metadata is fetched from the
+  // address domain, but a redirect may land on the LNURL service host, so the
+  // server-facing allowlist is used here.
   try {
     await fetchLnurlPayMetadata(parsed.username, domain, {
       timeoutMs: opts.timeoutMs,
-      allowedHosts: ALLOWED_LN_ADDRESS_DOMAINS,
+      allowedHosts: ALLOWED_LNURL_SERVICE_HOSTS,
     });
     return {
       type: 'lnaddress',
@@ -787,6 +801,7 @@ module.exports = {
   // Receiver resolution (custodial vs non-custodial)
   DEFAULT_LN_ADDRESS_DOMAIN,
   ALLOWED_LN_ADDRESS_DOMAINS,
+  ALLOWED_LNURL_SERVICE_HOSTS,
   ACCOUNT_DEFAULT_WALLET_QUERY,
   isAccountNotFoundError,
   isAccountInactiveError,

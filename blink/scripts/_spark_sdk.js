@@ -275,23 +275,66 @@ function storageUnavailableError(err) {
 }
 
 /**
- * Create the wallet-state dir owner-only and repair an existing permissive one.
+ * Create the wallet-state dir owner-only and FAIL CLOSED if that cannot be
+ * established.
  *
  * Without `mode`, mkdirSync honours the umask (0775 under a typical 022), so
  * group users could traverse or modify state belonging to a seed-controlled
- * Bitcoin wallet. chmod unconditionally so a dir created permissively by an
- * earlier run is tightened on the next connect.
+ * Bitcoin wallet. We therefore:
+ *   1. reject a symlink (or any non-directory) at the target — a pre-placed
+ *      symlink could redirect the wallet state somewhere an attacker controls;
+ *   2. create with mode 0700 and chmod unconditionally so a permissively
+ *      created dir from an earlier run is repaired;
+ *   3. VERIFY the postcondition — no group or world bits may remain — and throw
+ *      if they do. A swallowed chmod failure that left the dir at 0777 must be
+ *      a hard error, not a silent pass, because connect() is about to write
+ *      seed-controlled wallet state there.
  *
  * @param {string} dir
+ * @throws {Error} SPARK_STORAGE_PERMISSIONS if owner-only cannot be established.
  */
 function ensureOwnerOnlyDir(dir) {
   const fs = require('fs');
+
+  // Reject a symlink/non-directory BEFORE creating, using lstat so we see the
+  // link itself rather than following it.
+  try {
+    const lst = fs.lstatSync(dir);
+    if (lst.isSymbolicLink() || !lst.isDirectory()) {
+      const e = new Error(
+        `Refusing to use wallet-state path '${dir}': it exists but is a ${lst.isSymbolicLink() ? 'symlink' : 'non-directory'}. ` +
+          'Remove it or point the storage elsewhere; a pre-placed symlink could redirect wallet state.',
+      );
+      e.code = 'SPARK_STORAGE_PERMISSIONS';
+      throw e;
+    }
+  } catch (err) {
+    if (err && err.code === 'SPARK_STORAGE_PERMISSIONS') throw err;
+    // ENOENT: doesn't exist yet — fall through to create.
+    if (!err || err.code !== 'ENOENT') throw err;
+  }
+
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(dir, 0o700);
-  } catch {
-    // chmod may be unsupported (some network filesystems); mkdir mode is the
-    // best effort there.
+  } catch (err) {
+    const e = new Error(
+      `Could not make the wallet-state dir owner-only at '${dir}': ${err.message}. ` +
+        'Wallet state belongs to a seed-controlled account and must not be group/world accessible.',
+    );
+    e.code = 'SPARK_STORAGE_PERMISSIONS';
+    throw e;
+  }
+
+  // Verify the postcondition rather than trusting the calls above.
+  const mode = fs.statSync(dir).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    const e = new Error(
+      `Wallet-state dir '${dir}' has mode ${mode.toString(8)} after hardening; group/world bits must be 0. ` +
+        'Refusing to write seed-controlled wallet state there.',
+    );
+    e.code = 'SPARK_STORAGE_PERMISSIONS';
+    throw e;
   }
 }
 

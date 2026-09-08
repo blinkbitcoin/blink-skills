@@ -153,15 +153,24 @@ const TEST_METADATA = '[["text/plain","pay alice"]]';
 function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA) {
   const hrp = `ln${prefix}${msats % 100 === 0 ? msats / 100 + 'n' : msats * 10 + 'p'}`;
   const hash = crypto.createHash('sha256').update(metadata, 'utf8').digest();
+  const pHash = crypto.createHash('sha256').update('payment:seed').digest();
+  // Real timestamp (7 words) + p tag + h tag + 104-word signature.
+  const ts = Math.floor(Date.now() / 1000);
+  const tsWords = [];
+  for (let w = 6; w >= 0; w--) tsWords.push(Math.floor(ts / Math.pow(32, w)) % 32);
   const words = [
-    ...new Array(7).fill(0),
+    ...tsWords,
+    1,
+    (52 >> 5) & 31,
+    52 & 31,
+    ...bech32.toWords(pHash),
     23,
     (52 >> 5) & 31,
     52 & 31,
     ...bech32.toWords(hash),
     ...new Array(104).fill(0),
   ];
-  return bech32.encode(hrp, words, 2000);
+  return bech32.encode(hrp, words, 20000);
 }
 
 // ── create-invoice-lnaddress ─────────────────────────────────────────────────
