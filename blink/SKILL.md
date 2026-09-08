@@ -1,6 +1,6 @@
 ---
 name: blink-wallet
-description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
+description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
 version: 2.0.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
@@ -116,6 +116,8 @@ Create a staging API key at [dashboard.staging.blink.sv](https://dashboard.stagi
 
 If `BLINK_API_URL` is not set, production (`https://api.blink.sv/graphql`) is used by default.
 
+> **Non-custodial note:** `BLINK_API_URL` staging applies to custodial commands only. The `spark-*` commands target Spark mainnet by default; set `SPARK_NETWORK=regtest` (or pass `--network regtest`) for Spark regtest. See [non-custodial](references/non-custodial.md).
+
 ### API key resolution
 
 Scripts read `BLINK_API_KEY` from the process environment only:
@@ -167,6 +169,7 @@ These rules are mandatory for any AI agent using this skill:
 - Send payments (invoice pay, Lightning Address, LNURL, BTC or USD wallet).
 - Swap between wallets (BTC <-> USD internal conversion).
 - Read-only queries (balance, transactions, price, account info).
+- Non-custodial (Spark) account operations (receive via LNURL, seed-gated balance/send/history/events).
 
 2. Configure API access from [blink-api-and-auth](references/blink-api-and-auth.md):
 
@@ -202,7 +205,14 @@ These rules are mandatory for any AI agent using this skill:
 - Pay with `blink l402-pay <url> --max-amount <sats>` (Write scope required).
 - Token is cached; subsequent requests reuse it without re-paying.
 
-7. Apply safety constraints:
+7. For non-custodial (Spark) accounts, follow [non-custodial](references/non-custodial.md):
+
+- Resolve a `user@blink.sv` recipient with `blink resolve-receiver` (credential-free).
+- Receive with `blink create-invoice-lnaddress` (credential-free, works for both account types).
+- Balance / send / history / events need `SPARK_MNEMONIC` + `BREEZ_API_KEY` (Node 22+).
+- Dry-run `spark-send` first; it is **not** covered by budget controls.
+
+8. Apply safety constraints:
 
 - Use minimum API key scopes for the task.
 - Test on staging before production.
@@ -242,6 +252,17 @@ blink l402-pay https://api.example.com/resource --max-amount 1000
 
 # List cached L402 tokens
 blink l402-store list
+
+# Classify a Blink Lightning Address (custodial vs non-custodial Spark)
+blink resolve-receiver alice@blink.sv
+
+# Receive to any Blink Lightning Address — no API key, no seed
+blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
+
+# Non-custodial (Spark) account: balance, dry-run send, history
+blink spark-balance
+blink spark-send lnbc1000n1... 1000 --dry-run
+blink spark-transactions --limit 5
 ```
 
 ## Core Commands
@@ -417,6 +438,67 @@ blink account-info
 
 Shows account level, spending limits (withdrawal, internal send, convert), default wallet, and wallet summary with **pre-computed USD estimates** for BTC balances. Limits are denominated in USD cents with a rolling 24-hour window.
 
+## Non-Custodial (Spark) Commands
+
+Full details, setup, and security model: [non-custodial](references/non-custodial.md).
+
+### Resolve a Blink Receiver (account-type classifier)
+
+```bash
+blink resolve-receiver <identifier>   # e.g. alice  or  alice@blink.sv
+```
+
+Classifies a Blink identifier (bare username or `user@blink.sv`) as `custodial` (has a Blink wallet ID) or `lnaddress` (non-custodial Spark, served by the LNURL server), or reports it does not exist. **Credential-free** (`BLINK_API_KEY` optional, improves the custodial probe).
+
+### Receive to Any Blink Lightning Address
+
+```bash
+blink create-invoice-lnaddress <lightning_address> <amount_sats> [memo...] [--timeout <seconds>] [--no-verify]
+```
+
+Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay — **no API key and no seed required**, and it works whether the recipient is custodial or non-custodial (Spark); the LNURL server routes internally. Outputs two JSON objects: `invoice_created` immediately, then `verify_result` (`PAID`/`TIMEOUT`) once the LUD-21 verify URL reports settlement. For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
+
+- `--timeout <seconds>` — verify-poll timeout (default: 300, 0 = no timeout)
+- `--no-verify` — skip settlement polling; just create the invoice and exit
+
+### Spark Balance
+
+```bash
+blink spark-balance [--network mainnet|regtest]
+```
+
+Reads the BTC balance of a self-custodial (Spark) account directly from the wallet via the Breez Spark SDK. Non-custodial balances are **not visible through the Blink API**. Waits briefly for a stable balance after incoming payments (`stable` field in the output).
+
+### Spark Send
+
+```bash
+blink spark-send <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]
+```
+
+Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). Fees are always resolved and printed before sending; `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
+
+**Not covered by budget controls or the spending log** — this spends self-custodial funds directly (see [non-custodial](references/non-custodial.md)).
+
+> **AGENT:** This command spends self-custodial funds irreversibly. Always run `--dry-run` first, then confirm the amount and destination with the user before executing.
+
+### Spark Transactions
+
+```bash
+blink spark-transactions [--limit <n>] [--network mainnet|regtest]
+```
+
+Lists recent Spark account payments from SDK-local history (`--limit`, default 20). This history is invisible to the Blink API.
+
+### Spark Subscribe
+
+```bash
+blink spark-subscribe [--timeout <seconds>] [--network mainnet|regtest]
+```
+
+Streams live Spark wallet events as NDJSON (one JSON line per event). `--timeout` stops after N seconds (default: 300, 0 = run until interrupted). Non-custodial counterpart of `subscribe-updates`.
+
+> All `spark-*` commands require `SPARK_MNEMONIC` + `BREEZ_API_KEY` and Node 22+. Network defaults to mainnet; `SPARK_NETWORK` env var or `--network` flag overrides. See the Environment section above and [non-custodial](references/non-custodial.md) for getting a Breez key and installing the optional SDK dependencies.
+
 ## Realtime Subscriptions
 
 Blink supports GraphQL subscriptions over WebSocket using the `graphql-transport-ws` protocol. Requires Node 22+ for native WebSocket, or Node 20+ with the `--experimental-websocket` flag.
@@ -462,6 +544,12 @@ Streams account updates in real time. Each event is output as a JSON line (NDJSO
 | Subscribe updates  | `subscription myUpdates`                    | Read              |
 | L402 discover      | external HTTP (no Blink API)                | **None**          |
 | L402 pay           | `mutation lnInvoicePaymentSend` (on 402)    | Write             |
+| Resolve receiver   | `query accountDefaultWallet` + `.well-known/lnurlp` (public HTTP) | **None (public)** |
+| Invoice via LNURL  | LNURL-pay (LUD-06/16/21, no Blink API)      | **None (public)** |
+| Spark balance      | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
+| Spark send         | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
+| Spark transactions | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
+| Spark subscribe    | Breez Spark SDK events (no Blink API)       | **Seed** (`SPARK_MNEMONIC`) |
 
 **API Endpoint:** `https://api.blink.sv/graphql` (production)
 **Authentication:** `X-API-KEY` header
@@ -627,6 +715,72 @@ Second JSON (when payment resolves):
 }
 ```
 
+### Resolve receiver output example
+
+```json
+{
+  "exists": true,
+  "type": "lnaddress",
+  "username": "alice",
+  "domain": "blink.sv",
+  "lightningAddress": "alice@blink.sv",
+  "walletId": null
+}
+```
+
+`type` is `"custodial"` when the identifier maps to a Blink wallet (`walletId` present), `"lnaddress"` for a non-custodial (Spark) account. For unknown identifiers: `{ "exists": false, "type": null, ... }`.
+
+### Spark output examples
+
+**spark-balance:**
+
+```json
+{
+  "accountType": "lnaddress",
+  "network": "mainnet",
+  "balanceSats": 25000,
+  "stable": true
+}
+```
+
+**spark-send (dry-run):**
+
+```json
+{
+  "event": "send_prepared",
+  "dryRun": true,
+  "destination": "alice@blink.sv",
+  "destinationType": "lnurl",
+  "amountSats": 1000,
+  "feeSats": 1,
+  "network": "mainnet"
+}
+```
+
+**spark-send (executed):** same shape with `"event": "send_result"` plus `status` and `paymentId`. Exit code 1 when the SDK reports a `failed` payment status; `pending` exits 0 (still in flight).
+
+**spark-transactions:**
+
+```json
+{
+  "accountType": "lnaddress",
+  "network": "mainnet",
+  "count": 1,
+  "transactions": [
+    {
+      "id": "abc123",
+      "type": "receive",
+      "status": "COMPLETED",
+      "amountSats": 1000,
+      "feeSats": 0,
+      "timestamp": 1740000000
+    }
+  ]
+}
+```
+
+**create-invoice-lnaddress (two-phase):** first JSON is `invoice_created` (`accountType`, `lightningAddress`, `paymentRequest`, `verifyUrl`, `satoshis`); second JSON is `verify_result` with `status` `"PAID"` or `"TIMEOUT"` — only for non-custodial recipients that return a LUD-21 verify URL.
+
 ## Typical Agent Workflows
 
 ### Receive a payment (recommended — auto-subscribe + QR image)
@@ -670,6 +824,42 @@ blink balance
 blink create-invoice-usd 500 "Five dollars for service"
 # → First JSON: {"event": "invoice_created", "amountCents": 500, "amountUsd": "$5.00", ...}
 # Generate QR and send to user, then wait for second JSON
+```
+
+### Receive for a non-custodial (Spark) recipient (no credentials)
+
+```bash
+# 1. (Optional) classify the recipient
+blink resolve-receiver alice@blink.sv
+# → {"exists": true, "type": "lnaddress", "lightningAddress": "alice@blink.sv", ...}
+
+# 2. Mint an invoice via public LNURL-pay — no API key, no seed
+blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
+# → First JSON: {"event": "invoice_created", "accountType": "lnaddress", "paymentRequest": "lnbc...", "verifyUrl": "https://...", ...}
+# Generate QR from paymentRequest (blink qr works on any BOLT-11) and send to the payer
+
+# 3. Second JSON when settled: {"event": "verify_result", "status": "PAID", ...}
+# For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
+```
+
+### Send from a non-custodial (Spark) account
+
+```bash
+# Requires SPARK_MNEMONIC + BREEZ_API_KEY (Node 22+)
+
+# 1. Dry-run to resolve fees (no funds moved)
+blink spark-send lnbc1000n1... 1000 --dry-run
+# → {"event": "send_prepared", "feeSats": 1, ...}
+
+# 2. Check balance
+blink spark-balance
+
+# 3. Confirm amount and recipient with the user, then send
+blink spark-send lnbc1000n1... 1000
+# → {"event": "send_result", "status": "COMPLETED", ...}  (exit 1 on failed)
+
+# 4. Verify in SDK-local history
+blink spark-transactions --limit 1
 ```
 
 ### Send a payment (with fee check)
@@ -1236,6 +1426,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
 - **Fail closed for auto-pay:** `l402-pay` refuses to run unless a budget AND a non-empty domain allowlist are explicitly configured (`NO_BUDGET_CONFIGURED` / `NO_ALLOWLIST_CONFIGURED` errors explain the setup)
 - **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply
+- **Not covered:** `spark-send` (non-custodial, signs locally via the Breez SDK) does not go through budget enforcement and is not recorded in the spending log
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
@@ -1256,6 +1447,8 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Outbound HTTPS** to `api.blink.sv` (or `BLINK_API_URL` override) for all GraphQL queries and mutations.
 - **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
 - **L402 requests** go directly to the third-party URL you provide to `l402-discover` or `l402-pay`. The Blink API is contacted only when a payment is needed.
+- **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts `blink.sv` and its LNURL service host `lnurl.blink.sv` only — both allowlisted, every redirect re-validated.
+- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). Signing happens locally; the seed never leaves the machine.
 - **No other network calls.** Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
 
 ### Filesystem Access
@@ -1264,6 +1457,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
 - **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimages for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
 - **Budget files:** Budget config at `~/.blink/budget.json` and spending log at `~/.blink/spending-log.json`. The spending log is auto-pruned (entries older than 25h removed). Use `blink budget reset` to clear the log.
+- **Spark SDK state:** `spark-*` commands write Breez SDK wallet state to `~/.blink/spark/<network>-<hash>` (the directory name is a non-reversible sha256 prefix of the seed). Delete the directory to remove all local state.
 
 ### Stateless Design
 
@@ -1271,6 +1465,7 @@ Most scripts are stateless. Exceptions:
 
 - `l402-pay` maintains a token cache at `~/.blink/l402-tokens.json` to avoid re-paying for previously-accessed L402 services. Use `--no-store` to run without any persistence.
 - All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
+- `spark-*` commands persist Breez SDK wallet state at `~/.blink/spark/<network>-<hash>`. Deleting that directory resets local state (funds live on Spark; the seed restores the wallet).
 
 ### Payment Safety
 
@@ -1286,6 +1481,7 @@ Most scripts are stateless. Exceptions:
 - [payment-operations](references/payment-operations.md): send workflows, BTC vs USD wallet selection, fee probing, and safety guardrails.
 - [invoice-lifecycle](references/invoice-lifecycle.md): invoice creation, two-phase output parsing, monitoring strategies, QR generation, and expiration handling.
 - [swap-operations](references/swap-operations.md): BTC <-> USD internal conversion, quote/execute workflow, rounding behavior, and effective cost formulas.
+- [non-custodial](references/non-custodial.md): non-custodial (Spark) accounts — credential-free receiving via LNURL-pay, seed-gated `spark-*` commands, Breez API key setup, SSRF guard, and seed security model.
 - [Blink Agent Playbook](https://dev.blink.sv/api/agent-playbook): Canonical AI agent API reference — order of operations, safety constraints, and verification checklist.
 - [llms.txt](https://dev.blink.sv/llms.txt): Machine-readable discovery metadata for AI agents (endpoints, source URLs, hard rules).
 
@@ -1318,3 +1514,11 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/l402_info.js` — Get full L402 service details + paid health reports
 - `{baseDir}/scripts/_budget.js` — Shared budget module: config resolution, spend log, rolling limits, domain allowlist
 - `{baseDir}/scripts/budget.js` — Budget controls CLI (status, set, log, reset, allowlist)
+- `{baseDir}/scripts/_lnurl.js` — Zero-dependency LNURL client (LUD-06/16/21) with SSRF host allowlisting
+- `{baseDir}/scripts/_spark_sdk.js` — Shared Breez Spark SDK module: connect, seed validation, balance/payment normalization
+- `{baseDir}/scripts/resolve_receiver.js` — Classify a Blink identifier as custodial or non-custodial (Spark)
+- `{baseDir}/scripts/create_invoice_lnaddress.js` — Receive to any Blink Lightning Address via public LNURL-pay (no credentials)
+- `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
+- `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
+- `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)
+- `{baseDir}/scripts/spark_subscribe.js` — Stream live Spark wallet events
