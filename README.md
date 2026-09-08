@@ -1,17 +1,26 @@
 # Blink Lightning CLI
 
-Bitcoin Lightning wallet for the command line — zero runtime npm dependencies, Node.js 18+ built-ins only.
+Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
 
-24 commands for wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. Designed for humans and AI agents alike.
+25 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. Designed for humans and AI agents alike.
 
 ## Highlights
 
-- **Zero runtime dependencies** — only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.)
-- **24 commands** — balance, payments, invoices, QR codes, swaps, L402 consumer + producer, service discovery, budget controls
+- **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
+- **25 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
+- **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **261 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **474 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; also works with any LLM or human
+
+## Use cases
+
+- **Accept Lightning payments anywhere** — create invoices, generate QR codes, and receive to a human-readable Lightning address (`you@blink.sv`) with no API key and no seed.
+- **Pay and get paid programmatically** — send to invoices, Lightning addresses, or LNURL, with fee probing and budget limits so a script never overspends.
+- **Build and pay L402 paywalls** — gate an API or resource behind a Lightning invoice (producer), or let an agent auto-pay for metered access (consumer), with spend controls.
+- **Run a self-custodial agent wallet** — hold keys in a seed, check balance and send BTC without trusting a custodian, via the Breez Spark SDK.
+- **Give an AI agent money safely** — JSON-first output, budget guardrails, and a published skill manifest let an LLM agent hold and spend bitcoin within limits you set.
 
 ## Quick Start
 
@@ -83,6 +92,22 @@ Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 | `blink spark-send <destination> <sats>`   | Sign & send BTC from a Spark account (`--dry-run` shows fees)      |
 | `blink spark-transactions`                | List Spark account payments (SDK-local history)                   |
 | `blink spark-subscribe`                   | Stream live Spark wallet events                                   |
+
+**Getting a `BREEZ_API_KEY`.** The `spark-*` commands will not connect without
+one. It is a **Breez infrastructure credential, not custody** — it never touches
+the seed, cannot sign, and cannot spend. One key works with any seed. Get a free
+key via the [request form](https://breez.technology/request-api-key/#contact-us-form-sdk),
+or programmatically (the key is emailed to you):
+
+```bash
+curl -d "fullname=<name>" -d "company=<company>" \
+     -d "email=<email>" -d "message=<message>" \
+     https://breez.technology/contact/apikey
+```
+
+Then `export BREEZ_API_KEY="..."` alongside `SPARK_MNEMONIC`. See
+[`blink/references/non-custodial.md`](blink/references/non-custodial.md) for the
+full detail.
 
 > **Note:** Non-custodial **send** is BTC-only in this spike and cannot go
 > through the Blink API — it is signed locally with the seed. Only receive works
@@ -193,7 +218,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 261 tests, node:test framework, zero test dependencies
+npm test    # 474 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation
