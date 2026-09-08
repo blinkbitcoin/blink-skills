@@ -7,7 +7,7 @@ metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '1.8.0'
+    version: '2.0.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound

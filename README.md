@@ -167,7 +167,7 @@ blink balance
 
 ### OpenClaw / Hermes Agents
 
-Published on ClawHub as `blink@1.7.0`. The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
+Published on ClawHub as [`blink-wallet@2.0.0`](https://clawhub.ai/pretyflaco/skills/blink-wallet) (the older `blink` skill is deprecated). The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
 
 ### With blink-mcp
 
