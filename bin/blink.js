@@ -253,6 +253,53 @@ commands['create-invoice-usd'] = {
   },
 };
 
+commands['create-invoice-lnaddress'] = {
+  description:
+    'Receive to any Blink Lightning Address (custodial OR non-custodial/Spark) via LNURL-pay — no API key needed',
+  args: [
+    { name: 'address', required: true, description: 'Lightning Address (user@blink.sv) or bare username' },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+    { name: 'memo', required: false, variadic: true, description: 'Optional comment text' },
+  ],
+  options: {
+    timeout: { type: 'string', default: '300' },
+    verify: { type: 'boolean', default: true },
+  },
+  optMeta: {
+    timeout: { description: 'LUD-21 verify-poll timeout in seconds (0 = no timeout)', valueName: 'seconds' },
+    verify: { description: 'Poll LUD-21 verify for settlement (use --no-verify to skip)' },
+  },
+  examples: [
+    'blink create-invoice-lnaddress alice@blink.sv 1000',
+    'blink create-invoice-lnaddress alice 5000 "Coffee"',
+    'blink create-invoice-lnaddress alice@blink.sv 1000 --no-verify',
+  ],
+  action: async (pos, opts) => {
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    const argv = [String(pos[0]), String(pos[1])];
+    const memo = pos.slice(2);
+    if (memo.length > 0) argv.push(...memo);
+    argv.push('--timeout', String(timeout));
+    if (opts.verify === false) argv.push('--no-verify');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'create_invoice_lnaddress.js'));
+    await main();
+  },
+};
+
+commands['resolve-receiver'] = {
+  description: 'Classify a Blink identifier as custodial or non-custodial (Spark), or report it does not exist',
+  args: [{ name: 'identifier', required: true, description: 'Bare username or user@blink.sv' }],
+  options: {},
+  optMeta: {},
+  examples: ['blink resolve-receiver alice', 'blink resolve-receiver alice@blink.sv'],
+  action: async (pos) => {
+    setProcessArgv([pos[0]]);
+    const { main } = require(path.join(scriptsDir, 'resolve_receiver.js'));
+    await main();
+  },
+};
+
 commands['check-invoice'] = {
   description: 'Check payment status of a Lightning invoice by payment hash',
   args: [
@@ -281,6 +328,117 @@ commands['fee-probe'] = {
   action: async (pos, opts) => {
     setProcessArgv([pos[0], '--wallet', opts.wallet]);
     const { main } = require(path.join(scriptsDir, 'fee_probe.js'));
+    await main();
+  },
+};
+
+// ── Non-custodial (Spark) commands ───────────────────────────────────────────
+// These require the account SEED (SPARK_MNEMONIC) and the optional Breez Spark
+// SDK dependency (@breeztech/breez-sdk-spark, Node 22+). They are the
+// non-custodial parity for balance / send / transactions / subscribe-updates.
+// Holding the seed grants spend authority — treat it as a secret.
+
+// ── Network precedence ───────────────────────────────────────────────────────
+// ONE rule, applied identically by all four Spark commands:
+//     explicit --network  >  SPARK_NETWORK  >  mainnet
+// The CLI does NOT default `network` to mainnet. If it did, that default would
+// silently override an operator's SPARK_NETWORK=regtest, routing what they
+// configured as safe testing onto the real-funds network. The scripts already
+// fall back `SPARK_NETWORK || 'mainnet'`, so the CLI only forwards a value when
+// the user actually supplied one.
+
+commands['spark-balance'] = {
+  forceExit: true,
+  description: '[non-custodial] Show a Spark account BTC balance via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [],
+  options: { network: { type: 'string' } },
+  optMeta: { network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' } },
+  examples: ['blink spark-balance'],
+  action: async (pos, opts) => {
+    // Only override the environment when the user passed --network explicitly.
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
+    setProcessArgv([]);
+    const { main } = require(path.join(scriptsDir, 'spark_balance.js'));
+    await main();
+  },
+};
+
+commands['spark-send'] = {
+  forceExit: true,
+  description: '[non-custodial] Sign & send BTC from a Spark account via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [
+    {
+      name: 'destination',
+      required: true,
+      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, or Spark address',
+    },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+  ],
+  options: {
+    'dry-run': { type: 'boolean', default: false },
+    network: { type: 'string' },
+  },
+  optMeta: {
+    'dry-run': { description: 'Prepare & show fees without sending' },
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: [
+    'blink spark-send lnbc10u1p... 1000',
+    'blink spark-send alice@blink.sv 1000',
+    'blink spark-send alice@blink.sv 1000 --dry-run',
+  ],
+  action: async (pos, opts) => {
+    const argv = [String(pos[0]), String(pos[1])];
+    // Forward --network only when explicitly given; otherwise the script falls
+    // back to SPARK_NETWORK, so an unset flag cannot clobber the env.
+    if (opts.network !== undefined) argv.push('--network', opts.network);
+    if (opts['dry-run']) argv.push('--dry-run');
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'spark_send.js'));
+    await main();
+  },
+};
+
+commands['spark-transactions'] = {
+  forceExit: true,
+  description: '[non-custodial] List Spark account payments via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [],
+  options: {
+    limit: { type: 'string', default: '20' },
+    network: { type: 'string' },
+  },
+  optMeta: {
+    limit: { description: 'Max number of payments to return', valueName: 'n' },
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: ['blink spark-transactions', 'blink spark-transactions --limit 50'],
+  action: async (pos, opts) => {
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
+    const limit = parsePositiveInt(opts.limit, '--limit');
+    setProcessArgv(['--limit', String(limit)]);
+    const { main } = require(path.join(scriptsDir, 'spark_transactions.js'));
+    await main();
+  },
+};
+
+commands['spark-subscribe'] = {
+  forceExit: true,
+  description: '[non-custodial] Subscribe to Spark wallet events via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [],
+  options: {
+    timeout: { type: 'string', default: '300' },
+    network: { type: 'string' },
+  },
+  optMeta: {
+    timeout: { description: 'Timeout in seconds (0 = run until interrupted)', valueName: 'seconds' },
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: ['blink spark-subscribe', 'blink spark-subscribe --timeout 60'],
+  action: async (pos, opts) => {
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
+    const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
+    setProcessArgv(['--timeout', String(timeout)]);
+    const { main } = require(path.join(scriptsDir, 'spark_subscribe.js'));
     await main();
   },
 };
@@ -947,6 +1105,37 @@ async function main() {
   }
 
   await cmd.action(coerced, values);
+
+  // The Breez Spark SDK leaves event-loop handles open after disconnect, so a
+  // spark-* command would otherwise print its result and then hang forever.
+  // The scripts guard against this themselves, but only under
+  // `require.main === module` — which is false when they are dispatched from
+  // here, i.e. via the documented `blink <command>` entry point. Without this,
+  // every spark-* command hangs for any caller using the CLI (measured: 7.5s
+  // standalone vs. never-returns through the CLI).
+  //
+  // Scoped to the commands that actually load the SDK: process.exit() can
+  // truncate a pending async write when stdout is a pipe, and there is no
+  // reason to take that risk on the ~30 commands that already exit cleanly.
+  if (cmd.forceExit) {
+    await flushStdout();
+    process.exit(process.exitCode || 0);
+  }
+}
+
+/**
+ * Wait for stdout to drain before a forced exit, so piped output is not
+ * truncated mid-write.
+ * @returns {Promise<void>}
+ */
+function flushStdout() {
+  return new Promise((resolve) => {
+    if (process.stdout.writableLength === 0) {
+      resolve();
+      return;
+    }
+    process.stdout.write('', () => resolve());
+  });
 }
 
 main().catch(handleError);

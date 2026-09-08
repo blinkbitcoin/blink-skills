@@ -19,7 +19,12 @@
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {
+    "bech32": "^2.0.0",
     "eslint": "^9.0.0",
     "prettier": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@breeztech/breez-sdk-spark": "0.23.1",
+    "bip39": "^3.1.0"
   }
 }
