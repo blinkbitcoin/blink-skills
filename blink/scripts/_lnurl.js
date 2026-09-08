@@ -429,8 +429,9 @@ const BOLT11_DEFAULT_EXPIRY_SECONDS = 3600; // per BOLT-11 when no `x` tag
 
 /**
  * Decode a BOLT-11 invoice: verify the bech32 checksum, read the HRP
- * (network + amount) and parse the tagged fields — payment hash, description /
- * description-hash, expiry, and the timestamp.
+ * (network + amount) and parse the tagged fields — payment hash, payment secret,
+ * description / description-hash, expiry, and the timestamp — and check the
+ * signature's recovery id is in range.
  *
  * SCOPE BOUNDARY: this validates STRUCTURE and binds the invoice to our
  * request (network, amount, description). It does NOT verify the secp256k1
@@ -448,7 +449,8 @@ const BOLT11_DEFAULT_EXPIRY_SECONDS = 3600; // per BOLT-11 when no `x` tag
  * @param {number} [opts.nowSeconds]  Current time for the expiry check
  *        (injectable for testing; default Date.now()/1000).
  * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null,
- *             paymentHash: string, timestampSeconds: number, expirySeconds: number }}
+ *             paymentHash: string, paymentSecret: string, timestampSeconds: number,
+ *             expirySeconds: number, recoveryId: number }}
  */
 function decodeBolt11(paymentRequest, opts = {}) {
   const nowSeconds = opts.nowSeconds !== undefined ? opts.nowSeconds : Math.floor(Date.now() / 1000);
@@ -710,13 +712,12 @@ const LNURL_NOT_FOUND_PATTERNS = [
   /no\s+(such\s+)?(user|account|username|address)/i,
   /(user|account|username|address|identifier)\s+does\s+not\s+exist/i,
   /unknown\s+(user|account|username|address|identifier)/i,
-  // The exact production Blink response for a nonexistent address is verb-first:
-  // {"reason":"Couldn't find user 'x'."}. Anchored to the receiver noun so it
-  // cannot match an infrastructure "couldn't find <route|resource>" error. The
-  // `address` noun is ambiguous (it also names network infrastructure), so for
-  // it alone we require the quoted-subject form Blink actually emits.
-  /(couldn'?t|could\s+not|cannot)\s+find\s+(the\s+)?(user|account|username|identifier)/i,
-  /(couldn'?t|could\s+not|cannot)\s+find\s+(the\s+)?address\s+'/i,
+  // The exact production Blink response for a nonexistent address is verb-first
+  // and QUOTE-delimits the subject: {"reason":"Couldn't find user 'x'."}. The
+  // quote is the discriminator — it is what separates "couldn't find user 'x'"
+  // (absence) from "could not find user session for request" (infrastructure).
+  // The noun-first patterns above already cover the unquoted forms.
+  /(couldn'?t|could\s+not|cannot)\s+find\s+(the\s+)?(user|account|username|address|identifier)\s+'/i,
 ];
 
 /**

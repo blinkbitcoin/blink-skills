@@ -1010,6 +1010,35 @@ describe('decodeBolt11', () => {
     const inv = bech32.encode('lnbc10n', words, 20000);
     assert.throws(() => decodeBolt11(inv), /duplicate tag type 16/);
   });
+
+  it('rejects a malformed (wrong-length) payment-secret tag', () => {
+    // An s tag whose body is not exactly 32 bytes must leave paymentSecret null
+    // and the required-tag check must reject it.
+    const pHash = crypto.createHash('sha256').update('payment:x').digest();
+    const hHash = crypto.createHash('sha256').update(TEST_METADATA, 'utf8').digest();
+    const ts = Math.floor(Date.now() / 1000);
+    const tsWords = [];
+    for (let w = 6; w >= 0; w--) tsWords.push(Math.floor(ts / Math.pow(32, w)) % 32);
+    const shortSecret = bech32.toWords(crypto.createHash('sha256').update('s').digest()).slice(0, 40); // 40 words, not 52
+    const words = [
+      ...tsWords,
+      1,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(pHash),
+      16,
+      (40 >> 5) & 31,
+      40 & 31,
+      ...shortSecret, // malformed: 40 words
+      23,
+      (52 >> 5) & 31,
+      52 & 31,
+      ...bech32.toWords(hHash),
+      ...new Array(104).fill(0),
+    ];
+    const inv = bech32.encode('lnbc10n', words, 20000);
+    assert.throws(() => decodeBolt11(inv), /missing payment-secret/);
+  });
 });
 
 describe('assertInvoiceMatches', () => {

@@ -223,15 +223,22 @@ describe('_spark_sdk.ensureOwnerOnlyDir', () => {
   });
 
   // A symlink in the MANAGED ANCESTOR chain (e.g. ~/.blink/spark -> elsewhere)
-  // would redirect the wallet leaf through the link. lstat must catch it.
-  it('rejects a symlink in an ancestor directory', (t) => {
-    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+  // would redirect the wallet leaf through the link. lstat must catch it. This
+  // exercises the real managed chain, so it builds a fake home and points
+  // os.homedir() at it for the duration.
+  it('rejects a symlink in the managed ancestor chain (~/.blink/spark)', (t) => {
+    const os2 = require('node:os');
+    const fakeHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkhome-'));
     const elsewhere = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkelse-'));
+    const realHomedir = os2.homedir;
     t.after(() => {
-      fs.rmSync(base, { recursive: true, force: true });
+      os2.homedir = realHomedir;
+      fs.rmSync(fakeHome, { recursive: true, force: true });
       fs.rmSync(elsewhere, { recursive: true, force: true });
     });
-    const blink = pathMod.join(base, '.blink');
+    os2.homedir = () => fakeHome;
+
+    const blink = pathMod.join(fakeHome, '.blink');
     fs.mkdirSync(blink);
     fs.symlinkSync(elsewhere, pathMod.join(blink, 'spark')); // spark -> elsewhere
     const leaf = pathMod.join(blink, 'spark', 'mainnet-abc123');
@@ -244,6 +251,25 @@ describe('_spark_sdk.ensureOwnerOnlyDir', () => {
       false,
       'leaf must not be created through the link',
     );
+  });
+
+  // The scan must NOT walk above the Blink-owned chain. A path outside home
+  // (custom storage, or a tmpdir under a symlinked /var on macOS) must not be
+  // refused just because a high ancestor is a symlink the tool doesn't own.
+  it('does not walk above the managed chain for out-of-home paths', (t) => {
+    const base = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    const elsewhere = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkelse-'));
+    t.after(() => {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    });
+    // Symlink a grandparent out of home and confirm the leaf is still usable —
+    // the scan is leaf-only for out-of-home paths.
+    const linkParent = pathMod.join(base, 'linkparent');
+    fs.symlinkSync(elsewhere, linkParent);
+    const leaf = pathMod.join(linkParent, 'wallet');
+    assert.doesNotThrow(() => spark.ensureOwnerOnlyDir(leaf));
+    assert.equal(modeOf(leaf), 0o700);
   });
 
   // On a filesystem where chmod is unsupported, an already-secure (0700) dir

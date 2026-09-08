@@ -100,13 +100,15 @@ trusting a rebuild exit code — a rebuild can exit 0 without producing a bindin
 
 **Invoice validation scope (receive path):** the BOLT-11 check verifies
 **structure and request-binding**, not the cryptographic signature. It confirms
-the bech32 checksum, network, exact amount, a mandatory payment-hash tag,
-exactly one description form, a current non-expired timestamp, and that the
-description-hash matches `sha256(LUD-06 metadata)`. It does **not** verify the
-secp256k1 signature — that attests the payee node signed the invoice, not that
-the invoice matches our request, which is what we are checking. The signature is
-verified by the paying wallet before it signs the HTLC, so an unsigned invoice
-is unpayable (an availability failure) but cannot redirect funds.
+the bech32 checksum, network, exact amount, a mandatory payment-hash (`p`) tag,
+a mandatory payment-secret (`s`) tag, exactly one description form (`d` or `h`,
+not both, not neither), a current non-expired timestamp, a signature whose
+recovery id is in `{0,1,2,3}`, and that the description-hash matches
+`sha256(LUD-06 metadata)`. It does **not** verify the secp256k1 signature — that
+attests the payee node signed the invoice, not that the invoice matches our
+request, which is what we are checking. The signature is verified by the paying
+wallet before it signs the HTLC, so an unsigned invoice is unpayable (an
+availability failure) but cannot redirect funds.
 
 - `spark-balance` → `sdk.getInfo().balanceSats`
 - `spark-send` → classify the destination with `sdk.parse()`, then:

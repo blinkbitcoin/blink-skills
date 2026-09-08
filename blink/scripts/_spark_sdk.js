@@ -304,25 +304,35 @@ function ensureOwnerOnlyDir(dir) {
   };
 
   // Reject symlinks at the target and within the MANAGED ancestor chain —
-  // ~/.blink and ~/.blink/spark — but no higher. Walking to the filesystem root
-  // would hard-refuse on systems where a high-level ancestor is legitimately a
-  // symlink (/home -> /usr/home on some distros, managed /Users on macOS), which
-  // is not attacker-controlled wallet state. The chain the tool itself manages
-  // starts at the home directory's first Blink-owned component.
+  // ~/.blink and ~/.blink/spark — but no higher. Two boundaries matter:
+  //
+  //   - Do NOT walk above the Blink-owned root (~/.blink). Ancestors above it
+  //     (the home dir, /home -> /usr/home, managed /Users on macOS) are not
+  //     attacker-controlled wallet state, so their being symlinks is legitimate
+  //     and must not refuse the command.
+  //   - For a path OUTSIDE home (a custom storage path, or a tmpdir-based test),
+  //     the tool owns nothing above the leaf. Walking such a path to the root
+  //     would hit legitimately-symlinked system dirs — macOS's /var ->
+  //     /private/var makes os.tmpdir() itself unreachable this way — so for
+  //     out-of-home paths we scan only the leaf.
   //
   // (TOCTOU note: a symlink swapped in AFTER these lstat checks but before chmod
   // is an advisory-only gap against an active local attacker — closing it needs
   // fd-based O_NOFOLLOW, which is out of scope here.)
-  const home = os.homedir();
-  const managed = [];
-  let cur = path.resolve(dir);
-  // Walk up until we reach the home directory (exclusive) or the root.
-  while (cur && cur !== home && cur !== path.dirname(cur)) {
-    managed.push(cur);
-    cur = path.dirname(cur);
+  const managedRoot = path.join(os.homedir(), '.blink');
+  const resolved = path.resolve(dir);
+  const managed = [resolved];
+  if (resolved.startsWith(managedRoot + path.sep) || resolved === managedRoot) {
+    // Under the Blink root: walk up to and including ~/.blink, then stop.
+    let cur = resolved;
+    while (cur !== managedRoot) {
+      cur = path.dirname(cur);
+      managed.push(cur);
+    }
   }
-  // The leaf is `managed[0]`; the rest are the managed ancestors (~/.blink,
-  // ~/.blink/spark). Reject a symlink at any of them.
+  // else: out-of-home path — scan only the leaf.
+  // The leaf is `managed[0]`; for an in-home path the rest are the managed
+  // ancestors (~/.blink/spark, ~/.blink). Reject a symlink at any of them.
   for (const p of managed) {
     let lst;
     try {
