@@ -2,7 +2,7 @@
 
 Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
 
-25 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. Designed for humans and AI agents alike.
+25 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
 
 ## Highlights
 
@@ -12,7 +12,40 @@ Bitcoin Lightning wallet for the command line — zero required runtime npm depe
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
 - **474 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
-- **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; also works with any LLM or human
+- **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
+
+## Two ways to use it
+
+Blink offers two account types. Pick one — the commands you run and the
+credentials you need differ.
+
+|                         | **Custodial**                       | **Non-custodial (Spark)**                                   |
+| ----------------------- | ----------------------------------- | ---------------------------------------------------------- |
+| **Who holds the keys**  | Blink                               | **You** (a 12/24-word seed)                                |
+| **You need**            | `BLINK_API_KEY`                     | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
+| **Runtime deps**        | None (Node 18+ built-ins)           | Two optional packages, **Node 22+**                        |
+| **Balance / history**   | Blink API                           | Local, via the Breez SDK (not on the Blink API)            |
+| **Receive**             | Blink API invoice                   | Public LNURL-pay on `blink.sv` — **no credentials needed** |
+| **Send**                | Blink API                           | Signed locally by the SDK (not on the Blink API)           |
+
+**Custodial — benefits:** simplest setup (one API key, nothing to build); runs
+on Node 18+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
+toolkit.
+**Limitations:** Blink holds the funds — you trust Blink's solvency and
+availability, and the API key is the only thing between an attacker and your
+balance.
+
+**Non-custodial — benefits:** you hold the keys, so Blink cannot move or freeze
+your funds; **receive works with no credentials at all** (any Blink Lightning
+address); send is signed locally with no server signer.
+**Limitations:** whoever has the seed has the funds — lose it and they're gone,
+leak it and they're stolen; BTC-only (no USD); requires Node 22+ and a native
+module build; and the extra `BREEZ_API_KEY`.
+
+Both account types share the `blink.sv` Lightning-address domain — the account
+type is not encoded in the address. See
+[`blink/references/non-custodial.md`](blink/references/non-custodial.md) for the
+full model.
 
 ## Use cases
 
@@ -20,7 +53,7 @@ Bitcoin Lightning wallet for the command line — zero required runtime npm depe
 - **Pay and get paid programmatically** — send to invoices, Lightning addresses, or LNURL, with fee probing and budget limits so a script never overspends.
 - **Build and pay L402 paywalls** — gate an API or resource behind a Lightning invoice (producer), or let an agent auto-pay for metered access (consumer), with spend controls.
 - **Run a self-custodial agent wallet** — hold keys in a seed, check balance and send BTC without trusting a custodian, via the Breez Spark SDK.
-- **Give an AI agent money safely** — JSON-first output, budget guardrails, and a published skill manifest let an LLM agent hold and spend bitcoin within limits you set.
+- **Automate bitcoin from any environment** — a shell script, a cron job, a Python bot on a VPS, or an LLM agent. JSON-first output and budget guardrails let any of them hold and spend within limits you set.
 
 ## Quick Start
 
@@ -68,8 +101,8 @@ blink l402-verify --token <macaroon>:<preimage>        # verify a client's payme
 
 ### Non-custodial (Spark) accounts
 
-Blink now offers **self-custodial (Spark)** accounts alongside custodial ones.
-These commands add parity for non-custodial accounts. See
+Commands for the **self-custodial (Spark)** account type described in
+[Two ways to use it](#two-ways-to-use-it). See
 [`blink/references/non-custodial.md`](blink/references/non-custodial.md) for the
 full model and the API-growth research.
 
