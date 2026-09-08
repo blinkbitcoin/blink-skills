@@ -31,7 +31,7 @@ const fakeSdk = {
     return { balanceSats: balance };
   },
   async listPayments(req) {
-    if (echo) console.error(`STUB_LIMIT=${req && req.limit}`);
+    if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);
     return payments;
   },
   async parse(input) {

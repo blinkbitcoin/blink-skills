@@ -259,9 +259,9 @@ blink resolve-receiver alice@blink.sv
 # Receive to any Blink Lightning Address — no API key, no seed
 blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 
-# Non-custodial (Spark) account: balance, dry-run send, history
+# Non-custodial (Spark) account: balance, fee probe, history
 blink spark-balance
-blink spark-send lnbc1000n1... 1000 --dry-run
+blink spark-fee-probe lnbc1000n1... 1000
 blink spark-transactions --limit 5
 ```
 
@@ -460,6 +460,7 @@ Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay �
 
 - `--timeout <seconds>` — verify-poll timeout (default: 300, 0 = no timeout)
 - `--no-verify` — skip settlement polling; just create the invoice and exit
+- `--qr` — render a terminal QR (stderr) and a PNG in /tmp for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
 
 ### Spark Balance
 
@@ -472,22 +473,30 @@ Reads the BTC balance of a self-custodial (Spark) account directly from the wall
 ### Spark Send
 
 ```bash
-blink spark-send <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]
+blink spark-send <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
 ```
 
 Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). Fees are always resolved and printed before sending; `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
 
-**Not covered by budget controls or the spending log** — this spends self-custodial funds directly (see [non-custodial](references/non-custodial.md)).
+Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log. `--force` bypasses the budget check for an over-limit send.
 
-> **AGENT:** This command spends self-custodial funds irreversibly. Always run `--dry-run` first, then confirm the amount and destination with the user before executing.
+> **AGENT:** This command spends self-custodial funds irreversibly. Probe the fee (`spark-fee-probe` or `--dry-run`) first, then confirm the amount and destination with the user before executing.
+
+### Spark Fee Probe
+
+```bash
+blink spark-fee-probe <destination> <amount_sats> [--network mainnet|regtest]
+```
+
+Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded.
 
 ### Spark Transactions
 
 ```bash
-blink spark-transactions [--limit <n>] [--network mainnet|regtest]
+blink spark-transactions [--limit <n>] [--offset <n>] [--type send|receive] [--network mainnet|regtest]
 ```
 
-Lists recent Spark account payments from SDK-local history (`--limit`, default 20). This history is invisible to the Blink API.
+Lists recent Spark account payments from SDK-local history: `--limit` (default 20), `--offset` for pagination, `--type send|receive` to filter by direction. Output includes a `pageInfo` block — `hasNextPage` is `true` only when the page came back full. This history is invisible to the Blink API.
 
 ### Spark Subscribe
 
@@ -775,7 +784,21 @@ Second JSON (when payment resolves):
       "feeSats": 0,
       "timestamp": 1740000000
     }
-  ]
+  ],
+  "pageInfo": { "hasNextPage": false, "limit": 20, "offset": 0 }
+}
+```
+
+**spark-fee-probe:**
+
+```json
+{
+  "event": "fee_probe",
+  "destination": "lnbc1000n1...",
+  "destinationType": "bolt11",
+  "amountSats": 1000,
+  "feeSats": 1,
+  "network": "mainnet"
 }
 ```
 
@@ -847,9 +870,9 @@ blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 ```bash
 # Requires SPARK_MNEMONIC + BREEZ_API_KEY (Node 22+)
 
-# 1. Dry-run to resolve fees (no funds moved)
-blink spark-send lnbc1000n1... 1000 --dry-run
-# → {"event": "send_prepared", "feeSats": 1, ...}
+# 1. Probe the fee (nothing is sent)
+blink spark-fee-probe lnbc1000n1... 1000
+# → {"event": "fee_probe", "feeSats": 1, ...}
 
 # 2. Check balance
 blink spark-balance
@@ -1379,9 +1402,10 @@ Env vars take precedence over the config file (`~/.blink/budget.json`):
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:
 
-- **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`.
-  You chose the recipient and amount, so these run with or without a budget. If
-  limits are configured they are enforced; if not, the payment proceeds.
+- **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`,
+  `spark-send`. You chose the recipient and amount, so these run with or
+  without a budget. If limits are configured they are enforced; if not, the
+  payment proceeds.
 - **Autonomous L402 auto-pay** — `l402-pay`, and `l402-info --report` which
   delegates to it. These spend without a human in the loop for each payment, so
   they **fail closed**: with no budget configured, or an empty domain
@@ -1421,12 +1445,11 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 
 ### How Budget Enforcement Works
 
-- **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`
+- **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send` (after fee resolution, before signing)
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
 - **Fail closed for auto-pay:** `l402-pay` refuses to run unless a budget AND a non-empty domain allowlist are explicitly configured (`NO_BUDGET_CONFIGURED` / `NO_ALLOWLIST_CONFIGURED` errors explain the setup)
-- **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply
-- **Not covered:** `spark-send` (non-custodial, signs locally via the Breez SDK) does not go through budget enforcement and is not recorded in the spending log
+- **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply. On `spark-send` it is the explicit opt-out for an over-limit one-shot send.
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
@@ -1464,7 +1487,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 Most scripts are stateless. Exceptions:
 
 - `l402-pay` maintains a token cache at `~/.blink/l402-tokens.json` to avoid re-paying for previously-accessed L402 services. Use `--no-store` to run without any persistence.
-- All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
+- All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
 - `spark-*` commands persist Breez SDK wallet state at `~/.blink/spark/<network>-<hash>`. Deleting that directory resets local state (funds live on Spark; the seed restores the wallet).
 
 ### Payment Safety
@@ -1520,5 +1543,6 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/create_invoice_lnaddress.js` — Receive to any Blink Lightning Address via public LNURL-pay (no credentials)
 - `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
 - `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
+- `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee to send from a Spark account (prepare only, nothing sent)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)
 - `{baseDir}/scripts/spark_subscribe.js` — Stream live Spark wallet events

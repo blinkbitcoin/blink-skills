@@ -17,16 +17,24 @@
  * Run: node --test test/cli_noncustodial.test.js
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFile } = require('node:child_process');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 const binPath = path.resolve(__dirname, '..', 'bin', 'blink.js');
 const stubPath = path.resolve(__dirname, 'fixtures', 'spark_sdk_stub.js');
 
-const SPARK_COMMANDS = ['spark-balance', 'spark-send', 'spark-transactions', 'spark-subscribe'];
+const SPARK_COMMANDS = ['spark-balance', 'spark-send', 'spark-fee-probe', 'spark-transactions', 'spark-subscribe'];
 const CREDENTIAL_FREE_COMMANDS = ['resolve-receiver', 'create-invoice-lnaddress'];
+
+// spark-send enforces budget limits and records spends under ~/.blink. Point
+// the CLI's HOME at a throwaway dir so tests neither read the runner's real
+// budget config nor write into the real spending log.
+const cliHome = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-home-'));
+after(() => fs.rmSync(cliHome, { recursive: true, force: true }));
 
 /**
  * Run the CLI. Resolves with { code, stdout, stderr } — a non-zero exit is data
@@ -165,7 +173,7 @@ describe('CLI: options reach the underlying script', () => {
 describe('CLI: spark-send exit code reflects payment outcome', () => {
   it('exits 0 on a completed payment', async () => {
     const { code, stdout } = await runCli(['spark-send', 'lnbc100n1pabc', '1000'], {
-      env: { SPARK_STUB_STATUS: 'COMPLETED' },
+      env: { HOME: cliHome, SPARK_STUB_STATUS: 'COMPLETED' },
     });
     assert.equal(code, 0);
     assert.equal(JSON.parse(stdout).status, 'COMPLETED');
@@ -175,7 +183,7 @@ describe('CLI: spark-send exit code reflects payment outcome', () => {
     // The forceExit path in bin/blink.js must preserve the code main() set;
     // exiting 0 here would report a payment that did not happen as success.
     const { code, stdout } = await runCli(['spark-send', 'lnbc100n1pabc', '1000'], {
-      env: { SPARK_STUB_STATUS: 'failed' },
+      env: { HOME: cliHome, SPARK_STUB_STATUS: 'failed' },
     });
     assert.equal(code, 1);
     assert.equal(JSON.parse(stdout).status, 'failed', 'explicit JSON is still emitted');
@@ -183,9 +191,109 @@ describe('CLI: spark-send exit code reflects payment outcome', () => {
 
   it('exits 0 on a pending payment', async () => {
     const { code } = await runCli(['spark-send', 'lnbc100n1pabc', '1000'], {
-      env: { SPARK_STUB_STATUS: 'pending' },
+      env: { HOME: cliHome, SPARK_STUB_STATUS: 'pending' },
     });
     assert.equal(code, 0);
+  });
+});
+
+// ── budget enforcement (parity with the custodial pay commands) ──────────────
+
+describe('CLI: spark-send budget enforcement', () => {
+  it('a configured budget blocks an over-limit send', async () => {
+    const { code, stderr } = await runCli(['spark-send', 'lnbc100n1pabc', '100'], {
+      env: { HOME: cliHome, BLINK_BUDGET_DAILY_SATS: '50' },
+    });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /Budget exceeded/);
+  });
+
+  it('--force bypasses the budget check and records the spend', async () => {
+    const { code } = await runCli(['spark-send', 'lnbc100n1pabc', '100', '--force'], {
+      env: { HOME: cliHome, BLINK_BUDGET_DAILY_SATS: '50', SPARK_STUB_STATUS: 'COMPLETED' },
+    });
+    assert.equal(code, 0);
+    const log = JSON.parse(fs.readFileSync(path.join(cliHome, '.blink', 'spending-log.json'), 'utf8'));
+    const entry = log.find((e) => e.command === 'spark-send' && e.sats === 100);
+    assert.ok(entry, 'the send must be recorded in the spending log');
+  });
+
+  it('an unconfigured budget does not block an explicit send, and records it', async () => {
+    // Explicitly blank the budget env vars: the runner's real environment must
+    // not leak a configured budget into this "unconfigured" assertion.
+    const { code } = await runCli(['spark-send', 'lnbc100n1pabc', '100'], {
+      env: { HOME: cliHome, BLINK_BUDGET_HOURLY_SATS: '', BLINK_BUDGET_DAILY_SATS: '', SPARK_STUB_STATUS: 'COMPLETED' },
+    });
+    assert.equal(code, 0);
+    const log = JSON.parse(fs.readFileSync(path.join(cliHome, '.blink', 'spending-log.json'), 'utf8'));
+    assert.ok(log.some((e) => e.command === 'spark-send'));
+  });
+});
+
+// ── spark-fee-probe ──────────────────────────────────────────────────────────
+
+describe('CLI: spark-fee-probe', () => {
+  it('reports fees without sending (bolt11 path)', async () => {
+    const { code, stdout, killed } = await runCli(['spark-fee-probe', 'lnbc100n1pabc', '100']);
+    assert.ok(!killed, 'probe must not hang');
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.event, 'fee_probe');
+    assert.equal(j.destinationType, 'bolt11');
+    assert.equal(j.feeSats, 3); // stub prepareSendPayment -> lightningFeeSats
+  });
+
+  it('classifies a Lightning Address as the lnurl path', async () => {
+    const { code, stdout } = await runCli(['spark-fee-probe', 'alice@blink.sv', '100']);
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.destinationType, 'lnurl');
+    assert.equal(j.feeSats, 2); // stub prepareLnurlPay -> feeSats
+  });
+
+  it('forwards --network', async () => {
+    const { stderr } = await runCli(['spark-fee-probe', 'lnbc100n1pabc', '100', '--network', 'regtest'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.match(stderr, /STUB_NETWORK=regtest/);
+  });
+});
+
+// ── spark-transactions pagination / filtering ────────────────────────────────
+
+describe('CLI: spark-transactions pagination and filtering', () => {
+  it('forwards --offset to the SDK listPayments call', async () => {
+    const { stderr } = await runCli(['spark-transactions', '--offset', '40'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.match(stderr, /STUB_OFFSET=40/);
+  });
+
+  it('filters by --type receive', async () => {
+    const payments = JSON.stringify([
+      { id: 'p1', paymentType: 'send', status: 'completed', amount: 10, fees: 3, timestamp: 1710000000 },
+      { id: 'p2', paymentType: 'receive', status: 'completed', amount: 20, fees: 0, timestamp: 1710000001 },
+    ]);
+    const { code, stdout } = await runCli(['spark-transactions', '--type', 'receive'], {
+      env: { SPARK_STUB_PAYMENTS: payments },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.count, 1);
+    assert.equal(j.transactions[0].id, 'p2');
+    assert.equal(j.typeFilter, 'receive');
+  });
+
+  it('reports hasNextPage=false for a partial page', async () => {
+    const payments = JSON.stringify([{ id: 'p1', paymentType: 'send', status: 'completed', amount: 10, fees: 0 }]);
+    const { code, stdout } = await runCli(['spark-transactions', '--limit', '20'], {
+      env: { SPARK_STUB_PAYMENTS: payments },
+    });
+    assert.equal(code, 0);
+    assert.equal(JSON.parse(stdout).pageInfo.hasNextPage, false);
+  });
+
+  it('rejects an invalid --type', async () => {
+    const { code } = await runCli(['spark-transactions', '--type', 'sideways']);
+    assert.notEqual(code, 0);
   });
 });
 

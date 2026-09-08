@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Non-custodial (Spark) transaction history
  *
- * Usage: node spark_transactions.js [--limit <n>] [--network mainnet|regtest]
+ * Usage: node spark_transactions.js [--limit <n>] [--offset <n>] [--type send|receive] [--network mainnet|regtest]
  *
  * Lists recent payments for a NON-CUSTODIAL (Spark) account from the wallet via
  * the Breez Spark SDK. Non-custodial parity for the custodial `transactions`
@@ -25,18 +25,28 @@ const { connect, normalizePayment } = require('./_spark_sdk');
 
 function parseArgs(argv) {
   let limit = 20;
+  let offset = 0;
+  let type = null;
   let network = process.env.SPARK_NETWORK || 'mainnet';
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--limit' && i + 1 < argv.length) {
       limit = parseInt(argv[i + 1], 10);
       if (isNaN(limit) || limit <= 0) throw new Error('--limit must be a positive integer');
       i++;
+    } else if (argv[i] === '--offset' && i + 1 < argv.length) {
+      offset = parseInt(argv[i + 1], 10);
+      if (isNaN(offset) || offset < 0) throw new Error('--offset must be a non-negative integer');
+      i++;
+    } else if (argv[i] === '--type' && i + 1 < argv.length) {
+      type = String(argv[i + 1]).toLowerCase();
+      if (type !== 'send' && type !== 'receive') throw new Error("--type must be 'send' or 'receive'");
+      i++;
     } else if (argv[i] === '--network' && i + 1 < argv.length) {
       network = argv[i + 1];
       i++;
     }
   }
-  return { limit, network };
+  return { limit, offset, type, network };
 }
 
 async function main() {
@@ -45,15 +55,25 @@ async function main() {
   try {
     // listPayments signature varies slightly by SDK version; pass a request
     // object with a limit and normalize whatever comes back.
-    const raw = await sdk.listPayments({ limit: args.limit });
+    const raw = await sdk.listPayments({ limit: args.limit, offset: args.offset });
     const payments = Array.isArray(raw) ? raw : raw && raw.payments ? raw.payments : [];
+    let normalized = payments.map(normalizePayment);
+    if (args.type) normalized = normalized.filter((p) => p.type === args.type);
     console.log(
       JSON.stringify(
         {
           accountType: 'lnaddress',
           network: args.network,
-          count: payments.length,
-          transactions: payments.map(normalizePayment),
+          count: normalized.length,
+          transactions: normalized,
+          // Offset-based (the SDK has no cursor). hasNextPage is a heuristic:
+          // a full page MIGHT be the last one; fetch the next offset to know.
+          pageInfo: {
+            hasNextPage: payments.length === args.limit,
+            limit: args.limit,
+            offset: args.offset,
+          },
+          ...(args.type ? { typeFilter: args.type } : {}),
         },
         null,
         2,

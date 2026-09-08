@@ -264,15 +264,18 @@ commands['create-invoice-lnaddress'] = {
   options: {
     timeout: { type: 'string', default: '300' },
     verify: { type: 'boolean', default: true },
+    qr: { type: 'boolean', default: false },
   },
   optMeta: {
     timeout: { description: 'LUD-21 verify-poll timeout in seconds (0 = no timeout)', valueName: 'seconds' },
     verify: { description: 'Poll LUD-21 verify for settlement (use --no-verify to skip)' },
+    qr: { description: 'Render terminal QR + PNG for the minted invoice' },
   },
   examples: [
     'blink create-invoice-lnaddress alice@blink.sv 1000',
     'blink create-invoice-lnaddress alice 5000 "Coffee"',
     'blink create-invoice-lnaddress alice@blink.sv 1000 --no-verify',
+    'blink create-invoice-lnaddress alice@blink.sv 1000 --qr',
   ],
   action: async (pos, opts) => {
     const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
@@ -281,6 +284,7 @@ commands['create-invoice-lnaddress'] = {
     if (memo.length > 0) argv.push(...memo);
     argv.push('--timeout', String(timeout));
     if (opts.verify === false) argv.push('--no-verify');
+    if (opts.qr) argv.push('--qr');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice_lnaddress.js'));
     await main();
@@ -376,10 +380,12 @@ commands['spark-send'] = {
   ],
   options: {
     'dry-run': { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
     network: { type: 'string' },
   },
   optMeta: {
     'dry-run': { description: 'Prepare & show fees without sending' },
+    force: { description: 'Bypass the budget check for an over-limit send' },
     network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
   },
   examples: [
@@ -393,8 +399,37 @@ commands['spark-send'] = {
     // back to SPARK_NETWORK, so an unset flag cannot clobber the env.
     if (opts.network !== undefined) argv.push('--network', opts.network);
     if (opts['dry-run']) argv.push('--dry-run');
+    if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_send.js'));
+    await main();
+  },
+};
+
+commands['spark-fee-probe'] = {
+  forceExit: true,
+  description:
+    '[non-custodial] Estimate the fee to send from a Spark account — prepare only, nothing is sent (requires SPARK_MNEMONIC)',
+  args: [
+    {
+      name: 'destination',
+      required: true,
+      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, or Spark address',
+    },
+    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+  ],
+  options: {
+    network: { type: 'string' },
+  },
+  optMeta: {
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: ['blink spark-fee-probe lnbc10u1p... 1000', 'blink spark-fee-probe alice@blink.sv 1000'],
+  action: async (pos, opts) => {
+    const argv = [String(pos[0]), String(pos[1])];
+    if (opts.network !== undefined) argv.push('--network', opts.network);
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'spark_fee_probe.js'));
     await main();
   },
 };
@@ -405,17 +440,29 @@ commands['spark-transactions'] = {
   args: [],
   options: {
     limit: { type: 'string', default: '20' },
+    offset: { type: 'string', default: '0' },
+    type: { type: 'string' },
     network: { type: 'string' },
   },
   optMeta: {
     limit: { description: 'Max number of payments to return', valueName: 'n' },
+    offset: { description: 'Number of payments to skip (offset pagination)', valueName: 'n' },
+    type: { description: "Filter by direction: 'send' or 'receive'", valueName: 'send|receive' },
     network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
   },
-  examples: ['blink spark-transactions', 'blink spark-transactions --limit 50'],
+  examples: [
+    'blink spark-transactions',
+    'blink spark-transactions --limit 50',
+    'blink spark-transactions --offset 20 --limit 20',
+    'blink spark-transactions --type receive',
+  ],
   action: async (pos, opts) => {
     if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
     const limit = parsePositiveInt(opts.limit, '--limit');
-    setProcessArgv(['--limit', String(limit)]);
+    const offset = parseNonNegativeInt(opts.offset, '--offset');
+    const argv = ['--limit', String(limit), '--offset', String(offset)];
+    if (opts.type !== undefined) argv.push('--type', String(opts.type));
+    setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_transactions.js'));
     await main();
   },

@@ -148,10 +148,13 @@ their funds. If `bip39` is unavailable the command aborts
 treating "cannot check" as "checked and fine" silently disables the control.
 Neither error echoes the seed.
 
-**Not covered by budget controls:** `spark-send` bypasses the budget enforcement
-and spending log that guard the custodial pay commands — signing happens
-client-side, outside `_budget.js`. This is the highest-authority path in the
-skill; apply agent-side confirmation accordingly.
+**Budget controls:** `spark-send` is under the same rolling spend limits as the
+custodial pay commands. Configured limits (`BLINK_BUDGET_HOURLY_SATS` /
+`BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before
+signing — the last possible moment before funds move; an unconfigured budget
+does not block an explicit one-shot send; successful/pending sends are recorded
+in the spending log; `--force` overrides the check. `spark-fee-probe` and
+`--dry-run` move nothing and are never budget-gated.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

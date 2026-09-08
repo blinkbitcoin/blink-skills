@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Non-custodial (Spark) SEND
  *
- * Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]
+ * Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
  *
  * Sends BTC from a NON-CUSTODIAL (Spark) account by SIGNING the transaction
  * locally with the account seed, via the Breez Spark SDK. This is the
@@ -28,6 +28,11 @@
  * SAFETY:
  *   - Always resolves fees via the prepare step first and prints them.
  *   - --dry-run prepares only (fees shown) and does NOT send.
+ *   - Budget controls: BLINK_BUDGET_HOURLY_SATS / BLINK_BUDGET_DAILY_SATS are
+ *     enforced when configured (like the custodial pay commands); an
+ *     unconfigured budget does not block this explicit one-shot payment.
+ *     Successful/pending sends are recorded in the spending log.
+ *   - --force bypasses the budget check for an over-limit send.
  *   - The seed (SPARK_MNEMONIC) is never logged.
  *
  * Environment:
@@ -40,17 +45,21 @@
  */
 
 const { connect } = require('./_spark_sdk');
+const { checkBudget, recordSpend } = require('./_budget');
 
 function parseArgs(argv) {
   let destination = null;
   let amountSats = null;
   let dryRun = false;
+  let force = false;
   let network = process.env.SPARK_NETWORK || 'mainnet';
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--force') {
+      force = true;
     } else if (arg === '--network' && i + 1 < argv.length) {
       network = argv[i + 1];
       i++;
@@ -61,7 +70,7 @@ function parseArgs(argv) {
       if (isNaN(amountSats) || amountSats <= 0) throw new Error('amount_sats must be a positive integer');
     }
   }
-  return { destination, amountSats, dryRun, network };
+  return { destination, amountSats, dryRun, force, network };
 }
 
 function feeFromPrepare(prepareResponse) {
@@ -180,7 +189,9 @@ function isFailedStatus(status) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.destination || args.amountSats === null) {
-    console.error('Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]');
+    console.error(
+      'Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]',
+    );
     process.exit(1);
   }
 
@@ -221,10 +232,33 @@ async function main() {
       return;
     }
 
+    // ── Budget check ──
+    // Same treatment as the custodial one-shot payments (pay-invoice & co): the
+    // budget is enforced when configured, but an unconfigured budget must not
+    // block an explicitly user-initiated payment, so opt out of the fail-closed
+    // default that guards autonomous L402 auto-pay. --force overrides.
+    if (!args.force) {
+      const budgetResult = checkBudget(args.amountSats, { requireConfigured: false });
+      if (!budgetResult.allowed) {
+        throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+      }
+    }
+
     // 3. Send (signs locally) via the matching path.
     const result = lnurl ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
     const payment = result && result.payment ? result.payment : result;
     const status = (payment && payment.status) || 'SUBMITTED';
+
+    // Record the spend unless the SDK says the payment failed — same rule as
+    // the custodial pay commands ("only successful/pending payments are
+    // logged"). Non-fatal: a logging failure must not mask the payment result.
+    if (!isFailedStatus(status)) {
+      try {
+        recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
+      } catch {
+        /* non-fatal */
+      }
+    }
 
     console.log(
       JSON.stringify(
@@ -276,4 +310,13 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, feeFromPrepare, isLnurlPayInput, lnurlPayRequestFrom, isFailedStatus };
+module.exports = {
+  main,
+  parseArgs,
+  feeFromPrepare,
+  isLnurlPayInput,
+  lnurlPayRequestFrom,
+  isFailedStatus,
+  prepareLnurl,
+  prepareBolt,
+};
