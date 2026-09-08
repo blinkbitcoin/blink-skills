@@ -227,6 +227,7 @@ async function fetchWithRetry(
     headers = {},
     allowedHosts = null,
     what = 'URL',
+    retryOn404 = false,
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
@@ -256,6 +257,18 @@ async function fetchWithRetry(
           redirect: 'manual',
           headers: { Accept: 'application/json', Connection: 'close', ...headers },
         });
+        // A 404 is the LUD-16 "not found" signal, but it is ALSO what a
+        // transient proxy/CDN/WAF returns in front of a healthy LNURL server
+        // (rolling deploy, stale negative cache). Retry it like any other
+        // transient fault and only let a CONSISTENT 404 through to be read as
+        // not-found, so one flaky response is not relayed as "this address
+        // does not exist".
+        if (retryOn404 && res.status === 404 && attempt < retries) {
+          lastErr = new Error('HTTP 404 (transient?)');
+          res = null;
+          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+          continue;
+        }
         break;
       } catch (err) {
         lastErr = err;
@@ -290,10 +303,104 @@ async function fetchWithRetry(
 //
 // The callback hands back a `pr` string that we then show the user, or hand to
 // a wallet, as "the invoice for N sats". Nothing in LNURL forces that invoice
-// to actually encode N sats, or even to be on the network we think it is. A
-// server that returns an invoice for a different amount, or a mainnet client
-// handed a testnet invoice, is a silent failure. We do not need a full BOLT-11
-// decoder to close that: the human-readable prefix carries both facts.
+// to actually encode N sats, to be on the network we think it is, or to be the
+// invoice that corresponds to the metadata we fetched. Three independent checks
+// are needed, and none is optional:
+//
+//   1. bech32 checksum — otherwise a corrupted or fabricated `pr` string is
+//      accepted as an invoice at all.
+//   2. network + amount from the HRP — a testnet invoice, or one for the wrong
+//      amount, is a silent failure.
+//   3. the description-hash `h` tag must equal SHA-256 of the exact LUD-06
+//      metadata string — otherwise the invoice is not bound to the payRequest
+//      that produced it, and a server could return a pre-signed invoice for a
+//      different description than the one the user saw.
+//
+// All of this is pure parsing over a ~30-line bech32 core; it needs no
+// dependency. `bip39` provides no bech32 export, and pulling in `bolt11` for
+// this would be a new dependency for a well-specified decode.
+
+// ── bech32 (BIP-173; BOLT-11 uses bech32, not bech32m) ───────────────────────
+
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+const BECH32_CONST = 1; // bech32; bech32m would be 0x2bc830a3
+
+function bech32Polymod(values) {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) {
+      if ((top >>> i) & 1) chk ^= GEN[i];
+    }
+  }
+  return chk >>> 0;
+}
+
+function bech32HrpExpand(hrp) {
+  const out = [];
+  for (const c of hrp) out.push(c.charCodeAt(0) >>> 5);
+  out.push(0);
+  for (const c of hrp) out.push(c.charCodeAt(0) & 31);
+  return out;
+}
+
+/**
+ * Decode and verify a bech32/bech32m string.
+ * @param {string} str
+ * @returns {{ hrp: string, data: number[] }} data without the 6 checksum words.
+ */
+function bech32Decode(str) {
+  // BOLT-11 legitimately exceeds BIP-173's 90-char limit: a long `d` tag plus
+  // route hints can run to several thousand chars. Cap only to bound work.
+  if (str.length < 8 || str.length > 20000) throw new Error('bech32: bad length');
+  if (/[\x00-\x20\x7f-\xff]/.test(str)) throw new Error('bech32: invalid character range');
+  if (str.toLowerCase() !== str && str.toUpperCase() !== str) {
+    throw new Error('bech32: mixed case');
+  }
+  const s = str.toLowerCase();
+  const sep = s.lastIndexOf('1');
+  if (sep < 1 || sep + 7 > s.length) throw new Error('bech32: no valid separator');
+
+  const hrp = s.slice(0, sep);
+  const dataPart = s.slice(sep + 1);
+  const data = [];
+  for (const c of dataPart) {
+    const v = BECH32_CHARSET.indexOf(c);
+    if (v === -1) throw new Error(`bech32: invalid data character '${c}'`);
+    data.push(v);
+  }
+
+  const polymod = bech32Polymod([...bech32HrpExpand(hrp), ...data]);
+  if (polymod !== BECH32_CONST) throw new Error('bech32: checksum mismatch');
+  return { hrp, data: data.slice(0, -6) };
+}
+
+/** Convert between bit groups (here 5-bit words -> 8-bit bytes). */
+function convertBits(data, fromBits, toBits, pad) {
+  let acc = 0;
+  let bits = 0;
+  const out = [];
+  const maxv = (1 << toBits) - 1;
+  for (const value of data) {
+    if (value < 0 || value >>> fromBits !== 0) throw new Error('convertBits: value out of range');
+    acc = (acc << fromBits) | value;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      out.push((acc >>> bits) & maxv);
+    }
+  }
+  if (pad) {
+    if (bits > 0) out.push((acc << (toBits - bits)) & maxv);
+  } else if (bits >= fromBits || ((acc << (toBits - bits)) & maxv) !== 0) {
+    throw new Error('convertBits: invalid padding');
+  }
+  return out;
+}
+
+// ── BOLT-11 structure ────────────────────────────────────────────────────────
 
 // `lnbc<amount><multiplier>` — the multiplier is a fraction of 1 BTC.
 // 1 BTC = 100_000_000 sat = 100_000_000_000 msat.
@@ -312,63 +419,97 @@ const BOLT11_NETWORK_PREFIXES = {
 };
 
 /**
- * Decode the human-readable part of a BOLT-11 invoice.
+ * Decode a BOLT-11 invoice: verify the bech32 checksum, read the HRP
+ * (network + amount) and parse the tagged fields to find the description-hash.
  *
- * Deliberately does NOT verify the bech32 checksum or parse the tagged data —
- * that would be a dependency. It extracts only what is needed to bind the
- * invoice to the request that produced it.
+ * This does NOT verify the secp256k1 signature — that would be a much larger
+ * dependency, and the signature attests the invoice was signed by the payee
+ * node, not that it matches our request, which is what we are checking.
  *
  * @param {string} paymentRequest
- * @returns {{ network: string, amountMsats: number|null }}
- *          amountMsats is null for an amountless ("any amount") invoice.
+ * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null }}
+ *          amountMsats is null for an amountless invoice; descriptionHash is a
+ *          lowercase hex string when the `h` tag is present.
  */
-function decodeBolt11Hrp(paymentRequest) {
-  const pr = String(paymentRequest || '')
-    .trim()
-    .toLowerCase();
+function decodeBolt11(paymentRequest) {
+  const pr = String(paymentRequest || '').trim();
   if (!pr) throw new Error('Empty payment request.');
 
-  // bech32: the HRP is everything before the LAST '1' separator.
-  const sep = pr.lastIndexOf('1');
-  if (sep < 1) throw new Error('Not a valid BOLT-11 invoice (no bech32 separator).');
-  const hrp = pr.slice(0, sep);
-  const data = pr.slice(sep + 1);
-
-  if (!/^[023456789acdefghjklmnpqrstuvwxyz]+$/.test(data) || data.length < 6) {
-    throw new Error('Not a valid BOLT-11 invoice (bad bech32 data part).');
+  let decoded;
+  try {
+    decoded = bech32Decode(pr);
+  } catch (err) {
+    throw new Error(`Not a valid BOLT-11 invoice (${err.message}).`);
   }
+  const { hrp, data } = decoded;
 
   const m = hrp.match(/^ln(bcrt|bc|tb|sb)(\d*)([munp]?)$/);
   if (!m) throw new Error(`Not a valid BOLT-11 invoice (unrecognised prefix '${hrp}').`);
-
   const [, prefix, digits, multiplier] = m;
   const network = BOLT11_NETWORK_PREFIXES[prefix];
 
-  if (!digits) return { network, amountMsats: null }; // amountless invoice
-
-  const value = Number(digits);
-  if (!Number.isFinite(value)) throw new Error('Not a valid BOLT-11 invoice (bad amount).');
-
-  const amountMsats = multiplier ? value * BOLT11_MULTIPLIERS[multiplier] : value * 100_000_000_000;
-  if (!Number.isInteger(amountMsats)) {
-    throw new Error('Not a valid BOLT-11 invoice (sub-millisatoshi amount).');
+  // Amount (from the HRP).
+  let amountMsats = null;
+  if (digits) {
+    const value = Number(digits);
+    if (!Number.isFinite(value)) throw new Error('Not a valid BOLT-11 invoice (bad amount).');
+    amountMsats = multiplier ? value * BOLT11_MULTIPLIERS[multiplier] : value * 100_000_000_000;
+    if (!Number.isInteger(amountMsats)) {
+      throw new Error('Not a valid BOLT-11 invoice (sub-millisatoshi amount).');
+    }
   }
-  return { network, amountMsats };
+
+  // Tagged fields. The data part is: 35-bit timestamp (7 words) + tags + 520-bit
+  // signature (104 words). Each tag is: 5-bit type, 10-bit length (2 words),
+  // then `length` 5-bit words of data.
+  let descriptionHash = null;
+  let i = 7; // skip the 7-word timestamp
+  const sigWords = 104;
+  while (i + 3 <= data.length - sigWords) {
+    const type = data[i];
+    const len = (data[i + 1] << 5) | data[i + 2];
+    const start = i + 3;
+    if (start + len > data.length - sigWords) break; // malformed; stop scanning
+    if (type === 23) {
+      // `h` — description hash. BOLT-11 forbids duplicate tags, and a last-wins
+      // read would bind to a description other than the one verified, so a
+      // second `h` is a hard failure. A malformed body leaves the hash null —
+      // the binding check then refuses it, fail-closed.
+      if (descriptionHash !== null) {
+        throw new Error('Not a valid BOLT-11 invoice (duplicate description-hash tag).');
+      }
+      try {
+        const bytes = convertBits(data.slice(start, start + len), 5, 8, false);
+        if (bytes.length === 32) {
+          descriptionHash = Buffer.from(bytes).toString('hex');
+        }
+      } catch {
+        // malformed tag body: leave descriptionHash null
+      }
+    }
+    i = start + len;
+  }
+
+  return { network, amountMsats, descriptionHash };
 }
 
 /**
- * Assert that a returned invoice is the one we asked for.
+ * Assert that a returned invoice is the one we asked for: valid bech32, right
+ * network, exactly the amount requested, and — when the LUD-06 metadata is
+ * supplied — a description hash bound to that metadata.
  *
  * @param {string} paymentRequest
  * @param {object} expected
  * @param {number} expected.amountMsats
- * @param {string} [expected.network]  Default "mainnet".
- * @returns {{ network: string, amountMsats: number|null }}
+ * @param {string} [expected.network]   Default "mainnet".
+ * @param {string} [expected.metadata]  The exact LUD-06 metadata string. When
+ *        given, the invoice's `h` tag must equal sha256(metadata).
+ * @returns {{ network: string, amountMsats: number|null, descriptionHash: string|null }}
  */
-function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet' }) {
+function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet', metadata } = {}) {
   let decoded;
   try {
-    decoded = decodeBolt11Hrp(paymentRequest);
+    decoded = decodeBolt11(paymentRequest);
   } catch (err) {
     throw new Error(`LNURL-pay callback returned something that is not a BOLT-11 invoice: ${err.message}`);
   }
@@ -391,7 +532,48 @@ function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet'
     );
   }
 
+  // Bind the invoice to the payRequest metadata (LUD-06). Without this the
+  // invoice is valid and correctly-priced, but not provably for the
+  // description the user agreed to.
+  if (metadata !== undefined && metadata !== null) {
+    const crypto = require('crypto');
+    const expectedHash = crypto.createHash('sha256').update(String(metadata), 'utf8').digest('hex');
+    if (decoded.descriptionHash === null) {
+      throw new Error('LNURL-pay callback returned an invoice with no description-hash tag to bind.');
+    }
+    if (decoded.descriptionHash !== expectedHash) {
+      throw new Error(
+        'LNURL-pay callback returned an invoice whose description hash does not match the ' +
+          'LUD-06 metadata. Refusing it.',
+      );
+    }
+  }
+
   return decoded;
+}
+
+// ── LNURL error classification ───────────────────────────────────────────────
+//
+// A LUD-06 error body `{ status: "ERROR", reason }` is NOT automatically "this
+// address does not exist". The only reason that means absence is an explicit
+// not-found; anything else — "temporarily overloaded", a rate limit, a
+// malformed amount — is a SERVICE failure that the caller should retry, not
+// convert into a confident RECEIVER_NOT_FOUND. That conversion is the
+// outage-as-identity-answer bug, one layer below the now-fixed GraphQL probe.
+const LNURL_NOT_FOUND_PATTERNS = [
+  /not\s+found/i,
+  /does\s+not\s+exist/i,
+  /no\s+(such\s+)?(user|account|username)/i,
+  /unknown\s+(user|username|account|identifier)/i,
+];
+
+/**
+ * Is this LUD-06 error reason an unambiguous "the address does not exist"?
+ * @param {string} reason
+ * @returns {boolean}
+ */
+function isLnurlNotFoundReason(reason) {
+  return LNURL_NOT_FOUND_PATTERNS.some((re) => re.test(String(reason || '')));
 }
 
 // ── LNURL-pay metadata ───────────────────────────────────────────────────────
@@ -408,7 +590,10 @@ function assertInvoiceMatches(paymentRequest, { amountMsats, network = 'mainnet'
  */
 async function fetchLnurlPayMetadata(username, domain, opts = {}) {
   const url = lnurlpMetadataUrl(username, domain);
-  const res = await fetchWithRetry(url, { ...opts, what: 'LNURL-pay metadata URL' });
+  // 404 is the LUD-16 not-found signal, but a transient infra 404 is
+  // indistinguishable from it — retry so only a consistent 404 is read as
+  // "this address does not exist".
+  const res = await fetchWithRetry(url, { ...opts, what: 'LNURL-pay metadata URL', retryOn404: true });
 
   if (res.status === 404) {
     const e = new Error(`Lightning Address not found: ${username}@${domain}`);
@@ -426,10 +611,13 @@ async function fetchLnurlPayMetadata(username, domain, opts = {}) {
     throw new Error('LNURL-pay metadata was not valid JSON.');
   }
 
-  // LNURL error object (LUD-06): { status: "ERROR", reason }
+  // LNURL error object (LUD-06): { status: "ERROR", reason }. Only an
+  // unambiguous not-found reason is absence; anything else is a service
+  // failure and must NOT be read as "this receiver does not exist".
   if (body.status === 'ERROR') {
-    const e = new Error(`LNURL-pay error: ${body.reason || 'unknown reason'}`);
-    e.code = 'LNURL_NOT_FOUND';
+    const reason = body.reason || 'unknown reason';
+    const e = new Error(`LNURL-pay error: ${reason}`);
+    e.code = isLnurlNotFoundReason(reason) ? 'LNURL_NOT_FOUND' : 'LNURL_SERVICE_ERROR';
     throw e;
   }
 
@@ -466,6 +654,9 @@ async function fetchLnurlPayMetadata(username, domain, opts = {}) {
  * @param {object} [opts]
  * @param {Set<string>|string[]} [opts.allowedHosts]
  * @param {string} [opts.network]  Expected invoice network (default "mainnet").
+ * @param {string} [opts.metadata]  The exact LUD-06 metadata string from the
+ *        payRequest. When supplied, the returned invoice's description-hash tag
+ *        must match sha256(metadata).
  * @returns {Promise<{ paymentRequest: string, verify: string|null, routes: any[] }>}
  */
 async function requestInvoiceFromCallback(callback, amountMsats, comment, opts = {}) {
@@ -492,10 +683,15 @@ async function requestInvoiceFromCallback(callback, amountMsats, comment, opts =
     throw new Error('LNURL-pay callback did not return an invoice (pr).');
   }
 
-  // Bind the response to the request: right network, exactly the amount asked
-  // for. Done BEFORE the invoice is returned to any caller, so an invoice that
-  // does not match is never emitted or displayed.
-  assertInvoiceMatches(body.pr, { amountMsats, network: opts.network || 'mainnet' });
+  // Bind the response to the request: valid bech32, right network, exactly the
+  // amount asked for, and a description hash matching the LUD-06 metadata we
+  // fetched. Done BEFORE the invoice is returned to any caller, so an invoice
+  // that does not match is never emitted or displayed.
+  assertInvoiceMatches(body.pr, {
+    amountMsats,
+    network: opts.network || 'mainnet',
+    metadata: opts.metadata,
+  });
 
   // LUD-21 verify is another URL we will fetch; hold it to the same allowlist.
   if (body.verify) {
@@ -552,7 +748,12 @@ async function getInvoiceFromLightningAddress(address, amountSats, memo, opts = 
   }
 
   const comment = memo && meta.commentAllowed > 0 ? String(memo).slice(0, meta.commentAllowed) : undefined;
-  const invoice = await requestInvoiceFromCallback(meta.callback, amountMsats, comment, opts);
+  // Pass the metadata through so the returned invoice's description-hash is
+  // bound to this exact payRequest, per LUD-06.
+  const invoice = await requestInvoiceFromCallback(meta.callback, amountMsats, comment, {
+    ...opts,
+    metadata: meta.metadata,
+  });
 
   return {
     paymentRequest: invoice.paymentRequest,
@@ -619,7 +820,10 @@ module.exports = {
   LOCAL_HOSTS,
   isPrivateAddress,
   assertAllowedUrl,
-  decodeBolt11Hrp,
+  isLnurlNotFoundReason,
+  bech32Decode,
+  convertBits,
+  decodeBolt11,
   assertInvoiceMatches,
   parseLightningAddress,
   lnurlpMetadataUrl,

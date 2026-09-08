@@ -276,6 +276,27 @@ function isAccountNotFoundError(err) {
 }
 
 /**
+ * Does this GraphQL error mean the account exists but is INACTIVE?
+ *
+ * This is distinct from both "absent" and "lookup failed". An inactive
+ * custodial account cannot be paid through the custodial API — but Blink still
+ * serves its Lightning address publicly over LNURL, so the correct next step
+ * is the same as for a genuinely absent custodial account: fall through to the
+ * LNURL branch. Treating it as a hard probe failure would break the
+ * credential-free receive path for exactly the accounts that need it
+ * (reproduced live: `Account is inactive` for a username whose
+ * `.well-known/lnurlp/<user>` returns a valid payRequest).
+ *
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function isAccountInactiveError(err) {
+  if (!err || err.code !== 'GRAPHQL_ERROR') return false;
+  const messages = (err.graphQLErrors || []).map((e) => String(e && e.message)).join(' ') || String(err.message);
+  return /account\s+is\s+inactive/i.test(messages);
+}
+
+/**
  * Look up a custodial account's default BTC wallet by username.
  *
  * Returns null ONLY when the API successfully answered that no such custodial
@@ -308,7 +329,14 @@ async function getCustodialDefaultWallet({ username, apiKey = null, apiUrl, time
     });
     return (data && data.accountDefaultWallet) || null;
   } catch (err) {
+    // Absent custodial account: let the LNURL fallback decide.
     if (isAccountNotFoundError(err)) return null;
+    // An INACTIVE custodial account is also not payable through the custodial
+    // API — but "Account is inactive" can describe the CALLER's own (auth)
+    // account when an apiKey was supplied, not the receiver. Only the
+    // credential-free path can safely read it as "receiver is not custodial";
+    // when authenticated, it is ambiguous and must fail closed.
+    if (!apiKey && isAccountInactiveError(err)) return null;
     const e = new Error(
       `Could not determine whether '${username}' is a custodial Blink account: ${err.message}. ` +
         'Refusing to guess the account type from a failed lookup.',
@@ -378,9 +406,22 @@ async function resolveReceiver(identifier, opts = {}) {
       walletId: null,
     };
   } catch (err) {
+    // Only an unambiguous not-found becomes RECEIVER_NOT_FOUND. A service or
+    // protocol failure (LNURL_SERVICE_ERROR, HTTP 5xx, a timeout) propagates as
+    // a retryable failure — it must not be relayed as a confident identity
+    // answer, the same principle as the custodial probe above.
     if (err.code === 'LNURL_NOT_FOUND') {
       const e = new Error(`'${lightningAddress}' does not seem to be a Blink address that exists.`);
       e.code = 'RECEIVER_NOT_FOUND';
+      throw e;
+    }
+    if (err.code === 'LNURL_SERVICE_ERROR') {
+      const e = new Error(
+        `Could not confirm whether '${lightningAddress}' exists: the LNURL server reported a ` +
+          `temporary failure (${err.message}). Retry rather than treat this as a missing address.`,
+      );
+      e.code = 'LNURL_SERVICE_ERROR';
+      e.cause = err;
       throw e;
     }
     throw err;
@@ -748,6 +789,7 @@ module.exports = {
   ALLOWED_LN_ADDRESS_DOMAINS,
   ACCOUNT_DEFAULT_WALLET_QUERY,
   isAccountNotFoundError,
+  isAccountInactiveError,
   getCustodialDefaultWallet,
   resolveReceiver,
 

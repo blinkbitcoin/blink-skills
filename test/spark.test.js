@@ -89,7 +89,10 @@ describe('_spark_sdk.getMnemonic', () => {
     };
 
     assert.throws(
-      () => spark.validateMnemonicChecksum('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
+      () =>
+        spark.validateMnemonicChecksum(
+          'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+        ),
       (e) => e.code === 'MNEMONIC_VALIDATOR_UNAVAILABLE',
       'a missing validator must abort, not silently pass',
     );
@@ -144,6 +147,33 @@ describe('_spark_sdk.storageDirFor', () => {
   it('does not embed the raw seed in the path', () => {
     const dir = spark.storageDirFor('super secret seed phrase', 'mainnet');
     assert.equal(dir.includes('super secret'), false);
+  });
+});
+
+// ── wallet-state directory permissions (review finding #4) ──────────────────
+
+describe('_spark_sdk.ensureOwnerOnlyDir', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const pathMod = require('node:path');
+
+  function modeOf(dir) {
+    return fs.statSync(dir).mode & 0o777;
+  }
+
+  it('creates the wallet dir owner-only (0700)', (t) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-')) + '/wallet';
+    t.after(() => fs.rmSync(pathMod.dirname(dir), { recursive: true, force: true }));
+    spark.ensureOwnerOnlyDir(dir);
+    assert.equal(modeOf(dir), 0o700, 'a seed-controlled wallet dir must not be group/other accessible');
+  });
+
+  it('tightens an existing permissive dir on the next connect', (t) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'sparkperm-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.chmodSync(dir, 0o755); // simulate an earlier permissive creation
+    spark.ensureOwnerOnlyDir(dir);
+    assert.equal(modeOf(dir), 0o700, 'must repair a pre-existing permissive dir');
   });
 });
 
@@ -517,30 +547,91 @@ describe('spark_send.isFailedStatus', () => {
 });
 
 // ── storage preflight (review finding #1) ────────────────────────────────────
+//
+// The probe must require better-sqlite3 DIRECTLY and open a database, because
+// the SDK's own defaultStorage() factory is lazy in 0.23.1 — it returns an
+// object without opening SQLite, so probing it passes even when the native
+// binding is absent. We simulate the binding being present or broken by
+// intercepting require of better-sqlite3.
 
 describe('_spark_sdk.assertStorageAvailable', () => {
-  it('passes when default storage can be created', () => {
-    const mod = { defaultStorage: () => ({}) };
-    assert.doesNotThrow(() => spark.assertStorageAvailable(mod, '/tmp/whatever'));
+  // The probe resolves better-sqlite3 from inside the SDK package, so both must
+  // be installed for a require-cache stub to bind. Where the optional SDK is
+  // absent (this checkout, minimal CI) we instead drive the same code path by
+  // patching Module._resolveFilename, so the tests run in every environment.
+  const Module = require('node:module');
+
+  function withStubbedSqlite(t, impl) {
+    const realLoad = Module._load;
+    const realResolve = Module._resolveFilename;
+    t.after(() => {
+      Module._load = realLoad;
+      Module._resolveFilename = realResolve;
+    });
+
+    // The probe resolves the SDK package first (to find its own better-sqlite3
+    // tree). Where the SDK is absent, give it a path so we reach the probe.
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === '@breeztech/breez-sdk-spark') {
+        try {
+          return realResolve.call(this, request, ...rest);
+        } catch {
+          return require('node:path').join(__dirname, 'fixtures', 'fake_spark_sdk.js');
+        }
+      }
+      if (request === 'better-sqlite3') {
+        if (impl === null) {
+          const e = new Error("Cannot find module 'better-sqlite3'");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
+        }
+        // Return a path so require.resolve succeeds; _load below supplies the
+        // actual fake implementation regardless of the path.
+        return require('node:path').join(__dirname, 'fixtures', 'fake_better_sqlite3.js');
+      }
+      return realResolve.call(this, request, ...rest);
+    };
+
+    if (impl !== null) {
+      Module._load = function (request, parent, isMain) {
+        // The probe requires better-sqlite3 by NAME and then by the RESOLVED
+        // PATH; intercept both so the fake is returned regardless.
+        if (request === 'better-sqlite3' || /fake_better_sqlite3\.js$/.test(String(request))) return impl;
+        return realLoad.call(this, request, parent, isMain);
+      };
+    }
+  }
+
+  it('passes when better-sqlite3 can open and query a database', (t) => {
+    function FakeDatabase() {
+      return {
+        prepare: () => ({ get: () => ({ ok: 1 }) }),
+        close: () => {},
+      };
+    }
+    withStubbedSqlite(t, FakeDatabase);
+    assert.doesNotThrow(() => spark.assertStorageAvailable());
   });
 
-  it('converts a native bindings failure into an actionable error', () => {
-    const mod = {
-      defaultStorage() {
-        throw new Error('Could not locate the bindings file. Tried: .../better_sqlite3.node');
-      },
-    };
+  it('fails with an actionable error when the native binding cannot be constructed', (t) => {
+    function BrokenDatabase() {
+      throw new Error('Could not locate the bindings file. Tried: .../better_sqlite3.node');
+    }
+    withStubbedSqlite(t, BrokenDatabase);
     assert.throws(
-      () => spark.assertStorageAvailable(mod, '/tmp/whatever'),
+      () => spark.assertStorageAvailable(),
       (e) =>
         e.code === 'SPARK_STORAGE_UNAVAILABLE' &&
         /better-sqlite3/.test(e.message) &&
-        /npm rebuild/.test(e.message) &&
-        /ignore-scripts/.test(e.message),
+        /approve-builds|rebuild/.test(e.message),
     );
   });
 
-  it('is a no-op on an SDK build with no defaultStorage', () => {
-    assert.doesNotThrow(() => spark.assertStorageAvailable({}, '/tmp/whatever'));
+  it('fails with an actionable error when better-sqlite3 is not installed at all', (t) => {
+    withStubbedSqlite(t, null);
+    assert.throws(
+      () => spark.assertStorageAvailable(),
+      (e) => e.code === 'SPARK_STORAGE_UNAVAILABLE',
+    );
   });
 });

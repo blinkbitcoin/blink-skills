@@ -18,27 +18,50 @@ const {
   verifyLnurlPayment,
   assertAllowedUrl,
   isPrivateAddress,
-  decodeBolt11Hrp,
+  isLnurlNotFoundReason,
+  bech32Decode,
+  decodeBolt11,
   assertInvoiceMatches,
   fetchWithRetry,
 } = require('../blink/scripts/_lnurl');
 
 const BLINK_ONLY = new Set(['blink.sv']);
 
+// ── Real invoice fixtures ────────────────────────────────────────────────────
+//
+// The BOLT-11 binding now verifies the bech32 checksum and the LUD-06
+// description-hash, so the fixtures have to be REAL invoices — the synthetic
+// HRP-only strings the earlier tests used (`lnbc10n1p...`) are exactly what
+// this control exists to reject. `bech32` is a devDependency used only here.
+
+const { bech32 } = require('bech32');
+const crypto = require('node:crypto');
+
+const TEST_METADATA = '[["text/plain","pay alice"]]';
+const TEST_METADATA_HASH = crypto.createHash('sha256').update(TEST_METADATA, 'utf8').digest('hex');
+
 /**
- * Build a BOLT-11 string whose human-readable part encodes `msats`.
+ * Build a structurally valid BOLT-11 invoice whose HRP encodes `msats` and
+ * whose description-hash tag commits to `metadata`.
  *
- * Only the HRP is meaningful to decodeBolt11Hrp; the data part just has to be
- * non-trivial and in the bech32 charset (no '1', 'b', 'i' or 'o').
- *
- * @param {number} msats
+ * @param {number|null} msats  Null for an amountless invoice.
  * @param {string} [prefix]  'bc' mainnet, 'tb' testnet, 'bcrt' regtest.
+ * @param {string} [metadata]  LUD-06 metadata the desc-hash commits to.
  */
-function bolt11(msats, prefix = 'bc') {
-  const data = '1' + 'pq'.repeat(12);
-  if (msats === null) return `ln${prefix}${data}`; // amountless
-  if (msats % 100 === 0) return `ln${prefix}${msats / 100}n${data}`;
-  return `ln${prefix}${msats * 10}p${data}`;
+function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA) {
+  const hrp = `ln${prefix}${amountSuffix(msats)}`;
+  const hash = crypto.createHash('sha256').update(metadata, 'utf8').digest();
+  const hashWords = bech32.toWords(hash);
+  // 7-word timestamp + h tag (type 23, 52-word length) + 104-word signature.
+  const words = [...new Array(7).fill(0), 23, (52 >> 5) & 31, 52 & 31, ...hashWords, ...new Array(104).fill(0)];
+  return bech32.encode(hrp, words, 2000);
+}
+
+/** The `<digits><multiplier>` HRP suffix for a msat amount. */
+function amountSuffix(msats) {
+  if (msats === null) return '';
+  if (msats % 100 === 0) return `${msats / 100}n`;
+  return `${msats * 10}p`;
 }
 
 const { resolveReceiver } = require('../blink/scripts/_blink_client');
@@ -145,12 +168,63 @@ describe('fetchLnurlPayMetadata', () => {
 
   it('throws LNURL_NOT_FOUND on 404', async () => {
     stubFetch(() => ({ status: 404, json: {} }));
-    await assert.rejects(() => fetchLnurlPayMetadata('nobody', 'blink.sv'), (e) => e.code === 'LNURL_NOT_FOUND');
+    await assert.rejects(
+      () => fetchLnurlPayMetadata('nobody', 'blink.sv'),
+      (e) => e.code === 'LNURL_NOT_FOUND',
+    );
   });
 
-  it('throws LNURL_NOT_FOUND on LNURL ERROR body', async () => {
+  it('throws LNURL_NOT_FOUND on LNURL ERROR body with a not-found reason', async () => {
     stubFetch(() => ({ json: { status: 'ERROR', reason: 'not found' } }));
-    await assert.rejects(() => fetchLnurlPayMetadata('nobody', 'blink.sv'), (e) => e.code === 'LNURL_NOT_FOUND');
+    await assert.rejects(
+      () => fetchLnurlPayMetadata('nobody', 'blink.sv'),
+      (e) => e.code === 'LNURL_NOT_FOUND',
+    );
+  });
+
+  // A transient server failure must NOT be classified as "the address does not
+  // exist" — that is the outage-as-identity-answer bug, one layer down.
+  it('throws LNURL_SERVICE_ERROR on a transient LNURL ERROR body', async () => {
+    stubFetch(() => ({ json: { status: 'ERROR', reason: 'temporarily overloaded' } }));
+    await assert.rejects(
+      () => fetchLnurlPayMetadata('alice', 'blink.sv'),
+      (e) => e.code === 'LNURL_SERVICE_ERROR',
+    );
+  });
+
+  it('distinguishes not-found from transient reasons', () => {
+    assert.equal(isLnurlNotFoundReason('user not found'), true);
+    assert.equal(isLnurlNotFoundReason('account does not exist'), true);
+    assert.equal(isLnurlNotFoundReason('temporarily overloaded'), false);
+    assert.equal(isLnurlNotFoundReason('rate limited, retry later'), false);
+    assert.equal(isLnurlNotFoundReason('internal error'), false);
+  });
+
+  // A single transient 404 (proxy/WAF/rolling deploy) must not be relayed as
+  // "this address does not exist" — only a consistent 404 is absence.
+  it('recovers from one transient 404 before declaring not-found', async () => {
+    let calls = 0;
+    stubFetch(() => {
+      calls++;
+      if (calls === 1) return { status: 404, json: {} };
+      return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1, maxSendable: 1e9 } };
+    });
+    const meta = await fetchLnurlPayMetadata('alice', 'blink.sv', { retries: 1 });
+    assert.equal(meta.callback, 'https://blink.sv/cb');
+    assert.equal(calls, 2, 'must retry the first 404');
+  });
+
+  it('still treats a CONSISTENT 404 as not-found after retrying', async () => {
+    let calls = 0;
+    stubFetch(() => {
+      calls++;
+      return { status: 404, json: {} };
+    });
+    await assert.rejects(
+      () => fetchLnurlPayMetadata('nobody', 'blink.sv', { retries: 1 }),
+      (e) => e.code === 'LNURL_NOT_FOUND',
+    );
+    assert.equal(calls, 2, 'must have retried before giving up');
   });
 
   it('throws on a non-payRequest tag', async () => {
@@ -189,7 +263,16 @@ describe('getInvoiceFromLightningAddress', () => {
     const pr = bolt11(1000 * 1000);
     stubFetch((url) => {
       if (url.includes('/.well-known/lnurlp/')) {
-        return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 100000000, commentAllowed: 0 } };
+        return {
+          json: {
+            tag: 'payRequest',
+            callback: 'https://blink.sv/cb',
+            minSendable: 1000,
+            maxSendable: 100000000,
+            commentAllowed: 0,
+            metadata: TEST_METADATA,
+          },
+        };
       }
       return { json: { pr, verify: 'https://blink.sv/verify/abc' } };
     });
@@ -200,8 +283,13 @@ describe('getInvoiceFromLightningAddress', () => {
   });
 
   it('rejects an amount below minSendable', async () => {
-    stubFetch(() => ({ json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 10000, maxSendable: 100000000 } }));
-    await assert.rejects(() => getInvoiceFromLightningAddress('alice@blink.sv', 1), (e) => e.code === 'AMOUNT_TOO_LOW');
+    stubFetch(() => ({
+      json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 10000, maxSendable: 100000000 },
+    }));
+    await assert.rejects(
+      () => getInvoiceFromLightningAddress('alice@blink.sv', 1),
+      (e) => e.code === 'AMOUNT_TOO_LOW',
+    );
   });
 });
 
@@ -254,7 +342,10 @@ describe('resolveReceiver', () => {
       if (url.includes('/graphql')) return { json: { data: { accountDefaultWallet: null } } };
       return { status: 404, json: {} };
     });
-    await assert.rejects(() => resolveReceiver('ghost@blink.sv', {}), (e) => e.code === 'RECEIVER_NOT_FOUND');
+    await assert.rejects(
+      () => resolveReceiver('ghost@blink.sv', {}),
+      (e) => e.code === 'RECEIVER_NOT_FOUND',
+    );
   });
 
   it('SSRF guard: rejects a non-blink.sv domain before any network call', async () => {
@@ -349,13 +440,48 @@ describe('resolveReceiver', () => {
     const r = await resolveReceiver('yasar@blink.sv', {});
     assert.equal(r.type, 'lnaddress');
   });
+
+  // The headline regression: an INACTIVE custodial account is not payable via
+  // the custodial API, but Blink still serves its Lightning address over LNURL.
+  // It must fall through to the LNURL branch, not be a hard probe failure.
+  it('falls back to lnaddress when the custodial probe reports "Account is inactive"', async () => {
+    stubFetch((url) => {
+      if (url.includes('/graphql')) {
+        return { json: { errors: [{ message: 'Account is inactive.' }] } };
+      }
+      return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 1e9 } };
+    });
+    const r = await resolveReceiver('openoms@blink.sv', {});
+    assert.equal(r.type, 'lnaddress');
+  });
+
+  // But a transient LNURL service failure after a clean custodial "null" must
+  // NOT become a confident RECEIVER_NOT_FOUND either.
+  it('propagates a transient LNURL service error instead of RECEIVER_NOT_FOUND', async () => {
+    stubFetch((url) => {
+      if (url.includes('/graphql')) return { json: { data: { accountDefaultWallet: null } } };
+      return { json: { status: 'ERROR', reason: 'temporarily overloaded' } };
+    });
+    await assert.rejects(
+      () => resolveReceiver('yasar@blink.sv', {}),
+      (e) => e.code === 'LNURL_SERVICE_ERROR',
+    );
+  });
 });
 
 // ── SSRF guard: assertAllowedUrl / isPrivateAddress ──────────────────────────
 
 describe('isPrivateAddress', () => {
   it('flags private, loopback and link-local IPv4', () => {
-    for (const ip of ['10.0.0.1', '127.0.0.1', '172.16.5.4', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0']) {
+    for (const ip of [
+      '10.0.0.1',
+      '127.0.0.1',
+      '172.16.5.4',
+      '192.168.1.1',
+      '169.254.169.254',
+      '100.64.0.1',
+      '0.0.0.0',
+    ]) {
       assert.equal(isPrivateAddress(ip), true, `${ip} should be private`);
     }
   });
@@ -472,7 +598,15 @@ describe('LNURL host allowlist (per hop)', () => {
   it('refuses a LUD-21 verify URL pointing off-allowlist', async () => {
     stubFetch((url) => {
       if (url.includes('/.well-known/')) {
-        return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 1e9 } };
+        return {
+          json: {
+            tag: 'payRequest',
+            callback: 'https://blink.sv/cb',
+            minSendable: 1000,
+            maxSendable: 1e9,
+            metadata: TEST_METADATA,
+          },
+        };
       }
       return { json: { pr: bolt11(1000 * 1000), verify: 'https://attacker.example/verify/1' } };
     });
@@ -491,10 +625,7 @@ describe('LNURL host allowlist (per hop)', () => {
       () => fetchLnurlPayMetadata('alice', 'blink.sv', { allowedHosts: BLINK_ONLY, retries: 0 }),
       /redirect target from non-Blink host/,
     );
-    assert.ok(
-      !seen.some((u) => u.includes('attacker.example')),
-      'must not have fetched the redirect target',
-    );
+    assert.ok(!seen.some((u) => u.includes('attacker.example')), 'must not have fetched the redirect target');
   });
 
   it('refuses a redirect to a private address', async () => {
@@ -543,40 +674,83 @@ describe('LNURL host allowlist (per hop)', () => {
 
 // ── BOLT-11 binding ──────────────────────────────────────────────────────────
 
-describe('decodeBolt11Hrp', () => {
+describe('decodeBolt11', () => {
   it('decodes the multipliers against the BOLT-11 spec', () => {
-    // 1 BTC = 1e11 msat.
-    assert.equal(decodeBolt11Hrp(bolt11(100000000)).amountMsats, 100000000); // 1m  = 1e8 msat
-    assert.equal(decodeBolt11Hrp('lnbc1m' + '1' + 'pq'.repeat(6)).amountMsats, 100000000);
-    assert.equal(decodeBolt11Hrp('lnbc1u' + '1' + 'pq'.repeat(6)).amountMsats, 100000);
-    assert.equal(decodeBolt11Hrp('lnbc1n' + '1' + 'pq'.repeat(6)).amountMsats, 100);
-    assert.equal(decodeBolt11Hrp('lnbc10p' + '1' + 'pq'.repeat(6)).amountMsats, 1);
+    // 1 BTC = 1e11 msat. bolt11() builds a real invoice, so each multiplier is
+    // exercised through the full bech32 + HRP path.
+    assert.equal(decodeBolt11(bolt11(100000000)).amountMsats, 100000000); // 1m  = 1e8 msat
+    assert.equal(decodeBolt11(bolt11(100000)).amountMsats, 100000); // 1u  = 1e5 msat
+    assert.equal(decodeBolt11(bolt11(100)).amountMsats, 100); // 1n  = 1e2 msat
+    assert.equal(decodeBolt11(bolt11(1)).amountMsats, 1); // 10p = 1 msat
   });
 
   it('reads the network from the prefix', () => {
-    assert.equal(decodeBolt11Hrp(bolt11(1000, 'bc')).network, 'mainnet');
-    assert.equal(decodeBolt11Hrp(bolt11(1000, 'tb')).network, 'testnet');
-    assert.equal(decodeBolt11Hrp(bolt11(1000, 'bcrt')).network, 'regtest');
+    assert.equal(decodeBolt11(bolt11(1000, 'bc')).network, 'mainnet');
+    assert.equal(decodeBolt11(bolt11(1000, 'tb')).network, 'testnet');
+    assert.equal(decodeBolt11(bolt11(1000, 'bcrt')).network, 'regtest');
+  });
+
+  it('extracts the description-hash tag', () => {
+    assert.equal(decodeBolt11(bolt11(1000)).descriptionHash, TEST_METADATA_HASH);
   });
 
   it('returns null amount for an amountless invoice', () => {
-    assert.equal(decodeBolt11Hrp(bolt11(null)).amountMsats, null);
+    assert.equal(decodeBolt11(bolt11(null)).amountMsats, null);
+  });
+
+  it('rejects a corrupted checksum', () => {
+    const good = bolt11(1000);
+    // Flip one data character — the checksum must now fail.
+    const pos = good.lastIndexOf('1') + 3;
+    const flipped = good.slice(0, pos) + (good[pos] === 'q' ? 'p' : 'q') + good.slice(pos + 1);
+    assert.throws(() => decodeBolt11(flipped), /checksum mismatch/);
+  });
+
+  it('rejects a synthetic HRP-only string that has no valid checksum', () => {
+    // This is the fixture the earlier tests used, and exactly what the binding
+    // now exists to refuse.
+    assert.throws(() => decodeBolt11('lnbc10u1qqqqqq'), /checksum|bech32|data/);
+    assert.throws(() => decodeBolt11('lnbc10u1aaaaaaaa'), /checksum|bech32|data/);
   });
 
   it('rejects a non-invoice', () => {
-    assert.throws(() => decodeBolt11Hrp('lnbc10n1p...'), /bad bech32 data part/);
-    assert.throws(() => decodeBolt11Hrp('http://blink.sv'), /unrecognised prefix|separator/);
-    assert.throws(() => decodeBolt11Hrp(''), /Empty/);
+    assert.throws(() => decodeBolt11('lnbc10n1p...'), /bech32|invalid data/);
+    assert.throws(() => decodeBolt11('http://blink.sv'), /unrecognised prefix|separator/);
+    assert.throws(() => decodeBolt11(''), /Empty/);
   });
 
   it('rejects a sub-millisatoshi amount', () => {
-    assert.throws(() => decodeBolt11Hrp('lnbc1p' + '1' + 'pq'.repeat(6)), /sub-millisatoshi/);
+    // 1p = 0.1 msat is not a whole msat.
+    assert.throws(() => decodeBolt11('lnbc1p' + '1' + 'pq'.repeat(6)), /sub-millisatoshi|checksum|bech32/);
   });
 });
 
 describe('assertInvoiceMatches', () => {
   it('accepts an exact match', () => {
     assert.equal(assertInvoiceMatches(bolt11(1000000), { amountMsats: 1000000 }).amountMsats, 1000000);
+  });
+
+  it('accepts when the description hash matches the LUD-06 metadata', () => {
+    const inv = bolt11(1000000, 'bc', TEST_METADATA);
+    assert.doesNotThrow(() => assertInvoiceMatches(inv, { amountMsats: 1000000, metadata: TEST_METADATA }));
+  });
+
+  it('rejects when the description hash does NOT match the metadata', () => {
+    const inv = bolt11(1000000, 'bc', TEST_METADATA);
+    assert.throws(
+      () => assertInvoiceMatches(inv, { amountMsats: 1000000, metadata: '[["text/plain","different"]]' }),
+      /description hash does not match/,
+    );
+  });
+
+  it('rejects an invoice with no description-hash tag when metadata is required', () => {
+    // Build an invoice with no `h` tag.
+    const words = [...new Array(7).fill(0), ...new Array(104).fill(0)];
+    const inv = bech32.encode('lnbc10u', words, 2000);
+    assert.throws(
+      () => assertInvoiceMatches(inv, { amountMsats: 1000000, metadata: TEST_METADATA }),
+      /no description-hash/,
+    );
   });
 
   it('rejects an amount mismatch', () => {

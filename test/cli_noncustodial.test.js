@@ -112,6 +112,31 @@ describe('CLI: options reach the underlying script', () => {
     assert.match(stderr, /STUB_NETWORK=regtest/);
   });
 
+  // Review finding: an unset --network used to be defaulted to mainnet by the
+  // CLI registry and then clobbered the operator's SPARK_NETWORK=regtest. One
+  // precedence rule must hold everywhere: --network > SPARK_NETWORK > mainnet.
+  it('honours SPARK_NETWORK=regtest when no --network flag is given', async () => {
+    const { stderr, stdout } = await runCli(['spark-balance'], {
+      env: { SPARK_STUB_ECHO: '1', SPARK_NETWORK: 'regtest' },
+    });
+    assert.match(stderr, /STUB_NETWORK=regtest/);
+    assert.match(stdout, /"network":\s*"regtest"/);
+  });
+
+  it('an explicit --network overrides SPARK_NETWORK', async () => {
+    const { stderr } = await runCli(['spark-balance', '--network', 'mainnet'], {
+      env: { SPARK_STUB_ECHO: '1', SPARK_NETWORK: 'regtest' },
+    });
+    assert.match(stderr, /STUB_NETWORK=mainnet/);
+  });
+
+  it('defaults to mainnet only when neither flag nor env is set', async () => {
+    const env = { SPARK_STUB_ECHO: '1' };
+    delete process.env.SPARK_NETWORK;
+    const { stderr } = await runCli(['spark-balance'], { env });
+    assert.match(stderr, /STUB_NETWORK=mainnet/);
+  });
+
   it('forwards destination and amount to spark-send', async () => {
     const { stderr } = await runCli(['spark-send', 'lnbc100n1pabc', '1000', '--dry-run'], {
       env: { SPARK_STUB_ECHO: '1' },

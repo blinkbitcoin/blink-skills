@@ -191,7 +191,7 @@ function storageDirFor(mnemonic, network) {
 }
 
 /**
- * Verify the SDK's default storage backend can actually be instantiated.
+ * Verify the SDK's SQLite storage backend can actually be opened.
  *
  * The Node build of the Spark SDK stores wallet state in SQLite via
  * `better-sqlite3`, a NATIVE module that must be compiled at install time. When
@@ -201,32 +201,97 @@ function storageDirFor(mnemonic, network) {
  * everything looks installed — and each `spark-*` command instead fails deep
  * inside `connect()` with `Could not locate the bindings file`.
  *
- * Probing here converts that into one actionable error, before we have asked
- * for the seed.
+ * We do NOT probe the SDK's own `defaultStorage()` factory: in 0.23.1 that
+ * factory is lazy — it returns an object without opening a database, so the
+ * probe passes even when the native binding is absent, which is exactly the
+ * failure this preflight exists to catch. Instead we require `better-sqlite3`
+ * directly and open a database ourselves. `better-sqlite3` is already the
+ * SDK's own dependency, so this adds nothing new to the install.
  *
- * @param {object} mod        The loaded SDK module.
- * @param {string} storageDir
- * @throws {Error} If default storage cannot be created.
+ * @throws {Error} If the native binding cannot be required or a database cannot
+ *         be opened.
  */
-function assertStorageAvailable(mod, storageDir) {
-  if (typeof mod.defaultStorage !== 'function') return; // older SDK: nothing to probe
+function assertStorageAvailable() {
+  let betterSqlite3;
   try {
-    mod.defaultStorage(storageDir);
+    // Resolve from the SDK's own tree so we test the SAME copy the SDK will
+    // load, not a possibly-different hoisted one.
+    const sdkPath = require.resolve(SPARK_PACKAGE);
+    betterSqlite3 = require(require.resolve('better-sqlite3', { paths: [sdkPath] }));
   } catch (err) {
-    const e = new Error(
-      `The Breez Spark SDK is installed but its storage backend is not usable.\n` +
-        `${SPARK_PACKAGE} stores wallet state in SQLite through the native module\n` +
-        `\`better-sqlite3\`, which must be COMPILED during install.\n\n` +
-        `This usually means npm ran with --ignore-scripts, or the machine lacks a\n` +
-        `C++ toolchain. Fix with:\n` +
-        `    npm rebuild better-sqlite3\n` +
-        `or reinstall allowing build scripts to run:\n` +
-        `    npm install --foreground-scripts\n` +
-        `Building it requires python3, make and a C++ compiler (build-essential).\n` +
-        `Original storage error: ${err.message}`,
-    );
-    e.code = 'SPARK_STORAGE_UNAVAILABLE';
-    throw e;
+    // If we cannot even resolve the SDK package, the problem is the SDK install
+    // layout, not better-sqlite3's compilation — name it differently so the
+    // remediation isn't a rebuild that can't help.
+    if (err && err.code === 'MODULE_NOT_FOUND' && /breez-sdk-spark/.test(String(err.message))) {
+      const e = new Error(
+        `Could not resolve the Breez Spark SDK (${SPARK_PACKAGE}) to probe its storage backend. ` +
+          `Reinstall it: npm install ${SPARK_PACKAGE}. Original error: ${err.message}`,
+      );
+      e.code = 'SPARK_STORAGE_UNAVAILABLE';
+      throw e;
+    }
+    throw storageUnavailableError(err);
+  }
+
+  try {
+    const probe = new betterSqlite3(':memory:');
+    try {
+      probe.prepare('SELECT 1 AS ok').get();
+    } finally {
+      probe.close();
+    }
+  } catch (err) {
+    // The bindings file is missing or unloadable: present, but not compiled.
+    throw storageUnavailableError(err);
+  }
+}
+
+/**
+ * Build the actionable SPARK_STORAGE_UNAVAILABLE error. The remediation names
+ * the package-manager build-script approval step, because on pnpm/yarn and on
+ * npm with an install-scripts allowlist, a bare `npm rebuild` exits 0 while
+ * still not producing a usable binding — verify by opening a database, not by
+ * trusting the rebuild exit code.
+ *
+ * @param {Error} err
+ * @returns {Error}
+ */
+function storageUnavailableError(err) {
+  const e = new Error(
+    `The Breez Spark SDK is installed but its SQLite storage backend is not usable.\n` +
+      `${SPARK_PACKAGE} stores wallet state through the native module \`better-sqlite3\`,\n` +
+      `which must be COMPILED during install.\n\n` +
+      `This usually means the install ran without build scripts enabled. Approve and\n` +
+      `run the build for your package manager, then VERIFY it by opening a database —\n` +
+      `a rebuild can exit 0 while still not producing a working binding:\n` +
+      `    npm:    npm rebuild better-sqlite3   (if scripts were blocked, allow them)\n` +
+      `    pnpm:   pnpm approve-builds  then  pnpm rebuild better-sqlite3\n` +
+      `    yarn:   yarn rebuild better-sqlite3\n` +
+      `Building requires python3, make and a C++ compiler (build-essential).\n` +
+      `Original storage error: ${err.message}`,
+  );
+  e.code = 'SPARK_STORAGE_UNAVAILABLE';
+  return e;
+}
+
+/**
+ * Create the wallet-state dir owner-only and repair an existing permissive one.
+ *
+ * Without `mode`, mkdirSync honours the umask (0775 under a typical 022), so
+ * group users could traverse or modify state belonging to a seed-controlled
+ * Bitcoin wallet. chmod unconditionally so a dir created permissively by an
+ * earlier run is tightened on the next connect.
+ *
+ * @param {string} dir
+ */
+function ensureOwnerOnlyDir(dir) {
+  const fs = require('fs');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // chmod may be unsupported (some network filesystems); mkdir mode is the
+    // best effort there.
   }
 }
 
@@ -247,11 +312,10 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
   config.apiKey = apiKey;
 
   const storageDir = storageDirFor(mnemonic, network);
-  // Ensure the storage dir exists.
-  require('fs').mkdirSync(storageDir, { recursive: true });
+  ensureOwnerOnlyDir(storageDir);
 
   // Fail fast with a build-tools message rather than an opaque bindings error.
-  assertStorageAvailable(mod, storageDir);
+  assertStorageAvailable();
 
   const sdk = await mod.connect({
     config,
@@ -360,6 +424,7 @@ module.exports = {
   getMnemonic,
   getBreezApiKey,
   storageDirFor,
+  ensureOwnerOnlyDir,
   assertStorageAvailable,
   connect,
   normalizeInfo,

@@ -338,15 +338,25 @@ commands['fee-probe'] = {
 // non-custodial parity for balance / send / transactions / subscribe-updates.
 // Holding the seed grants spend authority — treat it as a secret.
 
+// ── Network precedence ───────────────────────────────────────────────────────
+// ONE rule, applied identically by all four Spark commands:
+//     explicit --network  >  SPARK_NETWORK  >  mainnet
+// The CLI does NOT default `network` to mainnet. If it did, that default would
+// silently override an operator's SPARK_NETWORK=regtest, routing what they
+// configured as safe testing onto the real-funds network. The scripts already
+// fall back `SPARK_NETWORK || 'mainnet'`, so the CLI only forwards a value when
+// the user actually supplied one.
+
 commands['spark-balance'] = {
   forceExit: true,
   description: '[non-custodial] Show a Spark account BTC balance via the Breez SDK (requires SPARK_MNEMONIC)',
   args: [],
-  options: { network: { type: 'string', default: 'mainnet' } },
+  options: { network: { type: 'string' } },
   optMeta: { network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' } },
   examples: ['blink spark-balance'],
   action: async (pos, opts) => {
-    process.env.SPARK_NETWORK = opts.network;
+    // Only override the environment when the user passed --network explicitly.
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
     setProcessArgv([]);
     const { main } = require(path.join(scriptsDir, 'spark_balance.js'));
     await main();
@@ -366,7 +376,7 @@ commands['spark-send'] = {
   ],
   options: {
     'dry-run': { type: 'boolean', default: false },
-    network: { type: 'string', default: 'mainnet' },
+    network: { type: 'string' },
   },
   optMeta: {
     'dry-run': { description: 'Prepare & show fees without sending' },
@@ -378,7 +388,10 @@ commands['spark-send'] = {
     'blink spark-send alice@blink.sv 1000 --dry-run',
   ],
   action: async (pos, opts) => {
-    const argv = [String(pos[0]), String(pos[1]), '--network', opts.network];
+    const argv = [String(pos[0]), String(pos[1])];
+    // Forward --network only when explicitly given; otherwise the script falls
+    // back to SPARK_NETWORK, so an unset flag cannot clobber the env.
+    if (opts.network !== undefined) argv.push('--network', opts.network);
     if (opts['dry-run']) argv.push('--dry-run');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_send.js'));
@@ -392,7 +405,7 @@ commands['spark-transactions'] = {
   args: [],
   options: {
     limit: { type: 'string', default: '20' },
-    network: { type: 'string', default: 'mainnet' },
+    network: { type: 'string' },
   },
   optMeta: {
     limit: { description: 'Max number of payments to return', valueName: 'n' },
@@ -400,7 +413,7 @@ commands['spark-transactions'] = {
   },
   examples: ['blink spark-transactions', 'blink spark-transactions --limit 50'],
   action: async (pos, opts) => {
-    process.env.SPARK_NETWORK = opts.network;
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
     const limit = parsePositiveInt(opts.limit, '--limit');
     setProcessArgv(['--limit', String(limit)]);
     const { main } = require(path.join(scriptsDir, 'spark_transactions.js'));
@@ -414,7 +427,7 @@ commands['spark-subscribe'] = {
   args: [],
   options: {
     timeout: { type: 'string', default: '300' },
-    network: { type: 'string', default: 'mainnet' },
+    network: { type: 'string' },
   },
   optMeta: {
     timeout: { description: 'Timeout in seconds (0 = run until interrupted)', valueName: 'seconds' },
@@ -422,7 +435,7 @@ commands['spark-subscribe'] = {
   },
   examples: ['blink spark-subscribe', 'blink spark-subscribe --timeout 60'],
   action: async (pos, opts) => {
-    process.env.SPARK_NETWORK = opts.network;
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
     const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
     setProcessArgv(['--timeout', String(timeout)]);
     const { main } = require(path.join(scriptsDir, 'spark_subscribe.js'));

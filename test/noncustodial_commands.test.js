@@ -143,11 +143,25 @@ function mockSparkSdk(fakeSdk, { onDisconnect } = {}) {
   };
 }
 
-/** A BOLT-11 whose HRP encodes `msats`. See test/lnurl.test.js for the rules. */
-function bolt11(msats, prefix = 'bc') {
-  const data = '1' + 'pq'.repeat(12);
-  if (msats % 100 === 0) return `ln${prefix}${msats / 100}n${data}`;
-  return `ln${prefix}${msats * 10}p${data}`;
+/** Real BOLT-11 invoices — the binding now checks the checksum and the LUD-06
+ * description-hash, so synthetic HRP-only strings no longer pass. */
+const { bech32 } = require('bech32');
+const crypto = require('node:crypto');
+
+const TEST_METADATA = '[["text/plain","pay alice"]]';
+
+function bolt11(msats, prefix = 'bc', metadata = TEST_METADATA) {
+  const hrp = `ln${prefix}${msats % 100 === 0 ? msats / 100 + 'n' : msats * 10 + 'p'}`;
+  const hash = crypto.createHash('sha256').update(metadata, 'utf8').digest();
+  const words = [
+    ...new Array(7).fill(0),
+    23,
+    (52 >> 5) & 31,
+    52 & 31,
+    ...bech32.toWords(hash),
+    ...new Array(104).fill(0),
+  ];
+  return bech32.encode(hrp, words, 2000);
 }
 
 // ── create-invoice-lnaddress ─────────────────────────────────────────────────
@@ -166,6 +180,7 @@ describe('create_invoice_lnaddress main()', () => {
         return {
           json: {
             tag: 'payRequest',
+            metadata: TEST_METADATA,
             callback: 'https://blink.sv/cb',
             minSendable: 1000,
             maxSendable: 1e9,
@@ -206,6 +221,7 @@ describe('create_invoice_lnaddress main()', () => {
         return {
           json: {
             tag: 'payRequest',
+            metadata: TEST_METADATA,
             callback: 'https://blink.sv/cb',
             minSendable: 1000,
             maxSendable: 1e9,
@@ -246,7 +262,13 @@ describe('create_invoice_lnaddress main()', () => {
       if (url.includes('/graphql')) return { json: { errors: [{ message: 'Account does not exist for username' }] } };
       if (url.includes('/.well-known/lnurlp/')) {
         return {
-          json: { tag: 'payRequest', callback: 'https://attacker.example/cb', minSendable: 1, maxSendable: 1e9 },
+          json: {
+            tag: 'payRequest',
+            metadata: TEST_METADATA,
+            callback: 'https://attacker.example/cb',
+            minSendable: 1,
+            maxSendable: 1e9,
+          },
         };
       }
       return { json: { pr: PR } };
@@ -261,7 +283,15 @@ describe('create_invoice_lnaddress main()', () => {
     stubFetch((url) => {
       if (url.includes('/graphql')) return { json: { errors: [{ message: 'Account does not exist' }] } };
       if (url.includes('/.well-known/lnurlp/')) {
-        return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 1e9 } };
+        return {
+          json: {
+            tag: 'payRequest',
+            metadata: TEST_METADATA,
+            callback: 'https://blink.sv/cb',
+            minSendable: 1000,
+            maxSendable: 1e9,
+          },
+        };
       }
       if (url.includes('/verify/')) {
         return { json: { status: 'OK', settled: true, preimage: 'deadbeef', pr: PR } };
@@ -281,7 +311,15 @@ describe('create_invoice_lnaddress main()', () => {
     stubFetch((url) => {
       if (url.includes('/graphql')) return { json: { errors: [{ message: 'Account does not exist' }] } };
       if (url.includes('/.well-known/lnurlp/')) {
-        return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 1e9 } };
+        return {
+          json: {
+            tag: 'payRequest',
+            metadata: TEST_METADATA,
+            callback: 'https://blink.sv/cb',
+            minSendable: 1000,
+            maxSendable: 1e9,
+          },
+        };
       }
       if (url.includes('/verify/')) return { json: { status: 'OK', settled: false } };
       return { json: { pr: PR, verify: 'https://blink.sv/verify/abc' } };
@@ -300,7 +338,15 @@ describe('create_invoice_lnaddress main()', () => {
     stubFetch((url) => {
       if (url.includes('/graphql')) return { json: { errors: [{ message: 'Account does not exist' }] } };
       if (url.includes('/.well-known/lnurlp/')) {
-        return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1000, maxSendable: 1e9 } };
+        return {
+          json: {
+            tag: 'payRequest',
+            metadata: TEST_METADATA,
+            callback: 'https://blink.sv/cb',
+            minSendable: 1000,
+            maxSendable: 1e9,
+          },
+        };
       }
       if (url.includes('/verify/')) {
         return { json: { status: 'OK', settled: true, pr: bolt11(9999 * 1000) } };
@@ -323,7 +369,15 @@ describe('create_invoice_lnaddress main()', () => {
   it('propagates a custodial-probe outage instead of guessing', async () => {
     stubFetch((url) => {
       if (url.includes('/graphql')) return { status: 503, json: {} };
-      return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1, maxSendable: 1e9 } };
+      return {
+        json: {
+          tag: 'payRequest',
+          metadata: TEST_METADATA,
+          callback: 'https://blink.sv/cb',
+          minSendable: 1,
+          maxSendable: 1e9,
+        },
+      };
     });
     await assert.rejects(
       () => runScript('create_invoice_lnaddress.js', ['alice@blink.sv', '1000', '--no-verify']),
@@ -351,7 +405,15 @@ describe('resolve_receiver main()', () => {
   it('emits a non-custodial classification', async () => {
     stubFetch((url) => {
       if (url.includes('/graphql')) return { json: { data: { accountDefaultWallet: null } } };
-      return { json: { tag: 'payRequest', callback: 'https://blink.sv/cb', minSendable: 1, maxSendable: 1e9 } };
+      return {
+        json: {
+          tag: 'payRequest',
+          metadata: TEST_METADATA,
+          callback: 'https://blink.sv/cb',
+          minSendable: 1,
+          maxSendable: 1e9,
+        },
+      };
     });
     const r = await runScript('resolve_receiver.js', ['alice@blink.sv']);
     assert.equal(r.json().type, 'lnaddress');

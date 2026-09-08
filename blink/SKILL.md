@@ -2,7 +2,7 @@
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, and L402 auto-pay client via the Blink API. All output is JSON.
 version: 2.0.0
-repository: https://github.com/blinkbitcoin/blink-skill
+repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
@@ -20,10 +20,22 @@ metadata:
       # states its own requirement — BLINK_API_KEY for custodial operations,
       # SPARK_MNEMONIC + BREEZ_API_KEY for the seed-gated spark-* commands.
       bins: [node]
-    optionalEnv: [BLINK_API_KEY, BLINK_API_URL, BLINK_WS_URL, BLINK_L402_ROOT_KEY, BLINK_BUDGET_HOURLY_SATS, BLINK_BUDGET_DAILY_SATS, BLINK_L402_ALLOWED_DOMAINS, SPARK_MNEMONIC, BREEZ_API_KEY, SPARK_NETWORK]
+    optionalEnv:
+      [
+        BLINK_API_KEY,
+        BLINK_API_URL,
+        BLINK_WS_URL,
+        BLINK_L402_ROOT_KEY,
+        BLINK_BUDGET_HOURLY_SATS,
+        BLINK_BUDGET_DAILY_SATS,
+        BLINK_L402_ALLOWED_DOMAINS,
+        SPARK_MNEMONIC,
+        BREEZ_API_KEY,
+        SPARK_NETWORK,
+      ]
     primaryEnv: BLINK_API_KEY
     emoji: '⚡'
-    homepage: 'https://github.com/blinkbitcoin/blink-skill'
+    homepage: 'https://github.com/blinkbitcoin/blink-skills'
     security:
       secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
       network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands only'
@@ -55,10 +67,12 @@ commands). Key concepts:
 
 ## Environment
 
-- Requires `bash` and Node.js 18+.
-- Requires `BLINK_API_KEY` environment variable with appropriate scopes.
-- For WebSocket subscriptions: Node 22+ (native) or Node 20+ with `--experimental-websocket`.
-- Zero runtime npm dependencies. Only Node.js built-in modules are used (`node:util`, `node:fs`, `node:path`, `node:child_process`).
+- Requires `bash` and Node.js 18+ (Node 22+ for the non-custodial `spark-*` commands and for WebSocket subscriptions; Node 20+ can use `--experimental-websocket`).
+- **Credentials depend on the command** — no single env var is required skill-wide:
+  - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
+  - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+- **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
 
@@ -112,7 +126,7 @@ No filesystem fallback: shell rc files (`~/.bashrc`, `~/.profile`, etc.) are nev
 
 ### Optional: CLI wrapper (full GitHub repo only)
 
-If you have cloned the [full GitHub repo](https://github.com/blinkbitcoin/blink-skill), you can optionally install a `blink` CLI command:
+If you have cloned the [full GitHub repo](https://github.com/blinkbitcoin/blink-skills), you can optionally install a `blink` CLI command:
 
 ```bash
 npm install   # install dev dependencies (eslint, prettier)
@@ -1166,11 +1180,11 @@ Prevent runaway spending in autonomous agent workflows with rolling spend limits
 
 Env vars take precedence over the config file (`~/.blink/budget.json`):
 
-| Env var | Config file key | Default | Description |
-|---------|----------------|---------|-------------|
-| `BLINK_BUDGET_HOURLY_SATS` | `hourlyLimitSats` | none | Max sats in rolling 1-hour window |
-| `BLINK_BUDGET_DAILY_SATS` | `dailyLimitSats` | none | Max sats in rolling 24-hour window |
-| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist` | none | Comma-separated domains for L402 auto-pay |
+| Env var                      | Config file key   | Default | Description                               |
+| ---------------------------- | ----------------- | ------- | ----------------------------------------- |
+| `BLINK_BUDGET_HOURLY_SATS`   | `hourlyLimitSats` | none    | Max sats in rolling 1-hour window         |
+| `BLINK_BUDGET_DAILY_SATS`    | `dailyLimitSats`  | none    | Max sats in rolling 24-hour window        |
+| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist`       | none    | Comma-separated domains for L402 auto-pay |
 
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:
@@ -1254,6 +1268,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### Stateless Design
 
 Most scripts are stateless. Exceptions:
+
 - `l402-pay` maintains a token cache at `~/.blink/l402-tokens.json` to avoid re-paying for previously-accessed L402 services. Use `--no-store` to run without any persistence.
 - All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
 
