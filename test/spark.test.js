@@ -783,11 +783,11 @@ describe('spark_send budget integration', () => {
 
   before(() => {
     // The mocked routing tests above also record spends; start this suite clean.
-    budget.resetLog();
+    budget.resetLog({ force: true });
   });
 
   beforeEach(() => {
-    budget.resetLog();
+    budget.resetLog({ force: true });
     try {
       fs.unlinkSync(budget.CONFIG_FILE);
     } catch {
@@ -838,7 +838,7 @@ describe('spark_send budget integration', () => {
     } catch {
       /* no config was written */
     }
-    budget.resetLog();
+    budget.resetLog({ force: true });
   });
 
   async function runMain(argv) {

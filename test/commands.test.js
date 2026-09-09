@@ -8,18 +8,23 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 // ── Shared test infrastructure ───────────────────────────────────────────────
 
 const clientPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_blink_client.js');
+const budgetPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_budget.js');
 const scriptsDir = path.resolve(__dirname, '..', 'blink', 'scripts');
 
 /**
  * Require a script fresh (bust require cache chain) so each test starts clean.
  */
 function freshRequire(scriptName) {
-  // Bust the client and the script so they re-bind
+  // Bust the client, the budget module (BLINK_DIR binds at load time and must
+  // see the patched homedir from setupTestEnv), and the script so they re-bind
   delete require.cache[require.resolve(clientPath)];
+  delete require.cache[require.resolve(budgetPath)];
   const scriptPath = path.join(scriptsDir, scriptName);
   delete require.cache[require.resolve(scriptPath)];
   return require(scriptPath);
@@ -47,6 +52,9 @@ function createMockFetch(handlers) {
 
 /**
  * Set up the test environment: mock env vars, suppress console, capture stdout.
+ * INVARIANT: homedir is redirected to a throwaway dir for the duration, so
+ * budget-integrated payment commands (recordSpend/reservations) can never
+ * write fake spends into the developer's real ~/.blink.
  */
 function setupTestEnv() {
   const originalEnv = { ...process.env };
@@ -54,6 +62,10 @@ function setupTestEnv() {
   const originalStdout = console.log;
   const originalStderr = console.error;
   const originalFetch = global.fetch;
+  const originalHomedir = os.homedir;
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-commands-test-'));
+
+  os.homedir = () => tmpHome;
 
   process.env.BLINK_API_KEY = 'blink_test_key_123';
   process.env.BLINK_API_URL = 'https://api.test.blink.sv/graphql';
@@ -81,6 +93,12 @@ function setupTestEnv() {
       console.log = originalStdout;
       console.error = originalStderr;
       global.fetch = originalFetch;
+      os.homedir = originalHomedir;
+      try {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
     },
   };
 }

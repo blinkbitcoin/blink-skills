@@ -410,19 +410,6 @@ describe('recordSpend and log pruning', () => {
     assert.equal(mod.readLog().length, 1, 'the renamed log is valid JSON with the entry');
   });
 
-  it('breaks a stale lock left by a crashed process and still records', () => {
-    fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    const lock = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
-    fs.writeFileSync(lock, '', 'utf8');
-    // Backdate far past the staleness threshold so the lock is immediately broken.
-    const old = new Date(Date.now() - 60_000);
-    fs.utimesSync(lock, old, old);
-    mod.recordSpend({ sats: 7, command: 'stale-lock-test' });
-    const log = mod.readLog();
-    assert.equal(log.length, 1, 'the stale lock must not wedge recording');
-    assert.equal(fs.existsSync(lock), false, 'the broken lock must be released');
-  });
-
   it('releases the lock after a successful record', () => {
     const lock = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
     mod.recordSpend({ sats: 3, command: 'lock-release-test' });
@@ -449,7 +436,7 @@ describe('spending-log lock ownership', () => {
     cleanupTempDir();
   });
   afterEach(() => {
-    mod.setLockTiming({ acquireTimeoutMs: 2000, staleMs: 5000 });
+    mod.setLockTiming({ acquireTimeoutMs: 2000 });
     try {
       fs.rmSync(lockPath, { force: true });
     } catch {
@@ -462,16 +449,23 @@ describe('spending-log lock ownership', () => {
     }
   });
 
-  it('throws BUDGET_LOCK_TIMEOUT against a live foreign lock and never deletes it', () => {
-    mod.setLockTiming({ acquireTimeoutMs: 60, staleMs: 60_000 });
+  it('fails closed with a recovery hint when the lock is held too long (no stale takeover)', () => {
+    mod.setLockTiming({ acquireTimeoutMs: 60 });
     fs.mkdirSync(path.dirname(lockPath), { recursive: true });
     fs.writeFileSync(lockPath, 'foreign-owner', 'utf8');
-    assert.throws(
-      () => mod.recordSpend({ sats: 1, command: 'x' }),
-      (e) => e.code === 'BUDGET_LOCK_TIMEOUT',
-      'refusing to mutate the log unlocked must be loud, not fail-open',
-    );
-    assert.equal(fs.readFileSync(lockPath, 'utf8'), 'foreign-owner', 'the foreign lock must survive');
+    try {
+      assert.throws(
+        () => mod.recordSpend({ sats: 1, command: 'x' }),
+        (e) =>
+          e.code === 'BUDGET_LOCK_TIMEOUT' &&
+          /remove it manually/.test(e.message) &&
+          e.message.includes('.spending-log.lock'),
+        'the operator must be told how to recover from a crashed lock holder',
+      );
+      assert.equal(fs.readFileSync(lockPath, 'utf8'), 'foreign-owner', 'no automatic unlink, stale or not');
+    } finally {
+      fs.rmSync(lockPath, { force: true });
+    }
   });
 
   it('releaseLogLock never deletes a lock acquired by someone else', () => {
@@ -480,36 +474,9 @@ describe('spending-log lock ownership', () => {
     try {
       fs.writeFileSync(lockPath, 'successor-owner', 'utf8'); // takeover while we hold
       mod.releaseLogLock(token);
-      assert.equal(
-        fs.readFileSync(lockPath, 'utf8'),
-        'successor-owner',
-        'a slow holder declared stale must not unlink its replacement',
-      );
+      assert.equal(fs.readFileSync(lockPath, 'utf8'), 'successor-owner', 'a holder must never unlink a successor lock');
     } finally {
       fs.rmSync(lockPath, { force: true });
-    }
-  });
-
-  it('throws BUDGET_LOCK_UNLINK_FAILED instead of spinning when a stale lock cannot be broken', () => {
-    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-    fs.writeFileSync(lockPath, 'crashed-process', 'utf8');
-    const old = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath, old, old); // unmistakably stale
-
-    const realUnlink = fs.unlinkSync;
-    fs.unlinkSync = () => {
-      const err = new Error('EACCES: immutable file');
-      err.code = 'EACCES';
-      throw err;
-    };
-    try {
-      assert.throws(
-        () => mod.recordSpend({ sats: 1, command: 'x' }),
-        (e) => e.code === 'BUDGET_LOCK_UNLINK_FAILED',
-        'an unlink that keeps failing must surface, not spin forever',
-      );
-    } finally {
-      fs.unlinkSync = realUnlink;
     }
   });
 });
@@ -617,33 +584,37 @@ describe('reserveBudget / finalizeReservation / releaseReservation', () => {
     );
   });
 
-  it('resetLog clears reservations too and returns the count', () => {
+  it('reset preserves active reservations: a concurrent payment cannot reuse the freed window', () => {
     mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
-    mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
-    mod.recordSpend({ sats: 10, command: 'y' });
-    assert.equal(mod.resetLog(), 2);
-    assert.deepEqual(mod.readLog(), []);
+    const a = mod.reserveBudget({ sats: 100, command: 'payment-a' }, { requireConfigured: false });
+    assert.equal(a.allowed, true);
+    const { removed, keptReserved } = mod.resetLog();
+    assert.equal(removed, 0, 'nothing finalized to remove');
+    assert.equal(keptReserved, 1, 'the in-flight reservation must survive an ordinary reset');
+    const b = mod.reserveBudget({ sats: 100, command: 'payment-b' }, { requireConfigured: false });
+    assert.equal(b.allowed, false, 'the limit must still protect the in-flight payment after reset');
+    assert.equal(mod.finalizeOrRecord(a.id, { sats: 100, command: 'payment-a' }), 'finalized');
+    assert.equal(mod.readLog().length, 1);
   });
 
-  it('finalizeOrRecord restores the spend when the reservation was erased by a reset', () => {
+  it('reset --force clears everything, and the in-flight finalize is restored afterwards', () => {
     mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
-    const r = mod.reserveBudget({ sats: 60, command: 'in-flight' }, { requireConfigured: false });
-    mod.resetLog(); // operator clears while the payment is in flight
-    const outcome = mod.finalizeOrRecord(r.id, { sats: 60, command: 'in-flight', domain: null });
-    assert.equal(outcome, 'restored');
-    const log = mod.readLog();
-    assert.equal(log.length, 1, 'the settled payment must be recorded even after a reset');
-    assert.equal(log[0].sats, 60);
-    assert.equal(log[0].state, undefined, 'restored entries are normal spends, not reservations');
+    const a = mod.reserveBudget({ sats: 100, command: 'payment-a' }, { requireConfigured: false });
+    const { removed, keptReserved } = mod.resetLog({ force: true });
+    assert.deepEqual({ removed, keptReserved }, { removed: 1, keptReserved: 0 });
+    // Documented consequence: the freed window can now be reserved by someone else.
+    assert.equal(mod.reserveBudget({ sats: 100, command: 'payment-b' }, { requireConfigured: false }).allowed, true);
+    const outcome = mod.finalizeOrRecord(a.id, { sats: 100, command: 'payment-a' });
+    assert.equal(outcome, 'restored', 'the settled payment must still be recorded after a force reset');
   });
 
-  it('finalizeOrRecord on a live reservation finalizes it', () => {
+  it('finalizeOrRecord is idempotent: a retry with the same id appends no duplicate', () => {
     mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
     const r = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
     assert.equal(mod.finalizeOrRecord(r.id, { sats: 60, command: 'x' }), 'finalized');
+    assert.equal(mod.finalizeOrRecord(r.id, { sats: 60, command: 'x' }), 'finalized');
     const log = mod.readLog();
-    assert.equal(log.length, 1);
-    assert.equal(log[0].state, undefined);
+    assert.equal(log.length, 1, 'a retried finalize must not double-count the spend');
   });
 
   it('finalizeOrRecord with a null id is a no-op', () => {
@@ -761,7 +732,7 @@ describe('getLog and resetLog', () => {
     assert.equal(entries.length, 5);
   });
 
-  it('resetLog clears all entries and returns count', () => {
+  it('resetLog clears finalized entries and returns counts', () => {
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
     fs.writeFileSync(
       mod.LOG_FILE,
@@ -770,8 +741,9 @@ describe('getLog and resetLog', () => {
         { ts: Date.now(), sats: 2, command: 'test' },
       ]),
     );
-    const removed = mod.resetLog();
+    const { removed, keptReserved } = mod.resetLog();
     assert.equal(removed, 2);
+    assert.equal(keptReserved, 0);
     assert.equal(mod.readLog().length, 0);
   });
 });

@@ -803,11 +803,17 @@ async function main() {
   if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
     // PENDING is in flight: count it against the budget like the one-shot pay
     // commands do, then surface the failure — the preimage will not resolve.
+    // Same warn-on-restored / warn-on-throw accounting as the normal record path.
     if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
       try {
-        finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
-      } catch {
-        /* recording failure after a moving payment is warned about below-equivalently; keep going */
+        const outcome = finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } catch (err) {
+        console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
       }
       reservationId = null;
     } else {
@@ -817,6 +823,14 @@ async function main() {
   }
 
   console.error(`Payment ${payResult.status === 'ALREADY_PAID' ? 'already paid' : 'successful'}!`);
+
+  // ALREADY_PAID means THIS invocation moved no funds — release the current
+  // reservation instead of finalizing it (pay_invoice releases for the same
+  // status; finalizing here would double-count the invoice against the budget).
+  if (payResult.status === 'ALREADY_PAID') {
+    releaseReservationQuietly();
+    reservationId = null;
+  }
 
   // ── Resolve preimage ──
   // Option A (primary): preImage returned inline via settlementVia in the mutation response.
@@ -876,7 +890,8 @@ async function main() {
   // (nothing was reserved), record the spend directly so the log stays
   // complete for unconfigured users too. finalizeOrRecord restores the entry
   // if the reservation was erased externally (e.g. by `budget reset`).
-  if (satoshis !== null) {
+  // ALREADY_PAID is excluded above (nothing moved this invocation).
+  if (satoshis !== null && payResult.status === 'SUCCESS') {
     try {
       if (reservationId) {
         const outcome = finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });

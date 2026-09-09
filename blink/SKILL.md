@@ -1423,7 +1423,8 @@ blink budget status                              # Show current spend vs limits
 blink budget set --hourly 1000 --daily 5000      # Set spending limits
 blink budget set --off                           # Remove all limits
 blink budget log [--last 10]                     # Show recent spending entries
-blink budget reset                               # Clear spending history (also clears active reservations)
+blink budget reset                               # Clear finalized history (keeps active reservations)
+blink budget reset --force                       # Clear EVERYTHING incl. reservations — unsafe mid-payment
 blink budget allowlist list                      # Show allowed L402 domains
 blink budget allowlist add satring.com           # Add domain to allowlist
 blink budget allowlist remove satring.com        # Remove domain from allowlist
@@ -1460,7 +1461,8 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
-- **`budget reset` and in-flight reservations:** reset clears everything, including active reservations. If a payment that was reserved before the reset later completes, the spend is re-recorded (accounting restored), but the freed allowance could briefly be reused by a concurrent payment. Do not reset while payments are in flight.
+- **`budget reset` and in-flight reservations:** an ordinary reset clears finalized history but **keeps active reservations**, so a payment in flight never reopens its allowance window. `budget reset --force` clears everything (the escape hatch for wedged reservations); if a force-cleared payment later completes, its spend is re-recorded — but the freed allowance can briefly be reused, so never force-reset while payments are in flight.
+- **Lock recovery:** budget mutations hold a lockfile at `~/.blink/.spending-log.lock` (max a few seconds each). If a crashed process leaves it behind, commands time out with a `BUDGET_LOCK_TIMEOUT` error — remove the file manually; automatic stale takeover is deliberately not attempted.
 
 > **AGENT:** Before making a payment, check budget status with `blink budget status` to see remaining budget. If budget is exceeded, inform the user and suggest increasing limits with `blink budget set`.
 

@@ -1514,6 +1514,38 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     }
   });
 
+  it('ALREADY_PAID records NO new spend (nothing moved this invocation) and still recovers the token', async () => {
+    configureAutoPay();
+    // The preimage flow must still work for ALREADY_PAID: the retry uses the
+    // previously-paid token, so the paymentHash-based fallback path runs.
+    mockPayment({ status: 'ALREADY_PAID' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'an ALREADY_PAID invoice must not double-count against the budget');
+  });
+
+  it('PENDING finalization failures warn on stderr instead of being swallowed', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING' });
+    // Make the accounting write fail, and capture stderr to prove the warning.
+    const budget = require(budgetPath);
+    const savedFinalize = budget.finalizeOrRecord;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.finalizeOrRecord = () => {
+      throw new Error('disk full');
+    };
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.finalizeOrRecord = savedFinalize;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /could not record the in-flight payment in the budget log.*disk full/s);
+  });
+
   it('dry-run still reports an undecodable amount instead of refusing', async () => {
     mock402(INVOICE_NO_AMOUNT);
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);

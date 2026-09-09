@@ -7,7 +7,8 @@
  *   node budget.js set --hourly <sats> --daily <sats>   Set spending limits
  *   node budget.js set --off                      Remove all spending limits
  *   node budget.js log [--last <n>]               Show recent spending entries
- *   node budget.js reset                          Clear spending history
+ *   node budget.js reset                          Clear spending history (keeps active reservations)
+ *   node budget.js reset --force                  Clear everything, incl. active reservations (unsafe mid-payment)
  *   node budget.js allowlist list                 Show allowed L402 domains
  *   node budget.js allowlist add <domain>         Add domain to allowlist
  *   node budget.js allowlist remove <domain>      Remove domain from allowlist
@@ -23,15 +24,7 @@
 
 'use strict';
 
-const {
-  getConfig,
-  writeConfig,
-  getStatus,
-  getLog,
-  resetLog,
-  CONFIG_FILE,
-  LOG_FILE,
-} = require('./_budget');
+const { getConfig, writeConfig, getStatus, getLog, resetLog, CONFIG_FILE, LOG_FILE } = require('./_budget');
 
 function main() {
   const args = process.argv.slice(2);
@@ -43,7 +36,7 @@ function main() {
     console.error('  blink budget set --hourly <sats> --daily <sats>');
     console.error('  blink budget set --off');
     console.error('  blink budget log [--last <n>]');
-    console.error('  blink budget reset');
+    console.error('  blink budget reset [--force]');
     console.error('  blink budget allowlist list|add|remove <domain>');
     process.exit(1);
   }
@@ -62,11 +55,19 @@ function main() {
         const fs = require('node:fs');
         const content = fs.readFileSync(CONFIG_FILE, 'utf8');
         existing = JSON.parse(content);
-      } catch { /* no existing config */ }
+      } catch {
+        /* no existing config */
+      }
       const preserved = existing.allowlist ? { allowlist: existing.allowlist } : {};
       writeConfig(preserved);
       console.error('Budget limits removed (allowlist preserved).');
-      console.log(JSON.stringify({ message: 'Budget limits removed. No spending limits enforced. Allowlist preserved.' }, null, 2));
+      console.log(
+        JSON.stringify(
+          { message: 'Budget limits removed. No spending limits enforced. Allowlist preserved.' },
+          null,
+          2,
+        ),
+      );
       return;
     }
 
@@ -147,12 +148,17 @@ function main() {
   }
 
   if (subcommand === 'reset') {
-    const removed = resetLog();
+    const force = args.includes('--force');
+    const { removed, keptReserved } = resetLog({ force });
     const output = {
       removed,
-      message: `Cleared ${removed} spending log entries.`,
+      keptReserved,
+      force,
+      message: force
+        ? `Cleared ${removed} spending log entries (including any active reservations — use only while no payments are in flight).`
+        : `Cleared ${removed} spending log entries. Kept ${keptReserved} active reservation(s); use --force to clear those too (unsafe while payments run).`,
     };
-    console.error(`Cleared ${removed} spending log entries.`);
+    console.error(output.message);
     console.log(JSON.stringify(output, null, 2));
     return;
   }
@@ -167,9 +173,10 @@ function main() {
         allowlist: config.allowlist,
         count: config.allowlist.length,
         source: envOverride ? 'BLINK_L402_ALLOWED_DOMAINS env var' : 'config file',
-        message: config.allowlist.length === 0
-          ? 'No domain restrictions — all domains allowed for L402 auto-pay.'
-          : `${config.allowlist.length} domain(s) allowed for L402 auto-pay.`,
+        message:
+          config.allowlist.length === 0
+            ? 'No domain restrictions — all domains allowed for L402 auto-pay.'
+            : `${config.allowlist.length} domain(s) allowed for L402 auto-pay.`,
       };
       console.log(JSON.stringify(output, null, 2));
       return;
@@ -193,9 +200,7 @@ function main() {
         // No existing config
       }
 
-      const allowlist = Array.isArray(existing.allowlist)
-        ? existing.allowlist.map((d) => d.toLowerCase().trim())
-        : [];
+      const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist.map((d) => d.toLowerCase().trim()) : [];
 
       if (allowlist.includes(normalized)) {
         console.error(`Domain ${normalized} is already in the allowlist.`);
@@ -230,9 +235,7 @@ function main() {
         // No existing config
       }
 
-      const allowlist = Array.isArray(existing.allowlist)
-        ? existing.allowlist.map((d) => d.toLowerCase().trim())
-        : [];
+      const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist.map((d) => d.toLowerCase().trim()) : [];
 
       const idx = allowlist.indexOf(normalized);
       if (idx === -1) {

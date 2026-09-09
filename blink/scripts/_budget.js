@@ -98,13 +98,17 @@ function writeConfig(config) {
 const LOG_LOCK_FILE = path.join(BLINK_DIR, '.spending-log.lock');
 const crypto = require('node:crypto');
 
-// Separate knobs: how long a caller waits for a lock vs. how old a lock must
-// be before it is treated as abandoned by a crashed process. Mutable via
+// How long a caller waits for the lock before failing closed. Mutable via
 // setLockTiming so tests can exercise timeouts without real waits.
-const lockTiming = { acquireTimeoutMs: 2000, staleMs: 5000 };
-function setLockTiming({ acquireTimeoutMs, staleMs } = {}) {
+// NOTE: there is deliberately NO automatic stale takeover. Pathname-based
+// mtime staleness cannot validate ownership atomically (a successor can be
+// unlinked mid-takeover; an old owner can clobber a successor), and this repo
+// takes no native deps, so no OS-backed advisory lock is available. The safe
+// alternative — and the one reviewers recommended — is fail-closed on
+// timeout with explicit operator recovery (delete the lock file by hand).
+const lockTiming = { acquireTimeoutMs: 2000 };
+function setLockTiming({ acquireTimeoutMs } = {}) {
   if (acquireTimeoutMs !== undefined) lockTiming.acquireTimeoutMs = acquireTimeoutMs;
-  if (staleMs !== undefined) lockTiming.staleMs = staleMs;
 }
 
 /**
@@ -125,16 +129,16 @@ function sleepSync(ms) {
 /**
  * Acquire an inter-process lock for spending-log mutations. O_EXCL creation is
  * the mutex; the file content is a unique OWNERSHIP TOKEN so release can never
- * delete a successor's lock (a slow holder that was declared stale and
- * replaced must not unlink the replacement).
+ * delete a successor's lock.
  *
  * Failure is loud, never fail-open: a lock that cannot be acquired in time
- * throws (the caller must not mutate the log unlocked), and a stale lock that
- * cannot be broken throws instead of spinning forever — wedging or silently
- * losing a spend entry after a payment has moved funds is worse than failing.
+ * throws BUDGET_LOCK_TIMEOUT (the caller must not mutate the log unlocked)
+ * and the message includes the explicit operator recovery for a lock left by
+ * a crashed process. There is NO automatic stale takeover — see the note at
+ * lockTiming for why pathname-based staleness was removed.
  *
  * @returns {string} the ownership token (pass to releaseLogLock).
- * @throws {Error} code BUDGET_LOCK_TIMEOUT or BUDGET_LOCK_UNLINK_FAILED.
+ * @throws {Error} code BUDGET_LOCK_TIMEOUT.
  */
 function acquireLogLock() {
   fs.mkdirSync(BLINK_DIR, { recursive: true });
@@ -151,36 +155,10 @@ function acquireLogLock() {
       return token;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let stat1;
-      try {
-        stat1 = fs.statSync(LOG_LOCK_FILE);
-      } catch {
-        continue; // lock vanished between open and stat — retry immediately
-      }
-      if (Date.now() - stat1.mtimeMs > lockTiming.staleMs) {
-        // Narrow the two-waiters race: both can decide the same old lock is
-        // stale, and one could unlink the other's freshly created replacement.
-        // Re-stat immediately before unlinking and abort if the lock changed.
-        let stat2;
-        try {
-          stat2 = fs.statSync(LOG_LOCK_FILE);
-        } catch {
-          continue; // already gone
-        }
-        if (stat2.mtimeMs !== stat1.mtimeMs) continue; // broken & recreated — wait for the new lock
-        try {
-          fs.unlinkSync(LOG_LOCK_FILE);
-        } catch (unlinkErr) {
-          if (unlinkErr.code === 'ENOENT') continue; // another waiter broke it first
-          const err = new Error(`Cannot break stale budget lock: ${unlinkErr.message}`);
-          err.code = 'BUDGET_LOCK_UNLINK_FAILED';
-          throw err;
-        }
-        continue;
-      }
       if (Date.now() >= deadline) {
         const err = new Error(
-          `Timed out after ${lockTiming.acquireTimeoutMs}ms waiting for the budget lock — refusing to mutate the spending log unlocked.`,
+          `Timed out after ${lockTiming.acquireTimeoutMs}ms waiting for the budget lock — refusing to mutate the spending log unlocked. ` +
+            `If no budget command is running, a crashed process may have left the lock behind; remove it manually: rm ${LOG_LOCK_FILE}`,
         );
         err.code = 'BUDGET_LOCK_TIMEOUT';
         throw err;
@@ -627,14 +605,17 @@ function releaseReservation(id) {
 }
 
 /**
- * Finalize a reservation OR restore accounting when it is missing.
+ * Finalize a reservation OR restore accounting when it is missing. Idempotent.
  *
- * `budget reset` clears active reservations while a payment may still be in
- * flight; if the reservation is gone when finalize arrives, finalize alone
- * would return false and the settled payment would escape the log entirely —
- * later budget checks would overestimate what is left. This helper writes a
- * normal spend entry in that case (conservative restoration) and returns
- * 'finalized' or 'restored' so the caller can warn on the latter.
+ * `budget reset --force` clears active reservations while a payment may still
+ * be in flight; if the reservation is gone when finalize arrives, finalize
+ * alone would return false and the settled payment would escape the log
+ * entirely — later budget checks would overestimate what is left. This helper
+ * writes a normal spend entry in that case (conservative restoration) and
+ * returns 'finalized', 'restored', or 'dropped' so the caller can warn.
+ *
+ * Finalized/restored entries CARRY the reservation id, so calling again with
+ * the same id is a no-op ('finalized') instead of appending a duplicate.
  *
  * @returns {'finalized' | 'restored' | 'dropped'}  'dropped' only when id is null.
  */
@@ -644,12 +625,14 @@ function finalizeOrRecord(id, { sats, command, domain = null } = {}) {
     const i = log.findIndex((e) => e.state === 'reserved' && e.id === id);
     if (i !== -1) {
       const { ts } = log[i];
-      log[i] = { ts, sats, command, domain };
+      log[i] = { ts, sats, command, domain, id };
       return 'finalized';
     }
-    // Reservation was erased externally (budget reset) or pruned: the payment
-    // moved funds, so restore the accounting with a normal spend entry.
-    log.push({ ts: Date.now(), sats, command, domain });
+    // Idempotency: already finalized/restored with this id — do not duplicate.
+    if (log.some((e) => e.id === id)) return 'finalized';
+    // Reservation was erased externally (budget reset --force) or pruned: the
+    // payment moved funds, so restore the accounting with a normal spend entry.
+    log.push({ ts: Date.now(), sats, command, domain, id });
     return 'restored';
   });
 }
@@ -669,17 +652,35 @@ function getLog(limit = 20) {
 }
 
 /**
- * Clear the spending log — under the same lock as every other mutation, so a
- * concurrent recordSpend/reservation cannot be erased by (or resurrect after)
- * a reset.
+ * Clear the spending log — under the same lock as every other mutation.
  *
- * @returns {number}  Number of entries removed.
+ * Default semantics preserve ACTIVE RESERVATIONS: a payment may be in flight
+ * with its reservation already reserved; clearing it would reopen the
+ * allowance window and let a concurrent payment exceed the configured limit.
+ * Completed/finalized history is cleared.
+ *
+ * `{ force: true }` clears EVERYTHING including active reservations — the
+ * escape hatch for wedged reservations. An in-flight payment whose
+ * reservation was force-cleared is still recorded by finalizeOrRecord, but
+ * the freed allowance can be reused in the interim (brief exceed window) —
+ * so --force must be documented as unsafe while payments run.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.force=false]  Also clear active reservations.
+ * @returns {{ removed: number, keptReserved: number }}
  */
-function resetLog() {
+function resetLog({ force = false } = {}) {
   return mutateLog((log) => {
-    const count = log.length;
+    if (force) {
+      const removed = log.length;
+      log.length = 0;
+      return { removed, keptReserved: 0 };
+    }
+    const kept = log.filter((e) => e.state === 'reserved');
+    const removed = log.length - kept.length;
     log.length = 0;
-    return count;
+    log.push(...kept);
+    return { removed, keptReserved: kept.length };
   });
 }
 
