@@ -133,12 +133,13 @@ async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000) {
  * Reads the human-readable part (amount + multiplier) from the invoice prefix.
  *
  * Supports mainnet (lnbc), testnet (lntb), signet (lntbs).
- * Returns null if not parseable.
+ * Returns null if not parseable. The HRP amount is a BigInt so huge valid
+ * amounts keep full precision through the multiplier conversion.
  *
  * @param {string} invoice
- * @returns {number | null}  Amount in satoshis, or null.
+ * @returns {{ amount: bigint, multiplier: string } | null}
  */
-function decodeBolt11AmountSats(invoice) {
+function bolt11AmountParts(invoice) {
   if (!invoice) return null;
   const lower = invoice.toLowerCase();
 
@@ -159,33 +160,80 @@ function decodeBolt11AmountSats(invoice) {
   const match = amountStr.match(/^(\d+)([munp]?)1/);
   if (!match) return null;
 
-  const amount = parseInt(match[1], 10);
-  const multiplier = match[2];
+  return { amount: BigInt(match[1]), multiplier: match[2] };
+}
 
-  if (isNaN(amount)) return null;
+/**
+ * Decode a BOLT-11 invoice amount in MILLISATOSHIS — full precision, no
+ * rounding. BigInt arithmetic throughout; sub-millisatoshi amounts (pico
+ * amounts below 1 msat) are floored at msat granularity. Returns null if not
+ * parseable, or if the amount exceeds a safe integer (not a usable amount).
+ *
+ * @param {string} invoice
+ * @returns {number | null}  Amount in millisatoshis, or null.
+ */
+function decodeBolt11AmountMsats(invoice) {
+  const parts = bolt11AmountParts(invoice);
+  if (!parts) return null;
 
-  // Convert to millisatoshis first, then to sats.
-  // Multipliers (from BOLT-11):
-  //   m = milli   → 0.001 BTC  → 1e5 sats  per unit
-  //   u = micro   → 0.000001 BTC → 100 sats per unit
-  //   n = nano    → 1e-9 BTC   → 0.1 sats per unit → round
-  //   p = pico    → 1e-12 BTC  → 0.0001 sats per unit → round
-  //   (none)      → whole BTC  → 1e8 sats per unit
-  const BTC_TO_SAT = 100_000_000;
+  const { amount, multiplier } = parts;
+  let msats;
   switch (multiplier) {
     case '':
-      return amount * BTC_TO_SAT;
+      msats = amount * 100_000_000_000n; // whole BTC → 1e11 msats
+      break;
     case 'm':
-      return Math.round(amount * BTC_TO_SAT * 0.001);
+      msats = amount * 100_000_000n; // 1e5 sats → 1e8 msats
+      break;
     case 'u':
-      return Math.round(amount * BTC_TO_SAT * 0.000_001);
+      msats = amount * 100_000n; // 100 sats → 1e5 msats
+      break;
     case 'n':
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_001);
+      msats = amount * 100n; // 0.1 sats → 100 msats
+      break;
     case 'p':
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_000_001);
+      msats = amount / 10n; // 0.0001 sats → 0.1 msats (floored to msat granularity)
+      break;
     default:
       return null;
   }
+  if (msats > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(msats);
+}
+
+/**
+ * Decode a BOLT-11 invoice amount in SATOSHIS (legacy, round-to-nearest).
+ * Callers that enforce money limits must NOT use this directly: rounding can
+ * push a below-1-sat invoice up to 1 sat and shave fractions off larger ones.
+ * Use budgetChargeFromInvoice() for enforcement.
+ *
+ * @param {string} invoice
+ * @returns {number | null}  Amount in satoshis, or null.
+ */
+function decodeBolt11AmountSats(invoice) {
+  const msats = decodeBolt11AmountMsats(invoice);
+  if (msats === null) return null;
+  return Math.round(msats / 1000);
+}
+
+/**
+ * The budget charge for a BOLT-11 invoice, structured so callers can tell
+ * "undecodable" apart from "positive sub-satoshi" — two different policies:
+ *   - undecodable                        → { msats: null, budgetSats: null }
+ *   - any positive decodable amount      → budgetSats = max(1, ceil(msats/1000))
+ *
+ * Any positive decodable amount charges AT LEAST 1 sat (explicit payments can
+ * never move funds untracked); fractional amounts charge ceil (conservative).
+ * Callers with a stricter policy — e.g. L402 refuses invoices below 1 sat —
+ * decide from `msats`.
+ *
+ * @param {string} invoice
+ * @returns {{ msats: number|null, budgetSats: number|null }}
+ */
+function budgetChargeFromInvoice(invoice) {
+  const msats = decodeBolt11AmountMsats(invoice);
+  if (msats === null) return { msats: null, budgetSats: null };
+  return { msats, budgetSats: Math.max(1, Math.ceil(msats / 1000)) };
 }
 
 // ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -368,6 +416,8 @@ module.exports = {
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,
+  decodeBolt11AmountMsats,
+  budgetChargeFromInvoice,
   fetchL402ProtocolInvoice,
   resolveCanonicalUrl,
   main,

@@ -1059,6 +1059,63 @@ describe('l402_pay redirect handling', () => {
   });
 });
 
+// ── BOLT-11 amount decoding / budget charge rule ─────────────────────────────
+
+describe('budgetChargeFromInvoice and decodeBolt11AmountMsats', () => {
+  const { budgetChargeFromInvoice, decodeBolt11AmountMsats, decodeBolt11AmountSats } = require(
+    path.join(scriptsDir, 'l402_discover'),
+  );
+
+  it('decodes millisats with full precision (no rounding)', () => {
+    assert.equal(decodeBolt11AmountMsats('lnbc10p1p0x'), 1); // 0.001 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc5000p1p0x'), 500); // 0.5 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc14000p1p0x'), 1400); // 1.4 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc10n1p0x'), 1000); // exactly 1 sat
+    assert.equal(decodeBolt11AmountMsats('lnbc1000n1p0x'), 100_000); // 100 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc1000u1p0x'), 100_000_000); // 100_000 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc100m1p0x'), 10_000_000_000); // 100 mBTC → 10_000 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc11p0x'), 100_000_000_000); // 1 BTC (whole-BTC multiplier)
+  });
+
+  it('keeps BigInt precision near the safe-integer boundary', () => {
+    // 9007199254740993p: Number() would round the digits before multiplying;
+    // BigInt keeps the exact floor of 900719925474099.3 msats.
+    assert.equal(decodeBolt11AmountMsats('lnbc9007199254740993p1p0x'), 900719925474099);
+    assert.deepEqual(budgetChargeFromInvoice('lnbc9007199254740993p1p0x'), {
+      msats: 900719925474099,
+      budgetSats: 900719925475,
+    });
+  });
+
+  it('returns null for amounts beyond a safe integer (unusable, not a charge)', () => {
+    assert.equal(decodeBolt11AmountMsats('lnbc90071992547409920u1p0x'), null);
+  });
+
+  it('legacy sat decode keeps its round-to-nearest display semantics', () => {
+    assert.equal(decodeBolt11AmountSats('lnbc1000u1p0x'), 100_000);
+    assert.equal(decodeBolt11AmountSats('lnbc10p1p0x'), 0);
+    assert.equal(decodeBolt11AmountSats('lnbc5000p1p0x'), 1);
+  });
+
+  it('any positive decodable amount charges at least 1 sat', () => {
+    assert.deepEqual(budgetChargeFromInvoice('lnbc10p1p0x'), { msats: 1, budgetSats: 1 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc5000p1p0x'), { msats: 500, budgetSats: 1 });
+  });
+
+  it('fractional sats are charged ceil, never round-to-nearest', () => {
+    assert.deepEqual(budgetChargeFromInvoice('lnbc14000p1p0x'), { msats: 1400, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc11n1p0x'), { msats: 1100, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc10n1p0x'), { msats: 1000, budgetSats: 1 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc20000p1p0x'), { msats: 2000, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc1000u1p0x'), { msats: 100_000_000, budgetSats: 100_000 });
+  });
+
+  it('undecodable invoices return nulls (distinguishable from sub-satoshi)', () => {
+    assert.deepEqual(budgetChargeFromInvoice('lnbc1p0noamount'), { msats: null, budgetSats: null });
+    assert.deepEqual(budgetChargeFromInvoice('not-an-invoice'), { msats: null, budgetSats: null });
+  });
+});
+
 // ── runFeeProbe ───────────────────────────────────────────────────────────────
 
 describe('runFeeProbe', () => {
@@ -1374,15 +1431,337 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     void code;
   });
 
-  it('dry-run still reports an undecodable amount instead of refusing', async () => {
+  // ── reservation lifecycle (review: keep reservations conservative) ─────────
+  //
+  // These tests exercise the full payment path with a controllable GraphQL
+  // backend, asserting on the budget log after runPay.
+
+  /**
+   * Mock the 402 challenge AND the Blink GraphQL backend. The mutation's
+   * outcome is driven by options: a status string, or a transport-level throw
+   * that mimics "timeout after the payment was dispatched".
+   */
+  function mockPayment({ status = 'SUCCESS', throwOnMutation = false, invoice = INVOICE_100K } = {}) {
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          if (throwOnMutation) throw new Error('network timeout after dispatch');
+          return respond({
+            lnInvoicePaymentSend: {
+              status,
+              errors: [],
+              transaction:
+                status === 'SUCCESS'
+                  ? { settlementVia: { preImage: 'a'.repeat(64) }, initiationVia: { paymentHash: 'b'.repeat(64) } }
+                  : null,
+            },
+          });
+        }
+        if (q.includes('transactions')) return respond({ transactions: { edges: [] } });
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        const hasAuth = opts && opts.headers && opts.headers.Authorization;
+        if (hasAuth) {
+          return { status: 200, url: u, headers: { get: () => null }, text: async () => JSON.stringify({ ok: true }) };
+        }
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${invoice}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
+  }
+
+  function readSpendLog() {
+    const budget = require(budgetPath);
+    return budget.readLog();
+  }
+
+  function configureAutoPay() {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    process.env.BLINK_BUDGET_DAILY_SATS = '200000';
+  }
+
+  it('a PENDING payment finalizes the reservation (in flight counts against the budget)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'the in-flight payment must stay on the budget');
+    assert.equal(log[0].sats, 100000);
+    assert.equal(log[0].state, undefined, 'finalized — a normal spend entry, not a reservation');
+  });
+
+  it('a transport error after dispatch KEEPS the reservation (fail-closed)', async () => {
+    configureAutoPay();
+    mockPayment({ throwOnMutation: true });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'outcome unknown — the budget must stay blocked');
+    assert.equal(log[0].state, 'reserved');
+  });
+
+  it('an explicit server rejection frees the reservation (nothing moved)', async () => {
+    configureAutoPay();
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          return respond({ lnInvoicePaymentSend: { status: 'FAILURE', errors: [{ message: 'Route not found' }] } });
+        }
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${INVOICE_100K}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
+  });
+
+  it('a sub-satoshi invoice amount is refused like an undecodable one', async () => {
+    configureAutoPay();
+    // 'lnbc10p...' ≈ 0.001 sats — decodeBolt11AmountSats rounds it to 0, which
+    // must NOT slip past the amount guard into a zero-value reservation.
+    mock402('lnbc10p1p0subsat');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_amount_undecodable');
+    assert.match(out.message, /below 1 satoshi/);
+    assert.deepEqual(readSpendLog(), [], 'no zero-value reservation may be persisted');
+  });
+
+  it('a 500-msat invoice is refused as below 1 satoshi (round-to-nearest used to let it pass)', async () => {
+    configureAutoPay();
+    mock402('lnbc5000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    assert.equal(output().event, 'l402_amount_undecodable');
+    assert.match(output().message, /below 1 satoshi/);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a 1400-msat invoice is charged ceil (2 sats) to the budget', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS', invoice: 'lnbc14000p1p0frac' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 2, '1400 msats must charge 2 sats, not the rounded 1');
+  });
+
+  it('a 1400-msat invoice is refused when only 1 sat of allowance remains (previously allowed)', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    process.env.BLINK_BUDGET_DAILY_SATS = '1';
+    mock402('lnbc14000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('SUCCESS output and cached token carry invoiceMsats + budgetSats for a fractional invoice', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS', invoice: 'lnbc14000p1p0frac' });
+    await runPay(['https://paywall.example.com/resource']); // no --no-store → token is cached
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.budgetSats, 2);
+    assert.equal(out.invoiceMsats, 1400);
+    const store = JSON.parse(fs.readFileSync(path.join(tmpDir, '.blink', 'l402-tokens.json'), 'utf8'));
+    const token = Object.values(store)[0];
+    assert.equal(token.budgetSats, 2, 'cached metadata must match the budget accounting');
+    assert.equal(token.invoiceMsats, 1400);
+  });
+
+  it('a PENDING 1400-msat payment finalizes at the ceil charge (2 sats)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING', invoice: 'lnbc14000p1p0frac' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 2);
+  });
+
+  it('SUCCESS with a live reservation finalizes it into a domain-tagged spend', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'the successful payment must be recorded');
+    assert.equal(log[0].sats, 100000);
+    assert.equal(log[0].command, 'l402-pay');
+    assert.equal(log[0].domain, 'paywall.example.com');
+    assert.equal(log[0].state, undefined, 'finalized — not still reserved');
+  });
+
+  it('a restored finalization (reservation erased externally) warns on stderr', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const budget = require(budgetPath);
+    const savedFinalize = budget.finalizeOrRecord;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.finalizeOrRecord = () => 'restored';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.finalizeOrRecord = savedFinalize;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /budget reservation was missing.*recorded anyway/s);
+  });
+
+  it('a status-only terminal failure (no GraphQL errors) frees the reservation', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'FAILURE' }); // mockPayment sends errors: [] for non-SUCCESS
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
+  });
+
+  it('a failing release on ALREADY_PAID warns on stderr instead of being swallowed', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'ALREADY_PAID' });
+    const budget = require(budgetPath);
+    const savedRelease = budget.releaseReservation;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.releaseReservation = () => {
+      throw new Error('lock timeout');
+    };
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.releaseReservation = savedRelease;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /could not release the budget reservation: lock timeout/);
+  });
+
+  it('a missing API key orphans no reservation (credentials resolve before reserving)', async () => {
+    configureAutoPay();
+    const savedKey = process.env.BLINK_API_KEY;
+    delete process.env.BLINK_API_KEY;
+    try {
+      mock402(INVOICE_100K);
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+      assert.deepEqual(readSpendLog(), [], 'no payment was attempted, so nothing may stay reserved');
+    } finally {
+      process.env.BLINK_API_KEY = savedKey;
+    }
+  });
+
+  it('ALREADY_PAID records NO new spend (nothing moved this invocation) and still recovers the token', async () => {
+    configureAutoPay();
+    // The preimage flow must still work for ALREADY_PAID: the retry uses the
+    // previously-paid token, so the paymentHash-based fallback path runs.
+    mockPayment({ status: 'ALREADY_PAID' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'an ALREADY_PAID invoice must not double-count against the budget');
+  });
+
+  it('PENDING finalization failures warn on stderr instead of being swallowed', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING' });
+    // Make the accounting write fail, and capture stderr to prove the warning.
+    const budget = require(budgetPath);
+    const savedFinalize = budget.finalizeOrRecord;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.finalizeOrRecord = () => {
+      throw new Error('disk full');
+    };
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.finalizeOrRecord = savedFinalize;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /could not record the in-flight payment in the budget log.*disk full/s);
+  });
+
+  it('dry-run refuses an undecodable amount exactly like execution (preview/execution parity)', async () => {
     mock402(INVOICE_NO_AMOUNT);
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
 
-    // Dry-run never spends, so it is not subject to the fail-closed guards.
-    assert.equal(code, null);
+    // The preview must never green-light what execution rejects.
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_amount_undecodable');
+    assert.equal(blinkApiWasCalled(), false);
+  });
+
+  it('dry-run previews the ceil charge for a 1400-msat invoice (budgetSats field + allowed flag)', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '1';
+    mock402('lnbc14000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
+
+    assert.equal(code, null, 'dry-run reports, it does not exit');
     const out = output();
     assert.equal(out.event, 'l402_dry_run');
-    assert.equal(out.satoshis, null);
-    assert.equal(blinkApiWasCalled(), false);
+    assert.equal(out.invoiceMsats, 1400);
+    assert.equal(out.budgetSats, 2, 'the preview must use the same conservative charge as execution');
+    assert.equal(out.budget.allowed, false, '2 sats against a 1-sat daily limit — preview and execution agree');
+  });
+
+  it('dry-run with a tight --max-amount refuses on the ceil charge, in the same words as execution', async () => {
+    configureAutoPay();
+    mock402('lnbc14000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run', '--max-amount', '1']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
   });
 });

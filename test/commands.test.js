@@ -8,18 +8,23 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 // ── Shared test infrastructure ───────────────────────────────────────────────
 
 const clientPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_blink_client.js');
+const budgetPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_budget.js');
 const scriptsDir = path.resolve(__dirname, '..', 'blink', 'scripts');
 
 /**
  * Require a script fresh (bust require cache chain) so each test starts clean.
  */
 function freshRequire(scriptName) {
-  // Bust the client and the script so they re-bind
+  // Bust the client, the budget module (BLINK_DIR binds at load time and must
+  // see the patched homedir from setupTestEnv), and the script so they re-bind
   delete require.cache[require.resolve(clientPath)];
+  delete require.cache[require.resolve(budgetPath)];
   const scriptPath = path.join(scriptsDir, scriptName);
   delete require.cache[require.resolve(scriptPath)];
   return require(scriptPath);
@@ -47,6 +52,9 @@ function createMockFetch(handlers) {
 
 /**
  * Set up the test environment: mock env vars, suppress console, capture stdout.
+ * INVARIANT: homedir is redirected to a throwaway dir for the duration, so
+ * budget-integrated payment commands (recordSpend/reservations) can never
+ * write fake spends into the developer's real ~/.blink.
  */
 function setupTestEnv() {
   const originalEnv = { ...process.env };
@@ -54,6 +62,10 @@ function setupTestEnv() {
   const originalStdout = console.log;
   const originalStderr = console.error;
   const originalFetch = global.fetch;
+  const originalHomedir = os.homedir;
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-commands-test-'));
+
+  os.homedir = () => tmpHome;
 
   process.env.BLINK_API_KEY = 'blink_test_key_123';
   process.env.BLINK_API_URL = 'https://api.test.blink.sv/graphql';
@@ -69,6 +81,7 @@ function setupTestEnv() {
   };
 
   return {
+    tmpHome,
     getStdout: () => stdoutLines.join('\n'),
     getStdoutJson: () => JSON.parse(stdoutLines.join('\n')),
     getStderr: () => stderrLines.join('\n'),
@@ -81,6 +94,12 @@ function setupTestEnv() {
       console.log = originalStdout;
       console.error = originalStderr;
       global.fetch = originalFetch;
+      os.homedir = originalHomedir;
+      try {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
     },
   };
 }
@@ -130,6 +149,75 @@ describe('pay_invoice', () => {
   });
   afterEach(() => {
     env.restore();
+  });
+
+  it('a fractional-satoshi invoice is charged ceil (1400 msats → 2 sats) to the budget', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '100';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc14000p1p0frac'];
+    const { main } = freshRequire('pay_invoice.js');
+    await main();
+    const log = JSON.parse(fs.readFileSync(path.join(env.tmpHome, '.blink', 'spending-log.json'), 'utf8'));
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 2, 'the budget must charge ceil, never round-to-nearest');
+  });
+
+  it('a 500-msat invoice charges 1 sat — explicit payments can never move funds untracked', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '100';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc5000p1p0frac'];
+    const { main } = freshRequire('pay_invoice.js');
+    await main();
+    const log = JSON.parse(fs.readFileSync(path.join(env.tmpHome, '.blink', 'spending-log.json'), 'utf8'));
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 1, 'any positive decodable amount charges at least 1 sat');
+  });
+
+  it('exhausted budget refuses the SECOND of two 500-msat payments', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '1';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc5000p1p0frac'];
+    await freshRequire('pay_invoice.js').main(); // first payment consumes the whole 1-sat allowance
+    await assert.rejects(() => freshRequire('pay_invoice.js').main(), /Budget exceeded/);
   });
 
   it('--dry-run outputs JSON with dryRun: true and does not send mutation', async () => {

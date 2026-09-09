@@ -128,6 +128,13 @@ availability failure) but cannot redirect funds.
   - BOLT-11 invoice / Spark address → `sdk.prepareSendPayment` (fees) then `sdk.sendPayment` (signs)
   - A Lightning Address (e.g. `alice@blink.sv`) is an LNURL-pay destination and
     MUST use the LNURL path — `prepareSendPayment` does not accept it.
+  - The classification is an **exhaustive allowlist**: the SDK's `parse()`
+    recognizes more types than we pay to (on-chain Bitcoin addresses, BOLT-12
+    offers, cross-chain destinations, receive-side methods like
+    `sparkInvoice`). Everything outside the four supported types is rejected
+    with `UNSUPPORTED_DESTINATION` instead of falling into a payment path it
+    was never validated for. Widening the list is a deliberate decision, not
+    a default.
 - `spark-transactions` → `sdk.listPayments`
 - `spark-subscribe` → `sdk.addEventListener`
 
@@ -148,10 +155,29 @@ their funds. If `bip39` is unavailable the command aborts
 treating "cannot check" as "checked and fine" silently disables the control.
 Neither error echoes the seed.
 
-**Not covered by budget controls:** `spark-send` bypasses the budget enforcement
-and spending log that guard the custodial pay commands — signing happens
-client-side, outside `_budget.js`. This is the highest-authority path in the
-skill; apply agent-side confirmation accordingly.
+**Budget controls:** `spark-send` is under the same rolling spend limits as the
+custodial pay commands. Configured limits (`BLINK_BUDGET_HOURLY_SATS` /
+`BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before
+signing — the last possible moment before funds move; an unconfigured budget
+does not block an explicit one-shot send; successful/pending sends are recorded
+in the spending log; `--force` overrides the check. `spark-fee-probe` and
+`--dry-run` move nothing and are never budget-gated.
+
+Two scope notes, both inherited from the shared budget module and identical to
+the custodial commands:
+
+- **Principal only.** Budgets count the payment amount, not the routing fee —
+  a 100-sat send with a 3-sat fee passes with 100 sats remaining and records
+  100. The fee is known at check time; counting it would diverge from the
+  custodial pay commands' convention.
+- **Enforcement is reservation-based.** `reserveBudget` decides AND reserves
+  under one lock before the send executes, so concurrent sends can never
+  jointly exceed a limit. Success/pending finalizes the reservation; an
+  explicit terminal failure releases it. An outcome-unknown error after
+  dispatch (timeout, lost response, SDK error) **keeps** the reservation —
+  the payment may still settle, so freeing the budget for a retry would
+  reopen the race; it is pruned fail-closed after 25h. A failed recording
+  after settlement behaves the same way.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

@@ -9,9 +9,11 @@
  * Run: node --test test/spark.test.js
  */
 
-const { describe, it, afterEach } = require('node:test');
+const { describe, it, afterEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
 
 const spark = require('../blink/scripts/_spark_sdk');
 const {
@@ -20,6 +22,26 @@ const {
   isLnurlPayInput,
   lnurlPayRequestFrom,
 } = require('../blink/scripts/spark_send');
+
+// ── budget isolation (must run before any spark_send re-load) ────────────────
+//
+// spark_send binds _budget.js at require time, and main() now both checks the
+// budget and records spends on ~/.blink. Seed the require cache with a _budget
+// instance whose BLINK_DIR resolves into a temp HOME, so every spark_send
+// re-load in this file checks/writes a throwaway dir instead of the real one.
+const budgetModulePath = require.resolve('../blink/scripts/_budget');
+const budgetTmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'spark-budget-home-'));
+{
+  const realHomedir = os.homedir;
+  os.homedir = () => budgetTmpHome;
+  try {
+    delete require.cache[budgetModulePath];
+    require(budgetModulePath);
+  } finally {
+    os.homedir = realHomedir;
+  }
+}
+after(() => fs.rmSync(budgetTmpHome, { recursive: true, force: true }));
 
 // ── getMnemonic (env-only, never rc files) ────────────────────────────────────
 
@@ -434,6 +456,11 @@ describe('spark_send.parseArgs', () => {
   it('rejects a non-positive amount', () => {
     assert.throws(() => parseSendArgs(['dest', '0']), /positive integer/);
   });
+
+  it('parses --force', () => {
+    const a = parseSendArgs(['dest', '1', '--force']);
+    assert.equal(a.force, true);
+  });
 });
 
 describe('spark_send.isLnurlPayInput', () => {
@@ -496,6 +523,48 @@ describe('spark_send.feeFromPrepare', () => {
     assert.equal(feeFromPrepare({}), null);
     assert.equal(feeFromPrepare(null), null);
     assert.equal(feeFromPrepare({ paymentMethod: {} }), null);
+  });
+});
+
+// ── spark_send.classifyDestination ───────────────────────────────────────────
+
+describe('spark_send.classifyDestination', () => {
+  const { classifyDestination } = require('../blink/scripts/spark_send');
+
+  it('routes lnUrlPay and lightningAddress to the lnurl path', () => {
+    assert.equal(classifyDestination({ type: 'lnUrlPay' }).type, 'lnurl');
+    assert.equal(classifyDestination({ type: 'lightningAddress' }).type, 'lnurl');
+  });
+
+  it('routes bolt11Invoice', () => {
+    assert.equal(classifyDestination({ type: 'bolt11Invoice' }).type, 'bolt11');
+  });
+
+  it('routes sparkAddress', () => {
+    assert.equal(classifyDestination({ type: 'sparkAddress' }).type, 'spark');
+  });
+
+  it('is case-insensitive on the discriminant', () => {
+    assert.equal(classifyDestination({ type: 'BOLT11INVOICE' }).type, 'bolt11');
+  });
+
+  it('rejects every other SDK input type by name', () => {
+    for (const t of ['bitcoinAddress', 'bolt12Invoice', 'crossChainAddress', 'url', 'lnurlWithdraw']) {
+      assert.throws(
+        () => classifyDestination({ type: t }),
+        (e) => e.code === 'UNSUPPORTED_DESTINATION' && e.message.includes(`'${t.toLowerCase()}'`),
+        `${t} must not fall into a payment path`,
+      );
+    }
+  });
+
+  it('rejects malformed parse results rather than guessing', () => {
+    for (const bad of [null, undefined, {}, { type: '' }, 'bolt11Invoice']) {
+      assert.throws(
+        () => classifyDestination(bad),
+        (e) => e.code === 'UNSUPPORTED_DESTINATION',
+      );
+    }
   });
 });
 
@@ -659,6 +728,247 @@ describe('spark_send main() destination routing', () => {
     await runMain(['lnbc100n1p...', '100']);
     assert.ok(!process.exitCode);
   });
+
+  // ── destination classification (review finding: exhaustive allowlist) ──────
+
+  it('rejects an unsupported SDK destination type before any prepare call', async () => {
+    installMock({ parseType: 'bitcoinAddress' });
+    await assert.rejects(
+      () => runMain(['bc1qxyz', '100']),
+      (e) => {
+        assert.match(e.message, /Unsupported destination type 'bitcoinaddress'/);
+        assert.equal(e.code, 'UNSUPPORTED_DESTINATION');
+        return true;
+      },
+    );
+    assert.deepEqual(calls, ['parse'], 'must stop after parse, before any prepare/send');
+  });
+
+  it('routes a Spark address through prepareSendPayment and labels it spark', async () => {
+    installMock({ parseType: 'sparkAddress' });
+    const out = await runMain(['spark1qxyz', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.destinationType, 'spark');
+    assert.equal(parsed.status, 'COMPLETED');
+  });
+
+  it('dry-run to a Spark address labels destinationType spark', async () => {
+    installMock({ parseType: 'sparkAddress' });
+    const out = await runMain(['spark1qxyz', '100', '--dry-run']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment']);
+    assert.equal(JSON.parse(out).destinationType, 'spark');
+  });
+});
+
+// ── spark_send budget integration (mocked SDK + isolated budget) ─────────────
+//
+// spark-send is now under budget controls like the custodial pay commands:
+// enforced when configured, allowed when not (explicit one-shot), recorded in
+// the spending log unless the payment failed. The _budget instance here is the
+// isolated one seeded at the top of the file, so these tests never touch ~/.blink.
+
+describe('spark_send budget integration', () => {
+  const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
+  const sparkSendPath = require.resolve('../blink/scripts/spark_send');
+  const budget = require(budgetModulePath); // the isolated instance
+
+  const { before, beforeEach } = require('node:test');
+
+  let calls;
+  let savedArgv;
+  let savedLog;
+  let savedErr;
+  let lastErr;
+
+  before(() => {
+    // The mocked routing tests above also record spends; start this suite clean.
+    budget.resetLog({ force: true });
+  });
+
+  beforeEach(() => {
+    budget.resetLog({ force: true });
+    try {
+      fs.unlinkSync(budget.CONFIG_FILE);
+    } catch {
+      /* no config was written */
+    }
+  });
+
+  function installMock({ status = 'COMPLETED' } = {}) {
+    calls = [];
+    const fakeSdk = {
+      async parse() {
+        calls.push('parse');
+        return { type: 'bolt11Invoice' };
+      },
+      async prepareSendPayment() {
+        calls.push('prepareSendPayment');
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
+      },
+      async sendPayment() {
+        calls.push('sendPayment');
+        return { payment: { id: 'bolt-1', status } };
+      },
+    };
+    require.cache[sparkSdkPath] = {
+      id: sparkSdkPath,
+      filename: sparkSdkPath,
+      loaded: true,
+      exports: {
+        async connect() {
+          return { sdk: fakeSdk, disconnect: async () => {} };
+        },
+      },
+    };
+    delete require.cache[sparkSendPath];
+  }
+
+  afterEach(() => {
+    delete require.cache[sparkSendPath];
+    delete require.cache[sparkSdkPath];
+    if (savedArgv) process.argv = savedArgv;
+    if (savedLog) console.log = savedLog;
+    if (savedErr) console.error = savedErr;
+    savedArgv = savedLog = savedErr = null;
+    process.exitCode = undefined;
+    // Reset budget state so tests cannot leak limits/log entries into each other.
+    try {
+      fs.unlinkSync(budget.CONFIG_FILE);
+    } catch {
+      /* no config was written */
+    }
+    budget.resetLog({ force: true });
+  });
+
+  async function runMain(argv) {
+    savedArgv = process.argv;
+    savedLog = console.log;
+    savedErr = console.error;
+    let out = '';
+    lastErr = '';
+    console.log = (s) => {
+      out += s;
+    };
+    console.error = (s) => {
+      lastErr += s + '\n';
+    };
+    process.argv = [process.execPath, path.basename(sparkSendPath), ...argv];
+    const { main } = require(sparkSendPath);
+    await main();
+    return out;
+  }
+
+  it('a failed budget-log recording warns on stderr but never masks the payment', async () => {
+    installMock({});
+    const savedRecord = budget.recordSpend;
+    budget.recordSpend = () => {
+      throw new Error('disk full');
+    };
+    try {
+      const out = await runMain(['lnbc100n1p...', '100']);
+      assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
+      assert.ok(!process.exitCode);
+      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+    } finally {
+      budget.recordSpend = savedRecord;
+    }
+  });
+
+  it('a failed finalization leaves the reservation counting (fail-closed) and warns', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    installMock({});
+    const savedFinalize = budget.finalizeOrRecord;
+    budget.finalizeOrRecord = () => {
+      throw new Error('disk full');
+    };
+    try {
+      const out = await runMain(['lnbc100n1p...', '100']);
+      assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
+      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+      const log = budget.readLog();
+      assert.equal(log.length, 1);
+      assert.equal(log[0].state, 'reserved', 'the orphaned reservation must keep blocking the budget');
+    } finally {
+      budget.finalizeOrRecord = savedFinalize;
+    }
+  });
+
+  it('an outcome-unknown SDK error after dispatch KEEPS the reservation (fail-closed)', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    installMock({});
+    // Replace sendPayment with a transport-level failure after dispatch.
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    const fake = require.cache[sdkPath].exports;
+    const fakeSdk = {
+      async parse() {
+        return { type: 'bolt11Invoice' };
+      },
+      async prepareSendPayment() {
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
+      },
+      async sendPayment() {
+        throw new Error('transport reset after dispatch');
+      },
+    };
+    fake.connect = async () => ({ sdk: fakeSdk, disconnect: async () => {} });
+    delete require.cache[sparkSendPath];
+    await assert.rejects(() => runMain(['lnbc100n1p...', '100']), /transport reset/);
+    const log = budget.readLog();
+    assert.equal(log.length, 1, 'the reservation must stay — the payment may still settle');
+    assert.equal(log[0].state, 'reserved');
+    assert.match(lastErr, /outcome is unknown.*25h prune/s);
+  });
+
+  it('an unconfigured budget allows an explicit send and records the spend', async () => {
+    installMock({});
+    const out = await runMain(['lnbc100n1p...', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    assert.equal(JSON.parse(out).status, 'COMPLETED');
+    const entries = budget.readLog();
+    assert.equal(entries.length, 1, 'exactly one spend entry');
+    assert.equal(entries[0].sats, 100);
+    assert.equal(entries[0].command, 'spark-send');
+  });
+
+  it('a configured budget blocks an over-limit send BEFORE the SDK send call', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 50, allowlist: [] });
+    installMock({});
+    await assert.rejects(() => runMain(['lnbc100n1p...', '100']), /Budget exceeded/);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment'], 'must stop after prepare, before send');
+    assert.equal(budget.readLog().length, 0, 'nothing recorded for a blocked send');
+  });
+
+  it('a within-budget send proceeds and records the spend', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    installMock({});
+    await runMain(['lnbc100n1p...', '100']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    assert.equal(budget.readLog().length, 1);
+  });
+
+  it('--force bypasses the budget check and records the spend', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 50, allowlist: [] });
+    installMock({});
+    const out = await runMain(['lnbc100n1p...', '100', '--force']);
+    assert.deepEqual(calls, ['parse', 'prepareSendPayment', 'sendPayment']);
+    assert.equal(JSON.parse(out).status, 'COMPLETED');
+    assert.equal(budget.readLog().length, 1);
+  });
+
+  it('a failed payment is not recorded', async () => {
+    installMock({ status: 'failed' });
+    await runMain(['lnbc100n1p...', '100']);
+    assert.equal(process.exitCode, 1);
+    assert.equal(budget.readLog().length, 0);
+  });
+
+  it('a pending payment is recorded (in flight, same rule as custodial)', async () => {
+    installMock({ status: 'pending' });
+    await runMain(['lnbc100n1p...', '100']);
+    assert.ok(!process.exitCode, 'pending is not a failure');
+    assert.equal(budget.readLog().length, 1);
+  });
 });
 
 // ── isFailedStatus ───────────────────────────────────────────────────────────
@@ -675,6 +985,86 @@ describe('spark_send.isFailedStatus', () => {
   it('does not match the non-failure statuses', () => {
     for (const s of ['completed', 'COMPLETED', 'pending', 'SUBMITTED', '', null, undefined]) {
       assert.equal(isFailedStatus(s), false, `${s} must not count as failed`);
+    }
+  });
+});
+
+// ── spark_transactions.parseArgs ─────────────────────────────────────────────
+
+describe('spark_transactions.parseArgs', () => {
+  const { parseArgs } = require('../blink/scripts/spark_transactions');
+
+  it('defaults to limit 20, offset 0, no type filter', () => {
+    const a = parseArgs([]);
+    assert.equal(a.limit, 20);
+    assert.equal(a.offset, 0);
+    assert.equal(a.type, null);
+  });
+
+  it('parses --limit, --offset and --type', () => {
+    const a = parseArgs(['--limit', '5', '--offset', '40', '--type', 'receive']);
+    assert.equal(a.limit, 5);
+    assert.equal(a.offset, 40);
+    assert.equal(a.type, 'receive');
+  });
+
+  it('normalizes --type casing', () => {
+    assert.equal(parseArgs(['--type', 'SEND']).type, 'send');
+  });
+
+  it('rejects a negative offset', () => {
+    assert.throws(() => parseArgs(['--offset', '-1']), /non-negative integer/);
+  });
+
+  it('rejects an invalid --type', () => {
+    assert.throws(() => parseArgs(['--type', 'sideways']), /must be 'send' or 'receive'/);
+  });
+});
+
+// ── spark_balance.parseArgs ──────────────────────────────────────────────────
+
+describe('spark_balance.parseArgs', () => {
+  const { parseArgs } = require('../blink/scripts/spark_balance');
+  const savedEnv = process.env.SPARK_NETWORK;
+
+  const restoreEnv = () => {
+    if (savedEnv === undefined) delete process.env.SPARK_NETWORK;
+    else process.env.SPARK_NETWORK = savedEnv;
+  };
+
+  it('defaults to mainnet with no args and no env var', () => {
+    delete process.env.SPARK_NETWORK;
+    try {
+      assert.equal(parseArgs([]).network, 'mainnet');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('falls back to SPARK_NETWORK when the flag is absent', () => {
+    process.env.SPARK_NETWORK = 'regtest';
+    try {
+      assert.equal(parseArgs([]).network, 'regtest');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('parses --network and lets the flag win over the env var', () => {
+    process.env.SPARK_NETWORK = 'mainnet';
+    try {
+      assert.equal(parseArgs(['--network', 'regtest']).network, 'regtest');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('ignores a trailing --network without a value', () => {
+    delete process.env.SPARK_NETWORK;
+    try {
+      assert.equal(parseArgs(['--network']).network, 'mainnet');
+    } finally {
+      restoreEnv();
     }
   });
 });

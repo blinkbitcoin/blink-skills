@@ -28,6 +28,8 @@
  *   memo...            - Optional. Remaining args joined as a comment.
  *   --timeout <s>      - Optional. Verify-poll timeout in seconds (default 300, 0 = no timeout).
  *   --no-verify        - Optional. Skip the LUD-21 verify polling; just create and exit.
+ *   --qr               - Optional. Render a terminal QR (stderr) + PNG in /tmp for the
+ *                        minted invoice; QR fields are merged into the invoice_created JSON.
  *
  * Environment:
  *   BLINK_API_KEY  - Optional. If present, improves the custodial-vs-non-custodial probe.
@@ -53,6 +55,7 @@ function parseArgs(argv) {
   let amountSats = null;
   let timeoutSeconds = 300;
   let noVerify = false;
+  let qr = false;
   const memoParts = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -67,6 +70,10 @@ function parseArgs(argv) {
     }
     if (arg === '--no-verify') {
       noVerify = true;
+      continue;
+    }
+    if (arg === '--qr') {
+      qr = true;
       continue;
     }
     if (address === null) {
@@ -86,6 +93,7 @@ function parseArgs(argv) {
     amountSats,
     timeoutSeconds,
     noVerify,
+    qr,
     memo: memoParts.length > 0 ? memoParts.join(' ') : undefined,
   };
 }
@@ -153,7 +161,7 @@ async function main() {
 
   if (!args.address || args.amountSats === null) {
     console.error(
-      'Usage: node create_invoice_lnaddress.js <lightning_address> <amount_sats> [memo...] [--timeout <seconds>] [--no-verify]',
+      'Usage: node create_invoice_lnaddress.js <lightning_address> <amount_sats> [memo...] [--timeout <seconds>] [--no-verify] [--qr]',
     );
     process.exit(1);
   }
@@ -191,6 +199,19 @@ async function main() {
     // A wallet id only exists for custodial recipients.
     walletId: receiver.walletId,
   };
+
+  // Optional QR: render BEFORE printing so the first JSON already carries the
+  // pngPath (mirrors the `blink qr` output fields). A render failure must not
+  // lose the invoice — the QR is a convenience, the paymentRequest is the product.
+  if (args.qr) {
+    try {
+      const { renderInvoiceQr } = require('./qr_invoice');
+      Object.assign(creationResult, renderInvoiceQr(invoice.paymentRequest));
+    } catch (e) {
+      console.error(`QR rendering failed (non-fatal): ${e.message}`);
+    }
+  }
+
   console.log(JSON.stringify(creationResult, null, 2));
 
   // 3. Detect settlement via LUD-21 verify (the only cross-provider signal).

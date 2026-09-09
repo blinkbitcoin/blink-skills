@@ -31,11 +31,16 @@ const fakeSdk = {
     return { balanceSats: balance };
   },
   async listPayments(req) {
-    if (echo) console.error(`STUB_LIMIT=${req && req.limit}`);
+    if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);
+    if (echo && req && req.typeFilter) console.error(`STUB_TYPEFILTER=${req.typeFilter.join(',')}`);
     return payments;
   },
   async parse(input) {
     if (echo) console.error(`STUB_DESTINATION=${input}`);
+    // SPARK_STUB_PARSE_TYPE forces a parse result type so tests can exercise
+    // unsupported destinations (e.g. bitcoinAddress) and the sparkAddress path.
+    const forced = process.env.SPARK_STUB_PARSE_TYPE;
+    if (forced) return { type: forced };
     return input.includes('@') ? { type: 'lnUrlPay', callback: 'https://blink.sv/cb' } : { type: 'bolt11Invoice' };
   },
   async prepareLnurlPay(req) {

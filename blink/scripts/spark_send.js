@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Non-custodial (Spark) SEND
  *
- * Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]
+ * Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
  *
  * Sends BTC from a NON-CUSTODIAL (Spark) account by SIGNING the transaction
  * locally with the account seed, via the Breez Spark SDK. This is the
@@ -28,6 +28,14 @@
  * SAFETY:
  *   - Always resolves fees via the prepare step first and prints them.
  *   - --dry-run prepares only (fees shown) and does NOT send.
+ *   - Budget controls: BLINK_BUDGET_HOURLY_SATS / BLINK_BUDGET_DAILY_SATS are
+ *     enforced when configured (like the custodial pay commands); an
+ *     unconfigured budget does not block this explicit one-shot payment.
+ *     The amount is RESERVED under the budget lock before sending and
+ *     finalized (or released on failure) after, so concurrent sends cannot
+ *     jointly exceed a limit. Successful/pending sends are recorded in the
+ *     spending log.
+ *   - --force bypasses the budget check for an over-limit send.
  *   - The seed (SPARK_MNEMONIC) is never logged.
  *
  * Environment:
@@ -40,17 +48,21 @@
  */
 
 const { connect } = require('./_spark_sdk');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 
 function parseArgs(argv) {
   let destination = null;
   let amountSats = null;
   let dryRun = false;
+  let force = false;
   let network = process.env.SPARK_NETWORK || 'mainnet';
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--force') {
+      force = true;
     } else if (arg === '--network' && i + 1 < argv.length) {
       network = argv[i + 1];
       i++;
@@ -61,7 +73,7 @@ function parseArgs(argv) {
       if (isNaN(amountSats) || amountSats <= 0) throw new Error('amount_sats must be a positive integer');
     }
   }
-  return { destination, amountSats, dryRun, network };
+  return { destination, amountSats, dryRun, force, network };
 }
 
 function feeFromPrepare(prepareResponse) {
@@ -93,6 +105,31 @@ function feeFromPrepare(prepareResponse) {
     return Number.isNaN(n) ? null : n;
   }
   return null;
+}
+
+/**
+ * Classify an SDK parse() result into one of the routing targets this skill
+ * supports. EXHAUSTIVE by design: the SDK recognizes more destination types
+ * than we can pay to (on-chain Bitcoin addresses, BOLT-12 offers, cross-chain
+ * addresses, URLs, ...), and a boolean LNURL-vs-everything-else check would
+ * let any future SDK input type silently fall into the generic
+ * prepareSendPayment path without ever having been validated for it. Only the
+ * four types below are allowed; everything else is rejected by name.
+ *
+ * @param {object} parsed  Result of sdk.parse(destination).
+ * @returns {{ type: 'lnurl'|'bolt11'|'spark', parsed: object }}
+ * @throws {Error} code UNSUPPORTED_DESTINATION for any unrecognized type.
+ */
+function classifyDestination(parsed) {
+  const t = parsed && typeof parsed.type === 'string' ? parsed.type.toLowerCase() : '';
+  if (t === 'lnurlpay' || t === 'lightningaddress') return { type: 'lnurl', parsed };
+  if (t === 'bolt11invoice') return { type: 'bolt11', parsed };
+  if (t === 'sparkaddress') return { type: 'spark', parsed };
+  const e = new Error(
+    `Unsupported destination type '${t || 'unknown'}'. Supported: BOLT-11 invoice, Spark address, Lightning Address, LNURL-pay URL.`,
+  );
+  e.code = 'UNSUPPORTED_DESTINATION';
+  throw e;
 }
 
 /**
@@ -180,7 +217,9 @@ function isFailedStatus(status) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.destination || args.amountSats === null) {
-    console.error('Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]');
+    console.error(
+      'Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]',
+    );
     process.exit(1);
   }
 
@@ -190,15 +229,19 @@ async function main() {
   try {
     // 1. Classify the destination.
     const parsed = await sdk.parse(args.destination);
-    const lnurl = isLnurlPayInput(parsed);
+    // Exhaustive classification: anything the SDK recognizes but this skill
+    // does not pay to (on-chain, BOLT-12, cross-chain, ...) is rejected here,
+    // before any prepare or budget interaction.
+    const dest = classifyDestination(parsed);
     console.error(
-      `Destination classified as ${lnurl ? 'Lightning Address / LNURL-pay' : 'BOLT-11 invoice / Spark address'}.`,
+      `Destination classified as ${dest.type === 'lnurl' ? 'Lightning Address / LNURL-pay' : dest.type === 'spark' ? 'Spark address' : 'BOLT-11 invoice'}.`,
     );
 
     // 2. Prepare (resolves fees) via the matching path.
-    const { prepareResponse, feeSats } = lnurl
-      ? await prepareLnurl(sdk, parsed, args.amountSats)
-      : await prepareBolt(sdk, args.destination, args.amountSats);
+    const { prepareResponse, feeSats } =
+      dest.type === 'lnurl'
+        ? await prepareLnurl(sdk, dest.parsed, args.amountSats)
+        : await prepareBolt(sdk, args.destination, args.amountSats);
 
     console.error(`Prepared payment. Estimated fee: ${feeSats === null ? 'unknown' : `${feeSats} sats`}.`);
 
@@ -209,7 +252,7 @@ async function main() {
             event: 'send_prepared',
             dryRun: true,
             destination: args.destination,
-            destinationType: lnurl ? 'lnurl' : 'bolt11',
+            destinationType: dest.type,
             amountSats: args.amountSats,
             feeSats,
             network: args.network,
@@ -221,10 +264,80 @@ async function main() {
       return;
     }
 
-    // 3. Send (signs locally) via the matching path.
-    const result = lnurl ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
+    // ── Budget reservation ──
+    // The limit decision AND the reservation append happen under one lock, so
+    // two concurrent sends can never both pass the same remaining budget. Same
+    // treatment as the custodial one-shot payments (pay-invoice & co): the
+    // budget is enforced when configured, but an unconfigured budget must not
+    // block an explicitly user-initiated payment, so opt out of the fail-closed
+    // default that guards autonomous L402 auto-pay. --force overrides.
+    // Budgets count the payment PRINCIPAL, not the routing fee — same
+    // convention as the custodial pay commands.
+    let reservationId = null;
+    if (!args.force) {
+      const reservation = reserveBudget(
+        { sats: args.amountSats, command: 'spark-send', domain: null },
+        { requireConfigured: false },
+      );
+      if (!reservation.allowed) {
+        throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
+      }
+      reservationId = reservation.id; // null when no budget is configured
+    }
+
+    // 3. Send (signs locally) via the matching path. A throw after the send
+    // was dispatched (timeout, lost response, SDK error) does NOT prove the
+    // payment failed — the payment may still settle. Keep the reservation
+    // reserved (fail-closed) rather than freeing the budget for a retry.
+    let result;
+    try {
+      result =
+        dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
+    } catch (e) {
+      if (reservationId) {
+        console.error(
+          `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+            `(fail-closed, auto-cleared by the 25h prune). Inspect \`spark-transactions\` before retrying.`,
+        );
+      }
+      throw e;
+    }
     const payment = result && result.payment ? result.payment : result;
     const status = (payment && payment.status) || 'SUBMITTED';
+
+    // Record the spend unless the SDK says the payment failed — same rule as
+    // the custodial pay commands ("only successful/pending payments are
+    // logged"). Non-fatal, but never silent: a spend that escapes the budget
+    // log would make later budget checks overestimate what is left.
+    if (!isFailedStatus(status)) {
+      try {
+        if (reservationId) {
+          const outcome = finalizeOrRecord(reservationId, {
+            sats: args.amountSats,
+            command: 'spark-send',
+            domain: null,
+          });
+          if (outcome === 'restored') {
+            console.error(
+              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+            );
+          }
+        } else {
+          recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
+        }
+      } catch (e) {
+        console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+      }
+    } else if (reservationId) {
+      // Explicit terminal failure — the payment did not happen, free the budget.
+      try {
+        releaseReservation(reservationId);
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
+      }
+    }
 
     console.log(
       JSON.stringify(
@@ -232,7 +345,7 @@ async function main() {
           event: 'send_result',
           status,
           destination: args.destination,
-          destinationType: lnurl ? 'lnurl' : 'bolt11',
+          destinationType: dest.type,
           amountSats: args.amountSats,
           feeSats,
           paymentId: (payment && (payment.id || payment.paymentHash)) || null,
@@ -276,4 +389,14 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, feeFromPrepare, isLnurlPayInput, lnurlPayRequestFrom, isFailedStatus };
+module.exports = {
+  main,
+  parseArgs,
+  feeFromPrepare,
+  isLnurlPayInput,
+  lnurlPayRequestFrom,
+  isFailedStatus,
+  classifyDestination,
+  prepareLnurl,
+  prepareBolt,
+};

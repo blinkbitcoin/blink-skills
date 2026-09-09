@@ -38,7 +38,7 @@ metadata:
     homepage: 'https://github.com/blinkbitcoin/blink-skills'
     security:
       secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
-      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands only'
+      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient''s address/callback hosts during SDK parse/prepare (before a budget rejection)'
       filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command is used'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
       notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
@@ -71,7 +71,7 @@ commands). Key concepts:
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
 - **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
@@ -151,7 +151,7 @@ These rules are mandatory for any AI agent using this skill:
 6. **Never log or display the API key.** Treat `BLINK_API_KEY` as a secret. Do not echo it, include it in messages, or write it to files.
 7. **Prefer staging for testing.** When the user is testing or learning, suggest setting `BLINK_API_URL` to the staging endpoint.
 8. **Respect irreversibility.** Warn the user that Lightning payments and swaps cannot be reversed once executed.
-9. **L402 auto-pay requires configuration and confirmation.** `l402-pay` fails closed: it refuses to pay unless an explicit spending budget (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) and a non-empty domain allowlist (`BLINK_L402_ALLOWED_DOMAINS` or `blink budget allowlist add`) are configured. It also refuses when the invoice amount cannot be decoded, since no limit can be applied to an unknown sum. Never call `l402-pay` without dry-running first (`--dry-run`) and confirming the satoshi amount with the user. The token cache (`~/.blink/l402-tokens.json`) means subsequent calls may reuse a paid token silently — inform the user when a cached token is used.
+9. **L402 auto-pay requires configuration and confirmation.** `l402-pay` fails closed: it refuses to pay unless an explicit spending budget (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) and a non-empty domain allowlist (`BLINK_L402_ALLOWED_DOMAINS` or `blink budget allowlist add`) are configured. It also refuses when the invoice amount cannot be decoded or is below 1 satoshi, since no limit can be applied to an unknown or unenforceable sum. Never call `l402-pay` without dry-running first (`--dry-run`) and confirming the satoshi amount with the user. The token cache (`~/.blink/l402-tokens.json`) means subsequent calls may reuse a paid token silently — inform the user when a cached token is used.
 
 ## Bitcoin Units
 
@@ -210,7 +210,7 @@ These rules are mandatory for any AI agent using this skill:
 - Resolve a `user@blink.sv` recipient with `blink resolve-receiver` (credential-free).
 - Receive with `blink create-invoice-lnaddress` (credential-free, works for both account types).
 - Balance / send / history / events need `SPARK_MNEMONIC` + `BREEZ_API_KEY` (Node 22+).
-- Dry-run `spark-send` first; it is **not** covered by budget controls.
+- Probe fees with `spark-fee-probe` (or `spark-send --dry-run`) first; budget limits apply when configured.
 
 8. Apply safety constraints:
 
@@ -259,9 +259,9 @@ blink resolve-receiver alice@blink.sv
 # Receive to any Blink Lightning Address — no API key, no seed
 blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 
-# Non-custodial (Spark) account: balance, dry-run send, history
+# Non-custodial (Spark) account: balance, fee probe, history
 blink spark-balance
-blink spark-send lnbc1000n1... 1000 --dry-run
+blink spark-fee-probe lnbc1000n1... 1000
 blink spark-transactions --limit 5
 ```
 
@@ -456,10 +456,14 @@ Classifies a Blink identifier (bare username or `user@blink.sv`) as `custodial` 
 blink create-invoice-lnaddress <lightning_address> <amount_sats> [memo...] [--timeout <seconds>] [--no-verify]
 ```
 
-Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay — **no API key and no seed required**, and it works whether the recipient is custodial or non-custodial (Spark); the LNURL server routes internally. Outputs two JSON objects: `invoice_created` immediately, then `verify_result` (`PAID`/`TIMEOUT`) once the LUD-21 verify URL reports settlement. For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
+Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay — **no API key and no seed required**, and it works whether the recipient is custodial or non-custodial (Spark); the LNURL server routes internally. Classification first sends an unauthenticated `accountDefaultWallet` request to the Blink API host (`BLINK_API_URL`); if that probe fails at the transport level, the command aborts (`CUSTODIAL_PROBE_FAILED`) instead of guessing the account type. It outputs `invoice_created` immediately; a second JSON object follows **only when settlement polling is active** (see below). For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
 
 - `--timeout <seconds>` — verify-poll timeout (default: 300, 0 = no timeout)
 - `--no-verify` — skip settlement polling; just create the invoice and exit
+
+**Output cardinality is conditional.** `invoice_created` is always emitted. The second object (`verify_result`, `PAID`/`TIMEOUT`) follows only if polling is active: `--no-verify` was **not** passed **and** the first JSON contains a `verifyUrl`. Check `verifyUrl` in the first JSON before waiting — when it is absent, the command emits exactly one object and exits.
+
+- `--qr` — render a terminal QR (stderr) and a PNG in /tmp for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
 
 ### Spark Balance
 
@@ -472,22 +476,30 @@ Reads the BTC balance of a self-custodial (Spark) account directly from the wall
 ### Spark Send
 
 ```bash
-blink spark-send <destination> <amount_sats> [--dry-run] [--network mainnet|regtest]
+blink spark-send <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
 ```
 
-Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destination may be a BOLT-11 invoice, Lightning Address, LNURL, or Spark address (classified automatically; a Lightning Address uses the LNURL-pay path). Fees are always resolved and printed before sending; `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
+Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destinations are classified **exhaustively**: only BOLT-11 invoices, Spark addresses, Lightning Addresses, and LNURL-pay URLs are accepted (a Lightning Address uses the LNURL-pay path). Anything else the SDK recognizes — on-chain Bitcoin addresses, BOLT-12 offers, cross-chain destinations — is rejected with `UNSUPPORTED_DESTINATION` before any prepare or budget interaction, and `destinationType` in the output is `bolt11`, `spark`, or `lnurl` accordingly. The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
 
-**Not covered by budget controls or the spending log** — this spends self-custodial funds directly (see [non-custodial](references/non-custodial.md)).
+Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log (a failed recording warns on stderr but never masks the payment result). `--force` bypasses the budget check for an over-limit send. **Budgets count the payment principal (the amount), not the routing fee** — the same convention as the custodial pay commands.
 
-> **AGENT:** This command spends self-custodial funds irreversibly. Always run `--dry-run` first, then confirm the amount and destination with the user before executing.
+> **AGENT:** This command spends self-custodial funds irreversibly. Probe the fee (`spark-fee-probe` or `--dry-run`) first, then confirm the amount and destination with the user before executing.
+
+### Spark Fee Probe
+
+```bash
+blink spark-fee-probe <destination> <amount_sats> [--network mainnet|regtest]
+```
+
+Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Same exhaustive destination allowlist as `spark-send`. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded.
 
 ### Spark Transactions
 
 ```bash
-blink spark-transactions [--limit <n>] [--network mainnet|regtest]
+blink spark-transactions [--limit <n>] [--offset <n>] [--type send|receive] [--network mainnet|regtest]
 ```
 
-Lists recent Spark account payments from SDK-local history (`--limit`, default 20). This history is invisible to the Blink API.
+Lists recent Spark account payments from SDK-local history: `--limit` (default 20), `--offset` for pagination, `--type send|receive` to filter by direction. Output includes a `pageInfo` block — `hasNextPage` is `true` only when the page came back full. This history is invisible to the Blink API.
 
 ### Spark Subscribe
 
@@ -521,35 +533,35 @@ Streams account updates in real time. Each event is output as a JSON line (NDJSO
 
 ## API Reference
 
-| Operation          | GraphQL                                     | Scope Required    |
-| ------------------ | ------------------------------------------- | ----------------- |
-| Check balance      | `query me` + `currencyConversionEstimation` | Read              |
-| Create BTC invoice | `mutation lnInvoiceCreate`                  | Receive           |
-| Create USD invoice | `mutation lnUsdInvoiceCreate`               | Receive           |
-| Check invoice      | `query invoiceByPaymentHash`                | Read              |
-| Pay invoice        | `mutation lnInvoicePaymentSend`             | Write             |
-| Pay LN address     | `mutation lnAddressPaymentSend`             | Write             |
-| Pay LNURL          | `mutation lnurlPaymentSend`                 | Write             |
-| Fee estimate (BTC) | `mutation lnInvoiceFeeProbe`                | Read              |
-| Fee estimate (USD) | `mutation lnUsdInvoiceFeeProbe`             | Read              |
-| Swap BTC→USD       | `mutation intraLedgerPaymentSend`           | Write             |
-| Swap USD→BTC       | `mutation intraLedgerUsdPaymentSend`        | Write             |
-| Transactions       | `query transactions`                        | Read              |
-| Price / convert    | `query currencyConversionEstimation`        | **None (public)** |
-| Price history      | `query btcPriceList`                        | **None (public)** |
-| Currency list      | `query currencyList`                        | **None (public)** |
-| Realtime price     | `query realtimePrice`                       | **None (public)** |
-| Account info       | `query me` + `currencyConversionEstimation` | Read              |
-| Subscribe invoice  | `subscription lnInvoicePaymentStatus`       | Read              |
-| Subscribe updates  | `subscription myUpdates`                    | Read              |
-| L402 discover      | external HTTP (no Blink API)                | **None**          |
-| L402 pay           | `mutation lnInvoicePaymentSend` (on 402)    | Write             |
-| Resolve receiver   | `query accountDefaultWallet` + `.well-known/lnurlp` (public HTTP) | **None (public)** |
-| Invoice via LNURL  | LNURL-pay (LUD-06/16/21, no Blink API)      | **None (public)** |
-| Spark balance      | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark send         | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark transactions | Breez Spark SDK (no Blink API)              | **Seed** (`SPARK_MNEMONIC`) |
-| Spark subscribe    | Breez Spark SDK events (no Blink API)       | **Seed** (`SPARK_MNEMONIC`) |
+| Operation          | GraphQL                                                                                           | Scope Required              |
+| ------------------ | ------------------------------------------------------------------------------------------------- | --------------------------- |
+| Check balance      | `query me` + `currencyConversionEstimation`                                                       | Read                        |
+| Create BTC invoice | `mutation lnInvoiceCreate`                                                                        | Receive                     |
+| Create USD invoice | `mutation lnUsdInvoiceCreate`                                                                     | Receive                     |
+| Check invoice      | `query invoiceByPaymentHash`                                                                      | Read                        |
+| Pay invoice        | `mutation lnInvoicePaymentSend`                                                                   | Write                       |
+| Pay LN address     | `mutation lnAddressPaymentSend`                                                                   | Write                       |
+| Pay LNURL          | `mutation lnurlPaymentSend`                                                                       | Write                       |
+| Fee estimate (BTC) | `mutation lnInvoiceFeeProbe`                                                                      | Read                        |
+| Fee estimate (USD) | `mutation lnUsdInvoiceFeeProbe`                                                                   | Read                        |
+| Swap BTC→USD       | `mutation intraLedgerPaymentSend`                                                                 | Write                       |
+| Swap USD→BTC       | `mutation intraLedgerUsdPaymentSend`                                                              | Write                       |
+| Transactions       | `query transactions`                                                                              | Read                        |
+| Price / convert    | `query currencyConversionEstimation`                                                              | **None (public)**           |
+| Price history      | `query btcPriceList`                                                                              | **None (public)**           |
+| Currency list      | `query currencyList`                                                                              | **None (public)**           |
+| Realtime price     | `query realtimePrice`                                                                             | **None (public)**           |
+| Account info       | `query me` + `currencyConversionEstimation`                                                       | Read                        |
+| Subscribe invoice  | `subscription lnInvoicePaymentStatus`                                                             | Read                        |
+| Subscribe updates  | `subscription myUpdates`                                                                          | Read                        |
+| L402 discover      | external HTTP (no Blink API)                                                                      | **None**                    |
+| L402 pay           | `mutation lnInvoicePaymentSend` (on 402)                                                          | Write                       |
+| Resolve receiver   | unauthenticated `accountDefaultWallet` probe (Blink GraphQL) + `.well-known/lnurlp` (public HTTP) | **None (public)**           |
+| Invoice via LNURL  | unauthenticated `accountDefaultWallet` probe (Blink GraphQL) + LNURL-pay (LUD-06/16/21)           | **None (public)**           |
+| Spark balance      | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark send         | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark transactions | Breez Spark SDK (no Blink API)                                                                    | **Seed** (`SPARK_MNEMONIC`) |
+| Spark subscribe    | Breez Spark SDK events (no Blink API)                                                             | **Seed** (`SPARK_MNEMONIC`) |
 
 **API Endpoint:** `https://api.blink.sv/graphql` (production)
 **Authentication:** `X-API-KEY` header
@@ -775,11 +787,25 @@ Second JSON (when payment resolves):
       "feeSats": 0,
       "timestamp": 1740000000
     }
-  ]
+  ],
+  "pageInfo": { "hasNextPage": false, "limit": 20, "offset": 0 }
 }
 ```
 
-**create-invoice-lnaddress (two-phase):** first JSON is `invoice_created` (`accountType`, `lightningAddress`, `paymentRequest`, `verifyUrl`, `satoshis`); second JSON is `verify_result` with `status` `"PAID"` or `"TIMEOUT"` — only for non-custodial recipients that return a LUD-21 verify URL.
+**spark-fee-probe:**
+
+```json
+{
+  "event": "fee_probe",
+  "destination": "lnbc1000n1...",
+  "destinationType": "bolt11",
+  "amountSats": 1000,
+  "feeSats": 1,
+  "network": "mainnet"
+}
+```
+
+**create-invoice-lnaddress (two-phase):** first JSON is `invoice_created` (`accountType`, `lightningAddress`, `paymentRequest`, `verifyUrl`, `satoshis`); second JSON is `verify_result` with `status` `"PAID"` or `"TIMEOUT"` — emitted **only when polling is active**: `--no-verify` was not passed and `verifyUrl` is present in the first JSON. Inspect `verifyUrl` before waiting; without it, exactly one object is emitted.
 
 ## Typical Agent Workflows
 
@@ -838,7 +864,9 @@ blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 # → First JSON: {"event": "invoice_created", "accountType": "lnaddress", "paymentRequest": "lnbc...", "verifyUrl": "https://...", ...}
 # Generate QR from paymentRequest (blink qr works on any BOLT-11) and send to the payer
 
-# 3. Second JSON when settled: {"event": "verify_result", "status": "PAID", ...}
+# 3. If verifyUrl was present (and --no-verify was not passed), wait for the second JSON:
+# → {"event": "verify_result", "status": "PAID", ...}
+# If verifyUrl is absent, the command already emitted its only JSON object and exited.
 # For Spark recipients the settled flag is webhook-populated and can lag a few seconds.
 ```
 
@@ -847,9 +875,9 @@ blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 ```bash
 # Requires SPARK_MNEMONIC + BREEZ_API_KEY (Node 22+)
 
-# 1. Dry-run to resolve fees (no funds moved)
-blink spark-send lnbc1000n1... 1000 --dry-run
-# → {"event": "send_prepared", "feeSats": 1, ...}
+# 1. Probe the fee (nothing is sent)
+blink spark-fee-probe lnbc1000n1... 1000
+# → {"event": "fee_probe", "feeSats": 1, ...}
 
 # 2. Check balance
 blink spark-balance
@@ -1379,9 +1407,10 @@ Env vars take precedence over the config file (`~/.blink/budget.json`):
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:
 
-- **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`.
-  You chose the recipient and amount, so these run with or without a budget. If
-  limits are configured they are enforced; if not, the payment proceeds.
+- **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`,
+  `spark-send`. You chose the recipient and amount, so these run with or
+  without a budget. If limits are configured they are enforced; if not, the
+  payment proceeds.
 - **Autonomous L402 auto-pay** — `l402-pay`, and `l402-info --report` which
   delegates to it. These spend without a human in the loop for each payment, so
   they **fail closed**: with no budget configured, or an empty domain
@@ -1394,7 +1423,8 @@ blink budget status                              # Show current spend vs limits
 blink budget set --hourly 1000 --daily 5000      # Set spending limits
 blink budget set --off                           # Remove all limits
 blink budget log [--last 10]                     # Show recent spending entries
-blink budget reset                               # Clear spending history
+blink budget reset                               # Clear finalized history (keeps active reservations)
+blink budget reset --force                       # Clear EVERYTHING incl. reservations — unsafe mid-payment
 blink budget allowlist list                      # Show allowed L402 domains
 blink budget allowlist add satring.com           # Add domain to allowlist
 blink budget allowlist remove satring.com        # Remove domain from allowlist
@@ -1421,15 +1451,20 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 
 ### How Budget Enforcement Works
 
-- **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`
+- **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send` (after fee resolution, before signing)
+- **Reserved, not just checked:** the amount is **reserved** under the budget lock before the payment executes, then finalized (success/pending) or released (known failure) — two concurrent payments can never both pass the same remaining budget. **Outcome-unknown errors after dispatch** (timeout, lost response) keep the reservation in place: the payment may still settle, so the budget stays blocked until the 25h prune. A crash between payment and finalization behaves the same; reserved entries appear in `budget log` with `"state": "reserved"`.
+- **Principal only:** budgets count the payment amount, not the routing fee — for the custodial commands and `spark-send` alike. Invoice amounts are charged **ceil with a 1-sat minimum for any positive decodable amount** (a 1400-msat invoice charges 2 sats; a 500-msat invoice charges 1 sat — explicit payments can never move funds untracked). `l402-pay` additionally refuses invoices below 1 satoshi entirely; its dry-run preview uses the exact same charge as execution.
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
 - **Fail closed for auto-pay:** `l402-pay` refuses to run unless a budget AND a non-empty domain allowlist are explicitly configured (`NO_BUDGET_CONFIGURED` / `NO_ALLOWLIST_CONFIGURED` errors explain the setup)
-- **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply
-- **Not covered:** `spark-send` (non-custodial, signs locally via the Breez SDK) does not go through budget enforcement and is not recorded in the spending log
+- **`--force` never bypasses these checks:** on `l402-pay` it forces a fresh payment instead of reusing a cached token; budget and allowlist still apply. On `spark-send` it is the explicit opt-out for an over-limit one-shot send.
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
+- **`budget reset` and in-flight reservations:** an ordinary reset clears finalized history but **keeps active reservations**, so a payment in flight never reopens its allowance window. `budget reset --force` clears everything (the escape hatch for wedged reservations); if a force-cleared payment later completes, its spend is re-recorded — but the freed allowance can briefly be reused, so never force-reset while payments are in flight.
+- **Lock recovery:** budget mutations hold a lockfile at `~/.blink/.spending-log.lock` (max a few seconds each). If a crashed process leaves it behind, commands time out with a `BUDGET_LOCK_TIMEOUT` error — remove the file manually; automatic stale takeover is deliberately not attempted.
+- **Corrupt log fails closed:** if the spending log can't be read or parsed, budget checks and payments throw `BUDGET_LOG_CORRUPT` — prior spend is unknown and is never treated as zero, and the damaged file is never overwritten. Recover with `blink budget reset --force` (discards it) or fix/remove the file manually.
+- **Corrupt config fails closed too:** a damaged `~/.blink/budget.json` throws `BUDGET_CONFIG_CORRUPT` rather than silently dropping your limits; a garbage limit env var (e.g. `BLINK_BUDGET_DAILY_SATS=abc`) throws `BUDGET_ENV_INVALID` naming the variable instead of being treated as unset. Recover by fixing or removing the file, then re-run `blink budget set`. Options are scoped per subcommand — `budget status --force` errors instead of being ignored.
 
 > **AGENT:** Before making a payment, check budget status with `blink budget status` to see remaining budget. If budget is exceeded, inform the user and suggest increasing limits with `blink budget set`.
 
@@ -1447,9 +1482,9 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Outbound HTTPS** to `api.blink.sv` (or `BLINK_API_URL` override) for all GraphQL queries and mutations.
 - **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
 - **L402 requests** go directly to the third-party URL you provide to `l402-discover` or `l402-pay`. The Blink API is contacted only when a payment is needed.
-- **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts `blink.sv` and its LNURL service host `lnurl.blink.sv` only — both allowlisted, every redirect re-validated.
-- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). Signing happens locally; the seed never leaves the machine.
-- **No other network calls.** Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
+- **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts the Blink API host (`BLINK_API_URL`) for an **unauthenticated `accountDefaultWallet` classification probe**, then `blink.sv` and its LNURL service host `lnurl.blink.sv` — all allowlisted, every redirect re-validated. A transport/5xx failure of the probe aborts (`CUSTODIAL_PROBE_FAILED`) rather than assuming the recipient is non-custodial; only an authoritative "no such custodial account" answer falls through to LNURL. Blocking the GraphQL host therefore breaks both credential-free commands.
+- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). `spark-send` and `spark-fee-probe` with a Lightning Address or LNURL destination also contact the **recipient's LNURL service** — the address domain and its callback host — during SDK parse/prepare. Note this happens *before* a configured budget can reject an over-limit send. Signing happens locally; the seed never leaves the machine.
+- **No other network calls** beyond those listed here. Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
 
 ### Filesystem Access
 
@@ -1464,7 +1499,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 Most scripts are stateless. Exceptions:
 
 - `l402-pay` maintains a token cache at `~/.blink/l402-tokens.json` to avoid re-paying for previously-accessed L402 services. Use `--no-store` to run without any persistence.
-- All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
+- All payment commands (`pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send`) log spending to `~/.blink/spending-log.json` for budget enforcement. This log is auto-pruned and can be cleared with `blink budget reset`.
 - `spark-*` commands persist Breez SDK wallet state at `~/.blink/spark/<network>-<hash>`. Deleting that directory resets local state (funds live on Spark; the seed restores the wallet).
 
 ### Payment Safety
@@ -1520,5 +1555,6 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/create_invoice_lnaddress.js` — Receive to any Blink Lightning Address via public LNURL-pay (no credentials)
 - `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
 - `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
+- `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee to send from a Spark account (prepare only, nothing sent)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)
 - `{baseDir}/scripts/spark_subscribe.js` — Stream live Spark wallet events

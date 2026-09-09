@@ -52,12 +52,20 @@ const {
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,
+  budgetChargeFromInvoice,
   fetchL402ProtocolInvoice,
 } = require('./l402_discover');
 
 const { saveToken, getToken } = require('./l402_store');
 
-const { checkBudget, checkDomainAllowed, recordSpend } = require('./_budget');
+const {
+  reserveBudget,
+  finalizeOrRecord,
+  releaseReservation,
+  recordSpend,
+  checkBudget,
+  checkDomainAllowed,
+} = require('./_budget');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -582,12 +590,62 @@ async function main() {
   console.error(`Format: ${challenge.format}`);
 
   const satoshis = decodeBolt11AmountSats(challenge.invoice);
+  // The budget charge, structured: msats=null means undecodable; any positive
+  // decodable amount charges max(1, ceil(msats/1000)). Enforcement (refusal,
+  // --max-amount, reservation, record) uses the charge — never the
+  // round-to-nearest display value, which can push a sub-satoshi invoice up
+  // to 1 sat or shave fractions off larger ones.
+  const charge = budgetChargeFromInvoice(challenge.invoice);
+  const budgetSats = charge.budgetSats;
 
   if (satoshis === null) {
     console.error('Warning: could not decode amount from invoice.');
   } else {
     console.error(`Payment required: ${satoshis} sats`);
   }
+  if (budgetSats !== null && budgetSats !== satoshis) {
+    console.error(`Note: budget charges ${budgetSats} sats conservatively for this fractional-satoshi invoice.`);
+  }
+
+  // An undecodable — or sub-satoshi — amount cannot be budget-checked, so
+  // paying it would spend a sum against limits that were never applied.
+  // Refusal applies to dry-run exactly like real execution: a preview must
+  // never green-light what execution rejects.
+  if (charge.msats === null || charge.msats < 1000) {
+    const output = {
+      event: 'l402_amount_undecodable',
+      url: args.url,
+      canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+      invoice: challenge.invoice,
+      invoiceMsats: charge.msats,
+      message:
+        'Refusing to pay: the invoice amount could not be decoded or is below 1 satoshi, so budget ' +
+        'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
+        'invoice explicitly with `blink pay-invoice` if you trust it.',
+    };
+    console.log(JSON.stringify(output, null, 2));
+    process.exit(1);
+  }
+
+  // Budget reservation state at function scope: the reservation happens inside
+  // the enforcement block below, but the pay section that follows must be able
+  // to finalize it (success) or release it (known failure) — and max-amount
+  // refusals in between must release it too. Credentials are likewise resolved
+  // BEFORE the reservation so a missing key cannot orphan it.
+  let reservationId = null;
+  let apiKey = null;
+  let apiUrl = null;
+  const releaseReservationSafely = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
+      }
+    }
+  };
 
   // ── Payment enforcement (fail closed) ──
   // A payment is about to be made: require an explicitly configured domain
@@ -610,50 +668,40 @@ async function main() {
       process.exit(1);
     }
 
-    // An undecodable amount cannot be budget-checked, so paying it would spend
-    // an unknown sum against limits that were never applied. Refuse rather
-    // than delegate the decision to the backend: `checkBudget` was previously
-    // skipped entirely when `satoshis` was null, which silently defeated both
-    // the budget and --max-amount guards for amountless invoices.
-    if (satoshis === null) {
-      const output = {
-        event: 'l402_amount_undecodable',
-        url: args.url,
-        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        invoice: challenge.invoice,
-        message:
-          'Refusing to pay: the amount could not be decoded from the L402 invoice, so budget ' +
-          'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
-          'invoice explicitly with `blink pay-invoice` if you trust it.',
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-
-    const budgetResult = checkBudget(satoshis, { requireConfigured: true });
-    if (!budgetResult.allowed) {
+    // ── Budget reservation (fail closed for autonomous auto-pay) ──
+    // The limit decision AND the reservation append happen under one lock, so
+    // two concurrent payments can never both pass the same remaining budget.
+    // Credentials are resolved FIRST: a missing API key must not orphan the
+    // reservation (no payment is attempted in that case, so nothing should
+    // stay reserved).
+    apiKey = getApiKey();
+    apiUrl = getApiUrl();
+    const reservation = reserveBudget({ sats: budgetSats, command: 'l402-pay', domain }, { requireConfigured: true });
+    if (!reservation.allowed) {
       const output = {
         event: 'l402_budget_exceeded',
         url: args.url,
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         satoshis,
-        ...budgetResult,
-        message: budgetResult.reason,
+        ...reservation,
+        message: reservation.reason,
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(1);
     }
+    reservationId = reservation.id;
   }
 
   // ── Per-request max-amount check ──
-  if (args.maxAmount !== null && satoshis !== null && satoshis > args.maxAmount) {
+  if (args.maxAmount !== null && budgetSats !== null && budgetSats > args.maxAmount) {
+    releaseReservationSafely();
     const output = {
       event: 'l402_budget_exceeded',
       url: args.url,
       canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
       satoshis,
       maxAmount: args.maxAmount,
-      message: `Payment of ${satoshis} sats exceeds --max-amount of ${args.maxAmount} sats. Aborting.`,
+      message: `Payment of ${budgetSats} sats exceeds --max-amount of ${args.maxAmount} sats. Aborting.`,
     };
     console.log(JSON.stringify(output, null, 2));
     process.exit(1);
@@ -661,9 +709,12 @@ async function main() {
 
   // ── Dry-run: report price and exit ──
   if (args.dryRun) {
-    // Reporting only — dry-run never spends. Opt out of the fail-closed default
-    // so an unconfigured budget shows remaining limits instead of a denial.
-    const budgetInfo = satoshis !== null ? checkBudget(satoshis, { requireConfigured: false }) : null;
+    // Reporting only — dry-run never spends. The preview uses the SAME
+    // conservative charge as real execution (ceil, never round-to-nearest),
+    // and the below-1-sat refusal above already mirrored execution.
+    // Opt out of the fail-closed default so an unconfigured budget shows
+    // remaining limits instead of a denial.
+    const budgetInfo = budgetSats !== null ? checkBudget(budgetSats, { requireConfigured: false }) : null;
     const output = {
       event: 'l402_dry_run',
       url: args.url,
@@ -671,9 +722,11 @@ async function main() {
       format: challenge.format,
       invoice: challenge.invoice,
       satoshis,
+      invoiceMsats: charge.msats,
+      budgetSats,
       satoshisFormatted: satoshis !== null ? `${satoshis} sats` : null,
       maxAmount: args.maxAmount,
-      withinBudget: args.maxAmount !== null && satoshis !== null ? satoshis <= args.maxAmount : null,
+      withinBudget: args.maxAmount !== null && budgetSats !== null ? budgetSats <= args.maxAmount : null,
       budget: budgetInfo
         ? {
             allowed: budgetInfo.allowed,
@@ -692,13 +745,22 @@ async function main() {
   }
 
   // ── Pay the invoice ──
-  const apiKey = getApiKey();
-  const apiUrl = getApiUrl();
-
-  const wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
+  // apiKey/apiUrl were resolved in the enforcement block above, before the
+  // reservation. Every throw between here and a successful payment must
+  // RELEASE the reservation when it happens before dispatch (setup failures)
+  // and KEEP it after dispatch (outcome unknown — the payment may settle).
+  let wallet;
+  let payData;
+  try {
+    wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
+  } catch (e) {
+    releaseReservationSafely();
+    throw e;
+  }
   console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
 
   if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
+    releaseReservationSafely();
     throw new Error('Insufficient balance: BTC wallet has 0 sats.');
   }
 
@@ -726,26 +788,67 @@ async function main() {
 
   console.error(`Paying ${satoshis ?? '?'} sats via Blink...`);
 
-  const payData = await graphqlRequest({
-    query: PAY_INVOICE_MUTATION,
-    variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  try {
+    payData = await graphqlRequest({
+      query: PAY_INVOICE_MUTATION,
+      variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    // Outcome-unknown after dispatch (timeout, lost response, transport
+    // reset): the payment may still settle, so the reservation STAYS —
+    // freeing it would let another auto-pay double-spend the same window.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
+    throw e;
+  }
 
   const payResult = payData.lnInvoicePaymentSend;
 
   if (payResult.errors && payResult.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
   if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
+    // PENDING is in flight: count it against the budget like the one-shot pay
+    // commands do, then surface the failure — the preimage will not resolve.
+    // Same warn-on-restored / warn-on-throw accounting as the normal record path.
+    if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
+      try {
+        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } catch (err) {
+        console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
+      }
+      reservationId = null;
+    } else {
+      releaseReservationSafely();
+    }
     throw new Error(`Payment not successful: status=${payResult.status}`);
   }
 
   console.error(`Payment ${payResult.status === 'ALREADY_PAID' ? 'already paid' : 'successful'}!`);
+
+  // ALREADY_PAID means THIS invocation moved no funds — release the current
+  // reservation instead of finalizing it (pay_invoice releases for the same
+  // status; finalizing here would double-count the invoice against the budget).
+  if (payResult.status === 'ALREADY_PAID') {
+    releaseReservationSafely();
+    reservationId = null;
+  }
 
   // ── Resolve preimage ──
   // Option A (primary): preImage returned inline via settlementVia in the mutation response.
@@ -793,6 +896,8 @@ async function main() {
         preimage,
         invoice: challenge.invoice,
         satoshis: satoshis ?? null,
+        invoiceMsats: charge.msats,
+        budgetSats,
       });
       console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
@@ -801,9 +906,23 @@ async function main() {
   }
 
   // ── Record spend in budget log ──
-  if (satoshis !== null) {
+  // Finalize the reservation (funds moved) — or, when no budget is configured
+  // (nothing was reserved), record the spend directly so the log stays
+  // complete for unconfigured users too. finalizeOrRecord restores the entry
+  // if the reservation was erased externally (e.g. by `budget reset`).
+  // ALREADY_PAID is excluded above (nothing moved this invocation).
+  if (budgetSats !== null && payResult.status === 'SUCCESS') {
     try {
-      recordSpend({ sats: satoshis, command: 'l402-pay', domain });
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: budgetSats, command: 'l402-pay', domain });
+      }
     } catch (err) {
       console.error(`Warning: could not record spend: ${err.message}`);
     }
@@ -840,6 +959,8 @@ async function main() {
     walletId: wallet.id,
     walletCurrency: args.walletCurrency,
     satoshis: satoshis ?? null,
+    invoiceMsats: charge.msats,
+    budgetSats,
     tokenReused: false,
     feeProbe: feeProbeResult
       ? { estimatedFeeSats: feeProbeResult.estimatedFeeSats, error: feeProbeResult.error }

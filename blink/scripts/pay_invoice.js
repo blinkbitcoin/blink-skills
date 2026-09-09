@@ -32,8 +32,8 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { checkBudget, recordSpend } = require('./_budget');
-const { decodeBolt11AmountSats } = require('./l402_discover');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
+const { budgetChargeFromInvoice } = require('./l402_discover');
 
 const PAY_INVOICE_MUTATION = `
   mutation LnInvoicePaymentSend($input: LnInvoicePaymentInput!) {
@@ -93,44 +93,88 @@ async function main() {
     throw new Error(`Insufficient balance: BTC wallet has 0 sats. Use --force to attempt anyway.`);
   }
 
-  // ── Budget check ──
-  const invoiceSats = decodeBolt11AmountSats(paymentRequest);
+  // ── Budget reservation ──
+  // The limit decision AND the reservation append happen under one lock, so
+  // two concurrent payments can never both pass the same remaining budget.
+  // The amount CHARGED to the budget: null when undecodable (budget tracking
+  // is skipped then — the API enforces wallet limits for those), otherwise
+  // max(1, ceil(msats/1000)). Any positive decodable amount charges at least
+  // 1 sat, so explicit payments can never move funds untracked.
+  const charge = budgetChargeFromInvoice(paymentRequest);
+  const invoiceSats = charge.budgetSats;
+  if (invoiceSats !== null && charge.msats !== null && charge.msats % 1000 !== 0) {
+    console.error(`Note: budget charges ${invoiceSats} sats conservatively for this fractional/sub-satoshi invoice.`);
+  }
+  let reservationId = null;
   if (invoiceSats !== null && !force) {
     // Explicitly user-initiated payment: an unconfigured budget must not block
     // it, so opt out of the fail-closed default that guards autonomous spending.
-    const budgetResult = checkBudget(invoiceSats, { requireConfigured: false });
-    if (!budgetResult.allowed) {
-      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+    const reservation = reserveBudget(
+      { sats: invoiceSats, command: 'pay-invoice', domain: null },
+      { requireConfigured: false },
+    );
+    if (!reservation.allowed) {
+      throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
     }
+    reservationId = reservation.id;
   }
+
+  const releaseReservationSafely = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
+      }
+    }
+  };
 
   const input = {
     walletId: wallet.id,
     paymentRequest,
   };
 
-  const data = await graphqlRequest({
-    query: PAY_INVOICE_MUTATION,
-    variables: { input },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  let data;
+  try {
+    data = await graphqlRequest({
+      query: PAY_INVOICE_MUTATION,
+      variables: { input },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    // Outcome-unknown after dispatch (timeout, lost response, transport
+    // reset): the payment may still settle, so the reservation STAYS —
+    // freeing it would let a retry double-spend the same budget window.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
+    throw e;
+  }
   const result = data.lnInvoicePaymentSend;
 
   if (result.errors && result.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const isSelfPay = result.errors.some(
       (e) =>
         (e.code && e.code.toString().toUpperCase().includes('CANT_PAY_SELF')) ||
         (e.message && e.message.toLowerCase().includes('self')),
     );
     if (isSelfPay) {
+      releaseReservationSafely();
       throw new Error(
         'Cannot pay your own invoice (CANT_PAY_SELF). ' +
           'L402 round-trip testing requires a second Blink account or a separate wallet.',
       );
     }
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -145,28 +189,39 @@ async function main() {
     output.balanceBeforeFormatted = `$${(wallet.balance / 100).toFixed(2)}`;
   }
 
+  const recordOrFinalize = () => {
+    try {
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: invoiceSats, command: 'pay-invoice', domain: null });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+      }
+    } catch (e) {
+      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+    }
+  };
+
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
     if (invoiceSats !== null) {
-      try {
-        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
-      } catch {
-        /* non-fatal */
-      }
+      recordOrFinalize();
     }
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
     if (invoiceSats !== null) {
-      try {
-        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
-      } catch {
-        /* non-fatal */
-      }
+      recordOrFinalize();
     }
   } else if (result.status === 'ALREADY_PAID') {
     console.error('Invoice was already paid.');
+    releaseReservationSafely();
   } else {
     console.error(`Payment status: ${result.status}`);
+    releaseReservationSafely();
   }
 
   console.log(JSON.stringify(output, null, 2));

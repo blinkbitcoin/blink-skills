@@ -35,7 +35,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { checkBudget, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 
 const PAY_LNURL_MUTATION = `
   mutation LnurlPaymentSend($input: LnurlPaymentSendInput!) {
@@ -100,15 +100,50 @@ async function main() {
     `Sending ${amountSats} sats via LNURL from ${walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`,
   );
 
-  // ── Budget check ──
+  // ── Budget reservation ──
+  // The limit decision AND the reservation append happen under one lock, so
+  // two concurrent payments can never both pass the same remaining budget.
+  let reservationId = null;
   if (!dryRun && !force) {
     // Explicitly user-initiated payment: an unconfigured budget must not block
     // it, so opt out of the fail-closed default that guards autonomous spending.
-    const budgetResult = checkBudget(amountSats, { requireConfigured: false });
-    if (!budgetResult.allowed) {
-      throw new Error(`Budget exceeded: ${budgetResult.reason} Use --force to override.`);
+    const reservation = reserveBudget(
+      { sats: amountSats, command: 'pay-lnurl', domain: null },
+      { requireConfigured: false },
+    );
+    if (!reservation.allowed) {
+      throw new Error(`Budget exceeded: ${reservation.reason} Use --force to override.`);
     }
+    reservationId = reservation.id;
   }
+
+  const releaseReservationSafely = () => {
+    if (reservationId) {
+      try {
+        releaseReservation(reservationId);
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
+      }
+    }
+  };
+  const recordOrFinalize = () => {
+    try {
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: amountSats, command: 'pay-lnurl', domain: null });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: amountSats, command: 'pay-lnurl', domain: null });
+      }
+    } catch (e) {
+      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
+    }
+  };
 
   // ── Dry-run: resolve everything, show details, exit without sending ──
   if (dryRun) {
@@ -134,17 +169,32 @@ async function main() {
     amount: amountSats,
   };
 
-  const data = await graphqlRequest({
-    query: PAY_LNURL_MUTATION,
-    variables: { input },
-    apiKey,
-    apiUrl,
-    timeoutMs: MUTATION_TIMEOUT_MS,
-  });
+  let data;
+  try {
+    data = await graphqlRequest({
+      query: PAY_LNURL_MUTATION,
+      variables: { input },
+      apiKey,
+      apiUrl,
+      timeoutMs: MUTATION_TIMEOUT_MS,
+    });
+  } catch (e) {
+    // Outcome-unknown after dispatch: the payment may still settle, so the
+    // reservation STAYS (fail-closed) rather than freeing budget for a retry.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
+    throw e;
+  }
   const result = data.lnurlPaymentSend;
 
   if (result.errors && result.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -162,20 +212,13 @@ async function main() {
 
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
-    try {
-      recordSpend({ sats: amountSats, command: 'pay-lnurl', domain: null });
-    } catch {
-      /* non-fatal */
-    }
+    recordOrFinalize();
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
-    try {
-      recordSpend({ sats: amountSats, command: 'pay-lnurl', domain: null });
-    } catch {
-      /* non-fatal */
-    }
+    recordOrFinalize();
   } else {
     console.error(`Payment status: ${result.status}`);
+    releaseReservationSafely();
   }
 
   console.log(JSON.stringify(output, null, 2));

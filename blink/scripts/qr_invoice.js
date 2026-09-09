@@ -754,19 +754,14 @@ function renderQrToPng(qr, { border = 4, scale = 10 } = {}) {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-function main() {
-  const args = process.argv.slice(2);
-  if (args.length < 1) {
-    console.error('Usage: node qr_invoice.js <bolt11_invoice>');
-    process.exit(1);
-  }
-
-  const invoice = normalizeInvoice(args.join(' '));
-  if (!invoice) {
-    console.error('Error: bolt11_invoice must be a non-empty string');
-    process.exit(1);
-  }
-
+/**
+ * Render a BOLT-11 invoice as a terminal QR (printed to stderr) plus a PNG
+ * file in /tmp. Shared by `blink qr` and `create-invoice-lnaddress --qr`.
+ *
+ * @param {string} invoice  BOLT-11 payment request string.
+ * @returns {{ invoice: string, qrRendered: boolean, qrSize: number, errorCorrection: string, pngPath: string, pngBytes: number }}
+ */
+function renderInvoiceQr(invoice) {
   // Uppercase for bech32 alphanumeric mode (~30% smaller QR)
   const normalized = invoice.toUpperCase();
   const qr = qrcodegen.QrCode.encodeText(normalized, qrcodegen.QrCode.Ecc.LOW);
@@ -781,20 +776,30 @@ function main() {
   fs.writeFileSync(pngPath, pngBuf);
   console.error(`PNG saved: ${pngPath} (${pngBuf.length} bytes)`);
 
-  console.log(
-    JSON.stringify(
-      {
-        invoice: normalized,
-        qrRendered: true,
-        qrSize: qr.size,
-        errorCorrection: 'L',
-        pngPath,
-        pngBytes: pngBuf.length,
-      },
-      null,
-      2,
-    ),
-  );
+  return {
+    invoice: normalized,
+    qrRendered: true,
+    qrSize: qr.size,
+    errorCorrection: 'L',
+    pngPath,
+    pngBytes: pngBuf.length,
+  };
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.length < 1) {
+    console.error('Usage: node qr_invoice.js <bolt11_invoice>');
+    process.exit(1);
+  }
+
+  const invoice = normalizeInvoice(args.join(' '));
+  if (!invoice) {
+    console.error('Error: bolt11_invoice must be a non-empty string');
+    process.exit(1);
+  }
+
+  console.log(JSON.stringify(renderInvoiceQr(invoice), null, 2));
 }
 
 if (require.main === module) {
@@ -806,4 +811,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main };
+module.exports = { main, renderInvoiceQr };
