@@ -33,7 +33,7 @@ const {
 } = require('./_blink_client');
 
 const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
-const { decodeBolt11AmountSats } = require('./l402_discover');
+const { decodeBolt11AmountSats, budgetSatsFromInvoice } = require('./l402_discover');
 
 const PAY_INVOICE_MUTATION = `
   mutation LnInvoicePaymentSend($input: LnInvoicePaymentInput!) {
@@ -96,7 +96,16 @@ async function main() {
   // ── Budget reservation ──
   // The limit decision AND the reservation append happen under one lock, so
   // two concurrent payments can never both pass the same remaining budget.
-  const invoiceSats = decodeBolt11AmountSats(paymentRequest);
+  // The amount CHARGED to the budget: ceil(msats/1000), null when undecodable
+  // or below 1 sat (budget tracking is skipped then, same as for undecodable
+  // amounts — the API enforces wallet limits for those).
+  const invoiceSats = budgetSatsFromInvoice(paymentRequest);
+  if (invoiceSats !== null) {
+    const decoded = decodeBolt11AmountSats(paymentRequest);
+    if (decoded !== null && invoiceSats !== decoded) {
+      console.error(`Note: budget charges ${invoiceSats} sats conservatively for this fractional-satoshi invoice.`);
+    }
+  }
   let reservationId = null;
   if (invoiceSats !== null && !force) {
     // Explicitly user-initiated payment: an unconfigured budget must not block

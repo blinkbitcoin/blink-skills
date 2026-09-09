@@ -895,6 +895,22 @@ describe('corrupt spending log fails closed', () => {
     assert.deepEqual(mod.readLog(), []);
   });
 
+  it('writeLog rejects entries the reader would reject (writer/reader share one schema)', () => {
+    assert.throws(
+      () => mod.writeLog([{ ts: Date.now(), sats: 0, command: 'x' }]),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+    assert.throws(
+      () =>
+        mod.writeLog([
+          { ts: Date.now(), sats: 1, command: 'a', id: 'dup' },
+          { ts: Date.now(), sats: 1, command: 'b', id: 'dup' },
+        ]),
+      /duplicate id/,
+    );
+    assert.equal(fs.existsSync(mod.LOG_FILE), false, 'nothing was persisted');
+  });
+
   it('budget reset --force also recovers from a corrupt log', () => {
     writeRaw('[{"ts":');
     const r = mod.resetLog({ force: true });

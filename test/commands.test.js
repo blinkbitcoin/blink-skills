@@ -81,6 +81,7 @@ function setupTestEnv() {
   };
 
   return {
+    tmpHome,
     getStdout: () => stdoutLines.join('\n'),
     getStdoutJson: () => JSON.parse(stdoutLines.join('\n')),
     getStderr: () => stderrLines.join('\n'),
@@ -148,6 +149,56 @@ describe('pay_invoice', () => {
   });
   afterEach(() => {
     env.restore();
+  });
+
+  it('a fractional-satoshi invoice is charged ceil (1400 msats → 2 sats) to the budget', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '100';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc14000p1p0frac'];
+    const { main } = freshRequire('pay_invoice.js');
+    await main();
+    const log = JSON.parse(fs.readFileSync(path.join(env.tmpHome, '.blink', 'spending-log.json'), 'utf8'));
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 2, 'the budget must charge ceil, never round-to-nearest');
+  });
+
+  it('a below-1-sat invoice skips budget tracking instead of reserving 0 or 1', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '100';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc5000p1p0frac'];
+    const { main } = freshRequire('pay_invoice.js');
+    await main();
+    assert.equal(
+      fs.existsSync(path.join(env.tmpHome, '.blink', 'spending-log.json')),
+      false,
+      'a sub-satoshi invoice is not budget-tracked (the API enforces wallet limits)',
+    );
   });
 
   it('--dry-run outputs JSON with dryRun: true and does not send mutation', async () => {

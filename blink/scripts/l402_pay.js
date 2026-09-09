@@ -52,6 +52,7 @@ const {
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,
+  budgetSatsFromInvoice,
   fetchL402ProtocolInvoice,
 } = require('./l402_discover');
 
@@ -589,11 +590,19 @@ async function main() {
   console.error(`Format: ${challenge.format}`);
 
   const satoshis = decodeBolt11AmountSats(challenge.invoice);
+  // The amount CHARGED to the budget: ceil(msats/1000), null when undecodable
+  // or below 1 sat. Enforcement (refusal, --max-amount, reservation, record)
+  // uses this — never the round-to-nearest display value, which can push a
+  // sub-satoshi invoice up to 1 sat or shave fractions off larger ones.
+  const budgetSats = budgetSatsFromInvoice(challenge.invoice);
 
   if (satoshis === null) {
     console.error('Warning: could not decode amount from invoice.');
   } else {
     console.error(`Payment required: ${satoshis} sats`);
+  }
+  if (budgetSats !== null && budgetSats !== satoshis) {
+    console.error(`Note: budget charges ${budgetSats} sats conservatively for this fractional-satoshi invoice.`);
   }
 
   // Budget reservation state at function scope: the reservation happens inside
@@ -642,7 +651,7 @@ async function main() {
     // (decodeBolt11AmountSats rounds a valid sub-satoshi invoice like 10p to
     // 0, which passes a plain `!== null` guard). Refuse rather than delegate
     // the decision to the backend.
-    if (satoshis === null || satoshis <= 0) {
+    if (budgetSats === null) {
       const output = {
         event: 'l402_amount_undecodable',
         url: args.url,
@@ -665,7 +674,7 @@ async function main() {
     // stay reserved).
     apiKey = getApiKey();
     apiUrl = getApiUrl();
-    const reservation = reserveBudget({ sats: satoshis, command: 'l402-pay', domain }, { requireConfigured: true });
+    const reservation = reserveBudget({ sats: budgetSats, command: 'l402-pay', domain }, { requireConfigured: true });
     if (!reservation.allowed) {
       const output = {
         event: 'l402_budget_exceeded',
@@ -682,7 +691,7 @@ async function main() {
   }
 
   // ── Per-request max-amount check ──
-  if (args.maxAmount !== null && satoshis !== null && satoshis > args.maxAmount) {
+  if (args.maxAmount !== null && budgetSats !== null && budgetSats > args.maxAmount) {
     releaseReservationSafely();
     const output = {
       event: 'l402_budget_exceeded',
@@ -808,7 +817,7 @@ async function main() {
     // Same warn-on-restored / warn-on-throw accounting as the normal record path.
     if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
       try {
-        const outcome = finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
+        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
         if (outcome === 'restored') {
           console.error(
             'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
@@ -893,17 +902,17 @@ async function main() {
   // complete for unconfigured users too. finalizeOrRecord restores the entry
   // if the reservation was erased externally (e.g. by `budget reset`).
   // ALREADY_PAID is excluded above (nothing moved this invocation).
-  if (satoshis !== null && payResult.status === 'SUCCESS') {
+  if (budgetSats !== null && payResult.status === 'SUCCESS') {
     try {
       if (reservationId) {
-        const outcome = finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
+        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
         if (outcome === 'restored') {
           console.error(
             'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
           );
         }
       } else {
-        recordSpend({ sats: satoshis, command: 'l402-pay', domain });
+        recordSpend({ sats: budgetSats, command: 'l402-pay', domain });
       }
     } catch (err) {
       console.error(`Warning: could not record spend: ${err.message}`);

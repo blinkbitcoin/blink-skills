@@ -452,11 +452,21 @@ function readLog() {
  * of the race; the read-modify-write half is handled by acquireLogLock in
  * recordSpend.)
  *
+ * Entries are validated with the same schema readLog enforces, so no writer
+ * can persist state the reader would then reject (writer/reader share one
+ * schema). Note the timestamp rule means a reservation stamped in the future
+ * (test-only nowMs override) cannot be persisted — there is no production
+ * caller for that option.
+ *
  * @param {Array} entries
  */
 function writeLog(entries) {
   const cutoff = Date.now() - PRUNE_THRESHOLD_MS;
   const pruned = entries.filter((e) => e.ts > cutoff);
+  const seenIds = new Set();
+  for (const [i, entry] of pruned.entries()) {
+    validateLogEntry(entry, i, seenIds);
+  }
   fs.mkdirSync(BLINK_DIR, { recursive: true });
   const tmp = `${LOG_FILE}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(pruned, null, 2), 'utf8');
