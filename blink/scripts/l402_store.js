@@ -120,17 +120,15 @@ function listTokens() {
     const expiresInMs = entry.expiresAt ? entry.expiresAt - now : null;
     return {
       domain,
-      macaroon: entry.macaroon
-        ? entry.macaroon.slice(0, 12) + '…' + entry.macaroon.slice(-6)
-        : null,
+      macaroon: entry.macaroon ? entry.macaroon.slice(0, 12) + '…' + entry.macaroon.slice(-6) : null,
       preimage: entry.preimage ? entry.preimage.slice(0, 8) + '…' : null,
       satoshis: entry.satoshis ?? null,
+      invoiceMsats: entry.invoiceMsats ?? null,
+      budgetSats: entry.budgetSats ?? null,
       savedAt: entry.savedAt ? new Date(entry.savedAt).toISOString() : null,
       expiresAt: entry.expiresAt ? new Date(entry.expiresAt).toISOString() : null,
       expired,
-      expiresIn: !expired && expiresInMs !== null
-        ? `${Math.round(expiresInMs / 1000)}s`
-        : null,
+      expiresIn: !expired && expiresInMs !== null ? `${Math.round(expiresInMs / 1000)}s` : null,
     };
   });
 }
@@ -206,6 +204,8 @@ function main() {
       macaroon: entry.macaroon,
       preimage: entry.preimage,
       satoshis: entry.satoshis ?? null,
+      invoiceMsats: entry.invoiceMsats ?? null,
+      budgetSats: entry.budgetSats ?? null,
       savedAt: entry.savedAt ? new Date(entry.savedAt).toISOString() : null,
       expiresAt: entry.expiresAt ? new Date(entry.expiresAt).toISOString() : null,
     };
@@ -218,9 +218,7 @@ function main() {
     const removed = clearTokens({ expiredOnly });
     const output = {
       removed,
-      message: expiredOnly
-        ? `Removed ${removed} expired token(s).`
-        : `Removed all ${removed} token(s).`,
+      message: expiredOnly ? `Removed ${removed} expired token(s).` : `Removed all ${removed} token(s).`,
     };
     console.log(JSON.stringify(output, null, 2));
     return;

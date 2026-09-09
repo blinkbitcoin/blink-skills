@@ -27,7 +27,14 @@ const os = require('node:os');
 const binPath = path.resolve(__dirname, '..', 'bin', 'blink.js');
 const stubPath = path.resolve(__dirname, 'fixtures', 'spark_sdk_stub.js');
 
-const SPARK_COMMANDS = ['spark-balance', 'spark-send', 'spark-fee-probe', 'spark-transactions', 'spark-subscribe'];
+const SPARK_COMMANDS = [
+  'spark-balance',
+  'spark-send',
+  'spark-fee-probe',
+  'spark-transactions',
+  'spark-subscribe',
+  'spark-info',
+];
 const CREDENTIAL_FREE_COMMANDS = ['resolve-receiver', 'create-invoice-lnaddress'];
 
 // spark-send enforces budget limits and records spends under ~/.blink. Point
@@ -87,6 +94,25 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.ok(!killed, 'command must not hit the timeout');
     assert.equal(code, 0);
     assert.equal(JSON.parse(stdout).balanceSats, 2551);
+  });
+
+  it('spark-info exits promptly with the getInfo payload and network', async () => {
+    const { code, stdout, killed } = await runCli(['spark-info'], { env: { SPARK_STUB_BALANCE: '2551' } });
+    assert.ok(!killed, 'command must not hit the timeout');
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.balanceSats, 2551);
+    assert.equal(j.network, 'mainnet');
+  });
+
+  it('spark-info forwards --network to connect()', async () => {
+    const { code, stderr, stdout } = await runCli(['spark-info', '--network', 'regtest'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.equal(code, 0);
+    assert.match(stderr, /STUB_NETWORK=regtest/);
+    assert.equal(JSON.parse(stdout).network, 'regtest');
   });
 
   it('spark-transactions exits promptly with JSON', async () => {

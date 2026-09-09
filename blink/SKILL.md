@@ -473,6 +473,14 @@ blink spark-balance [--network mainnet|regtest]
 
 Reads the BTC balance of a self-custodial (Spark) account directly from the wallet via the Breez Spark SDK. Non-custodial balances are **not visible through the Blink API**. Waits briefly for a stable balance after incoming payments (`stable` field in the output).
 
+### Spark Info
+
+```bash
+blink spark-info [--network mainnet|regtest]
+```
+
+Shows a Spark account's info from the SDK's `getInfo()` (balance plus any other fields the SDK version returns, BigInt coerced to Number). Non-custodial counterpart of `account-info`. Requires `SPARK_MNEMONIC` + `BREEZ_API_KEY`.
+
 ### Spark Send
 
 ```bash
@@ -1554,6 +1562,7 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/resolve_receiver.js` — Classify a Blink identifier as custodial or non-custodial (Spark)
 - `{baseDir}/scripts/create_invoice_lnaddress.js` — Receive to any Blink Lightning Address via public LNURL-pay (no credentials)
 - `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
+- `{baseDir}/scripts/spark_info.js` — Non-custodial (Spark) account info via the SDK (getInfo dump)
 - `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
 - `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee to send from a Spark account (prepare only, nothing sent)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)

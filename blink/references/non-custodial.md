@@ -208,6 +208,45 @@ Set it as `BREEZ_API_KEY` alongside `SPARK_MNEMONIC`.
 - Send is a proof-of-concept demonstrating that agent-side signing works with
   no Blink API change and no server signer/VPS.
 
+## Live-fire checklist (regtest)
+
+Before a release that touches the `spark-*` scripts, run a quick pass against
+Spark **regtest** (a regtest seed and a `BREEZ_API_KEY` are required; never
+print either):
+
+```bash
+export SPARK_MNEMONIC="<regtest seed>"
+export BREEZ_API_KEY="<key>"
+export SPARK_NETWORK=regtest
+
+blink spark-info                      # getInfo shape matches normalizeInfo expectations
+blink spark-balance                   # balance reads, stable=true
+blink spark-transactions --limit 5    # listPayments shape matches the normalizer
+blink spark-fee-probe <destination> 1 # parse/prepare fee extraction (feeSats non-null)
+blink spark-send <destination> 1 --dry-run
+```
+
+This is the contract the test stubs emulate; if a real run disagrees with the
+stubs, the stubs (not the assertions) are what must change.
+
+**Verified live on Spark regtest (2026-09):** `spark-info`, `spark-balance`,
+`spark-transactions` (including `--offset` and the native `typeFilter`, which
+the real SDK accepts), `spark-fee-probe`, `spark-send --dry-run`, and a real
+1-sat send settling `completed` with the budget reservation finalizing
+correctly. The stub shapes match the real SDK: `getInfo()` returns
+`{identityPubkey, balanceSats, tokenBalances}` (the stub is a compatible
+subset), `listPayments` normalizes identically, and `parse()`/prepare routing
+behaves as mocked.
+
+**Install pitfall seen in practice:** npm silently skips the SDK as an
+optional dependency when its own optional native subtree fails to build for
+the running Node ABI — on a machine that first installed under Node 20,
+`better-sqlite3` was compiled against NODE_MODULE_VERSION 115 and Node 22
+needs 127, so every install rolled the SDK back with no error. Recovery:
+rebuild the native module against the target Node's headers, e.g.
+`npm rebuild better-sqlite3 --nodedir="$(dirname "$(dirname "$(which node)")")"`,
+then reinstall.
+
 ## API-growth notes (issue #940)
 
 - **Receive needs no Blink API change** — the identifier alone is sufficient.
