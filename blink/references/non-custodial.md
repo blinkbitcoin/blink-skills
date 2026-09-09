@@ -86,6 +86,13 @@ A remote server's answer is checked against the request that produced it:
 These operations need the account seed and run the Breez Spark SDK headless in
 Node (Node 22+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
 
+**Network selection:** all four `spark-*` commands default to Spark **mainnet**.
+Override with `SPARK_NETWORK=regtest` or a `--network mainnet|regtest` flag
+(flag wins). SDK storage is keyed per network (`~/.blink/spark/<network>-<hash>`),
+so mainnet and regtest state never mix. There is no Spark equivalent of Blink's
+signet `BLINK_API_URL` staging — production `blink.sv` LNURL receive is the only
+receive environment.
+
 **Install requirement:** the SDK persists wallet state through `better-sqlite3`,
 a native module compiled at install time (needs `python3`, `make`, a C++
 compiler). Under `--ignore-scripts` the package is unpacked but never built and
@@ -97,6 +104,11 @@ database — so probing it cannot catch this. `connect()` therefore requires
 approval step (`npm rebuild better-sqlite3`, `pnpm approve-builds` then
 `pnpm rebuild`, `yarn rebuild`). Verify a fix by opening a database, not by
 trusting a rebuild exit code — a rebuild can exit 0 without producing a binding.
+
+**Version pinning:** the SDK is pinned to `0.23.1` rather than `0.24.x`:
+`0.24.0` and `0.24.1` share a commit, carry no release notes, and GitHub still
+marks `0.23.0` latest — `0.23.1` is the announced `0.23.0` tree. Revisit the pin
+when a documented `0.24.x` release appears.
 
 **Invoice validation scope (receive path):** the BOLT-11 check verifies
 **structure and request-binding**, not the cryptographic signature. It confirms
@@ -135,6 +147,11 @@ their funds. If `bip39` is unavailable the command aborts
 (`MNEMONIC_VALIDATOR_UNAVAILABLE`) rather than continuing unverified, because
 treating "cannot check" as "checked and fine" silently disables the control.
 Neither error echoes the seed.
+
+**Not covered by budget controls:** `spark-send` bypasses the budget enforcement
+and spending log that guard the custodial pay commands — signing happens
+client-side, outside `_budget.js`. This is the highest-authority path in the
+skill; apply agent-side confirmation accordingly.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 
