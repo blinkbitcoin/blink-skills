@@ -1501,6 +1501,67 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
   });
 
+  it('SUCCESS with a live reservation finalizes it into a domain-tagged spend', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'the successful payment must be recorded');
+    assert.equal(log[0].sats, 100000);
+    assert.equal(log[0].command, 'l402-pay');
+    assert.equal(log[0].domain, 'paywall.example.com');
+    assert.equal(log[0].state, undefined, 'finalized — not still reserved');
+  });
+
+  it('a restored finalization (reservation erased externally) warns on stderr', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const budget = require(budgetPath);
+    const savedFinalize = budget.finalizeOrRecord;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.finalizeOrRecord = () => 'restored';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.finalizeOrRecord = savedFinalize;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /budget reservation was missing.*recorded anyway/s);
+  });
+
+  it('a status-only terminal failure (no GraphQL errors) frees the reservation', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'FAILURE' }); // mockPayment sends errors: [] for non-SUCCESS
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
+  });
+
+  it('a failing release on ALREADY_PAID warns on stderr instead of being swallowed', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'ALREADY_PAID' });
+    const budget = require(budgetPath);
+    const savedRelease = budget.releaseReservation;
+    const originalStderr = console.error;
+    let errOut = '';
+    budget.releaseReservation = () => {
+      throw new Error('lock timeout');
+    };
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+    } finally {
+      budget.releaseReservation = savedRelease;
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /could not release the budget reservation: lock timeout/);
+  });
+
   it('a missing API key orphans no reservation (credentials resolve before reserving)', async () => {
     configureAutoPay();
     const savedKey = process.env.BLINK_API_KEY;

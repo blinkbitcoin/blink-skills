@@ -483,7 +483,7 @@ describe('spending-log lock ownership', () => {
 
 // ── reservations (review: reserve the amount before the payment executes) ────
 
-describe('reserveBudget / finalizeReservation / releaseReservation', () => {
+describe('reserveBudget / finalizeOrRecord / releaseReservation', () => {
   let mod;
   before(() => {
     setupTempDir();
@@ -540,18 +540,6 @@ describe('reserveBudget / finalizeReservation / releaseReservation', () => {
     assert.equal(mod.getStatus().dailySpent, 60);
     assert.equal(mod.checkBudget(50, { requireConfigured: false }).allowed, false);
     assert.equal(mod.checkBudget(40, { requireConfigured: false }).allowed, true);
-  });
-
-  it('finalizeReservation converts the reservation into a normal spend entry', () => {
-    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
-    const r = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
-    assert.equal(mod.finalizeReservation(r.id), true);
-    const log = mod.readLog();
-    assert.equal(log.length, 1);
-    assert.equal(log[0].sats, 60);
-    assert.equal(log[0].command, 'x');
-    assert.equal(log[0].state, undefined, 'the final entry must not carry reservation state');
-    assert.equal(log[0].id, undefined);
   });
 
   it('releaseReservation removes the reservation and frees the budget', () => {

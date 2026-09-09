@@ -332,6 +332,53 @@ describe('CLI: spark-transactions pagination and filtering', () => {
   });
 });
 
+// ── budget CLI dispatch (review: documented --force must reach the script) ───
+
+describe('CLI: budget reset through the public dispatcher', () => {
+  function seededHome(entries) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-reset-'));
+    fs.mkdirSync(path.join(home, '.blink'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.blink', 'spending-log.json'), JSON.stringify(entries), 'utf8');
+    return home;
+  }
+
+  it('ordinary reset clears finalized history and keeps active reservations', async () => {
+    const home = seededHome([
+      { ts: Date.now(), sats: 10, command: 'pay-invoice', domain: null },
+      { ts: Date.now(), sats: 60, command: 'spark-send', domain: null, state: 'reserved', id: 'r1' },
+    ]);
+    try {
+      const { code, stdout } = await runCli(['budget', 'reset'], { env: { HOME: home }, stub: false });
+      assert.equal(code, 0);
+      const out = JSON.parse(stdout);
+      assert.equal(out.removed, 1);
+      assert.equal(out.keptReserved, 1);
+      const remaining = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'spending-log.json'), 'utf8'));
+      assert.equal(remaining.length, 1);
+      assert.equal(remaining[0].state, 'reserved');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reset --force survives CLI dispatch and clears everything (incl. reservations)', async () => {
+    const home = seededHome([
+      { ts: Date.now(), sats: 60, command: 'spark-send', domain: null, state: 'reserved', id: 'r1' },
+    ]);
+    try {
+      const { code, stdout } = await runCli(['budget', 'reset', '--force'], { env: { HOME: home }, stub: false });
+      assert.equal(code, 0, 'the documented --force escape hatch must work through `blink`');
+      const out = JSON.parse(stdout);
+      assert.equal(out.removed, 1);
+      assert.equal(out.force, true);
+      const remaining = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'spending-log.json'), 'utf8'));
+      assert.deepEqual(remaining, []);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── credential-free commands need no API key ─────────────────────────────────
 
 describe('CLI: credential-free commands run without BLINK_API_KEY', () => {

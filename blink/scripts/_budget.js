@@ -197,8 +197,9 @@ function releaseLogLock(token) {
  * mutation path can bypass the lock (recordSpend, resetLog, reservations).
  * The lock is never held across a payment — mutations are short.
  *
- * Ownership is re-checked before the write: if our lock was declared stale
- * and replaced while a mutation stalled, writing would clobber the
+ * Ownership is re-checked before the write: there is no automatic stale
+ * takeover, but the lock file can still be removed or replaced EXTERNALLY
+ * (operator cleanup, manual recovery); writing after that would clobber the
  * successor's state — refuse loudly instead.
  *
  * @param {(log: Array) => any} mutator  Mutates the log array in place; its
@@ -213,11 +214,11 @@ function mutateLog(mutator) {
     try {
       current = fs.readFileSync(LOG_LOCK_FILE, 'utf8');
     } catch {
-      current = null; // vanished — could be a stale break + replacement
+      current = null; // vanished — removed or replaced externally
     }
     if (current !== token) {
       const err = new Error(
-        'Budget lock was lost to staleness before the write completed — refusing to clobber a successor\u2019s log state.',
+        'Budget lock was removed or replaced externally before the write completed — refusing to clobber a successor\u2019s log state.',
       );
       err.code = 'BUDGET_LOCK_LOST';
       throw err;
@@ -577,21 +578,6 @@ function reserveBudget({ sats, command, domain = null }, opts = {}) {
 }
 
 /**
- * Convert a reservation into a normal spend entry (the payment succeeded or
- * is legitimately pending). Returns false when the reservation no longer
- * exists — e.g. it was pruned — in which case the budget already counted it.
- */
-function finalizeReservation(id) {
-  return mutateLog((log) => {
-    const i = log.findIndex((e) => e.state === 'reserved' && e.id === id);
-    if (i === -1) return false;
-    const { ts, sats, command, domain } = log[i];
-    log[i] = { ts, sats, command, domain };
-    return true;
-  });
-}
-
-/**
  * Remove a reservation (the payment failed or was never attempted). Returns
  * false when the reservation no longer exists.
  */
@@ -606,6 +592,10 @@ function releaseReservation(id) {
 
 /**
  * Finalize a reservation OR restore accounting when it is missing. Idempotent.
+ *
+ * This is the ONLY finalize API: the legacy finalizeReservation() (which
+ * dropped the id and was not idempotent) was removed deliberately — mixing
+ * the two would defeat duplicate suppression.
  *
  * `budget reset --force` clears active reservations while a payment may still
  * be in flight; if the reservation is gone when finalize arrives, finalize
@@ -719,7 +709,6 @@ module.exports = {
 
   // Reservations (reserve before the payment executes; finalize or release after)
   reserveBudget,
-  finalizeReservation,
   finalizeOrRecord,
   releaseReservation,
 

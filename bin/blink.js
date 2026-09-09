@@ -965,12 +965,14 @@ commands.budget = {
     off: { type: 'boolean', default: false },
     last: { type: 'string' },
     expired: { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
   },
   optMeta: {
     hourly: { description: 'Hourly spending limit in sats (with set)', valueName: 'sats' },
     daily: { description: 'Daily spending limit in sats (with set)', valueName: 'sats' },
     off: { description: 'Remove all spending limits (with set)' },
     last: { description: 'Number of log entries to show (with log)', valueName: 'n' },
+    force: { description: 'Clear active reservations too (with reset; unsafe mid-payment)' },
   },
   examples: [
     'blink budget status',
@@ -978,6 +980,7 @@ commands.budget = {
     'blink budget set --off',
     'blink budget log --last 10',
     'blink budget reset',
+    'blink budget reset --force',
     'blink budget allowlist list',
     'blink budget allowlist add satring.com',
     'blink budget allowlist remove satring.com',
@@ -989,6 +992,7 @@ commands.budget = {
     if (opts.off) argv.push('--off');
     if (opts.last) argv.push('--last', opts.last);
     if (opts.expired) argv.push('--expired');
+    if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'budget.js'));
     main();

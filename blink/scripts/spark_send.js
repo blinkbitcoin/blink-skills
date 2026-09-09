@@ -332,8 +332,10 @@ async function main() {
       // Explicit terminal failure — the payment did not happen, free the budget.
       try {
         releaseReservation(reservationId);
-      } catch {
-        /* orphaned reservation counts conservatively until pruned */
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
       }
     }
 

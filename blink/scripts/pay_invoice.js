@@ -115,8 +115,10 @@ async function main() {
     if (reservationId) {
       try {
         releaseReservation(reservationId);
-      } catch {
-        /* an orphaned reservation counts conservatively until pruned */
+      } catch (e) {
+        // Not silent: a failed release strands the allowance — fail-closed is
+        // correct for the budget, but the operator must be told.
+        console.error(`Warning: could not release the budget reservation: ${e.message}`);
       }
     }
   };
