@@ -1463,6 +1463,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
 - **`budget reset` and in-flight reservations:** an ordinary reset clears finalized history but **keeps active reservations**, so a payment in flight never reopens its allowance window. `budget reset --force` clears everything (the escape hatch for wedged reservations); if a force-cleared payment later completes, its spend is re-recorded — but the freed allowance can briefly be reused, so never force-reset while payments are in flight.
 - **Lock recovery:** budget mutations hold a lockfile at `~/.blink/.spending-log.lock` (max a few seconds each). If a crashed process leaves it behind, commands time out with a `BUDGET_LOCK_TIMEOUT` error — remove the file manually; automatic stale takeover is deliberately not attempted.
+- **Corrupt log fails closed:** if the spending log can't be read or parsed, budget checks and payments throw `BUDGET_LOG_CORRUPT` — prior spend is unknown and is never treated as zero, and the damaged file is never overwritten. Recover with `blink budget reset --force` (discards it) or fix/remove the file manually.
 
 > **AGENT:** Before making a payment, check budget status with `blink budget status` to see remaining budget. If budget is exceeded, inform the user and suggest increasing limits with `blink budget set`.
 

@@ -604,7 +604,7 @@ async function main() {
   let reservationId = null;
   let apiKey = null;
   let apiUrl = null;
-  const releaseReservationQuietly = () => {
+  const releaseReservationSafely = () => {
     if (reservationId) {
       try {
         releaseReservation(reservationId);
@@ -683,7 +683,7 @@ async function main() {
 
   // ── Per-request max-amount check ──
   if (args.maxAmount !== null && satoshis !== null && satoshis > args.maxAmount) {
-    releaseReservationQuietly();
+    releaseReservationSafely();
     const output = {
       event: 'l402_budget_exceeded',
       url: args.url,
@@ -738,13 +738,13 @@ async function main() {
   try {
     wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
   } catch (e) {
-    releaseReservationQuietly();
+    releaseReservationSafely();
     throw e;
   }
   console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
 
   if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
-    releaseReservationQuietly();
+    releaseReservationSafely();
     throw new Error('Insufficient balance: BTC wallet has 0 sats.');
   }
 
@@ -798,7 +798,7 @@ async function main() {
   if (payResult.errors && payResult.errors.length > 0) {
     // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationQuietly();
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -819,7 +819,7 @@ async function main() {
       }
       reservationId = null;
     } else {
-      releaseReservationQuietly();
+      releaseReservationSafely();
     }
     throw new Error(`Payment not successful: status=${payResult.status}`);
   }
@@ -830,7 +830,7 @@ async function main() {
   // reservation instead of finalizing it (pay_invoice releases for the same
   // status; finalizing here would double-count the invoice against the budget).
   if (payResult.status === 'ALREADY_PAID') {
-    releaseReservationQuietly();
+    releaseReservationSafely();
     reservationId = null;
   }
 

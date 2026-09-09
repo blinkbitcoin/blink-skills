@@ -117,7 +117,7 @@ async function main() {
     reservationId = reservation.id;
   }
 
-  const releaseReservationQuietly = () => {
+  const releaseReservationSafely = () => {
     if (reservationId) {
       try {
         releaseReservation(reservationId);
@@ -194,7 +194,7 @@ async function main() {
   if (result.errors && result.errors.length > 0) {
     // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationQuietly();
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -218,7 +218,7 @@ async function main() {
     recordOrFinalize();
   } else {
     console.error(`Payment status: ${result.status}`);
-    releaseReservationQuietly();
+    releaseReservationSafely();
   }
 
   console.log(JSON.stringify(output, null, 2));

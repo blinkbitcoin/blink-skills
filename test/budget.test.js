@@ -667,6 +667,138 @@ describe('mutateLog ownership re-check', () => {
   });
 });
 
+// ── corrupt spending log fails closed (review: malformed log read as empty) ──
+
+describe('corrupt spending log fails closed', () => {
+  let mod;
+  before(() => {
+    setupTempDir();
+    saveEnv();
+    patchHomedir();
+    delete require.cache[require.resolve(path.join(scriptsDir, '_budget.js'))];
+    mod = require(path.join(scriptsDir, '_budget.js'));
+  });
+  after(() => {
+    restoreHomedir();
+    restoreEnv();
+    cleanupTempDir();
+  });
+  afterEach(() => {
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
+    try {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    } catch {
+      /* ok */
+    }
+  });
+
+  function writeRaw(content) {
+    fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
+    fs.writeFileSync(mod.LOG_FILE, content, 'utf8');
+  }
+
+  it('a missing file still reads as empty (ENOENT)', () => {
+    assert.deepEqual(mod.readLog(), []);
+  });
+
+  it('truncated JSON throws BUDGET_LOG_CORRUPT for reads, checks, status, and log views', () => {
+    // checkBudget reads the log only when limits are configured.
+    mod.writeConfig({ hourlyLimitSats: 1000, dailyLimitSats: 1000, allowlist: [] });
+    writeRaw('[{"ts": 1');
+    for (const fn of [
+      () => mod.readLog(),
+      () => mod.checkBudget(100, { requireConfigured: false }),
+      () => mod.getStatus(),
+      () => mod.getLog(),
+    ]) {
+      assert.throws(fn, (e) => e.code === 'BUDGET_LOG_CORRUPT' && /reset --force/.test(e.message));
+    }
+  });
+
+  it('a non-array top-level value throws', () => {
+    writeRaw(JSON.stringify({ entries: [] }));
+    assert.throws(
+      () => mod.readLog(),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+  });
+
+  it('entries missing budget-relevant fields throw', () => {
+    writeRaw(JSON.stringify([{ ts: Date.now(), command: 'x' }])); // no sats
+    assert.throws(() => mod.readLog(), /entry 0 is malformed/);
+  });
+
+  it('a reserved entry without an id throws', () => {
+    writeRaw(JSON.stringify([{ ts: Date.now(), sats: 1, command: 'x', state: 'reserved' }]));
+    assert.throws(
+      () => mod.readLog(),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+  });
+
+  it('a read error (non-ENOENT) throws instead of returning empty', () => {
+    const realRead = fs.readFileSync;
+    fs.readFileSync = (p, ...rest) => {
+      if (String(p) === mod.LOG_FILE) {
+        const e = new Error('EACCES');
+        e.code = 'EACCES';
+        throw e;
+      }
+      return realRead(p, ...rest);
+    };
+    try {
+      assert.throws(
+        () => mod.readLog(),
+        (e) => e.code === 'BUDGET_LOG_CORRUPT',
+      );
+    } finally {
+      fs.readFileSync = realRead;
+    }
+  });
+
+  it('recordSpend on a corrupt log throws and does NOT overwrite the damaged file', () => {
+    writeRaw('not json');
+    assert.throws(
+      () => mod.recordSpend({ sats: 5, command: 'x' }),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+    assert.equal(fs.readFileSync(mod.LOG_FILE, 'utf8'), 'not json', 'the damaged file must not be replaced');
+  });
+
+  it('reserveBudget on a corrupt log throws (no new reservation over unknown spend)', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    writeRaw('garbage[');
+    assert.throws(
+      () => mod.reserveBudget({ sats: 10, command: 'x' }, { requireConfigured: false }),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+  });
+
+  it('budget reset recovers from a corrupt log and reports discardedCorrupt', () => {
+    writeRaw('garbage');
+    const r = mod.resetLog();
+    assert.equal(r.discardedCorrupt, true);
+    assert.deepEqual(mod.readLog(), [], 'reset discarded the damaged file');
+  });
+
+  it('budget reset --force also recovers from a corrupt log', () => {
+    writeRaw('[{"ts":');
+    const r = mod.resetLog({ force: true });
+    assert.equal(r.discardedCorrupt, true);
+    assert.deepEqual(mod.readLog(), []);
+  });
+
+  it('reset on a healthy log reports discardedCorrupt false', () => {
+    mod.recordSpend({ sats: 1, command: 'x' });
+    const r = mod.resetLog();
+    assert.equal(r.discardedCorrupt, false);
+  });
+});
+
 // ── getLog / resetLog ────────────────────────────────────────────────────────
 
 describe('getLog and resetLog', () => {
@@ -934,5 +1066,72 @@ describe('budget.js CLI — allowlist', () => {
     const logs = captureLog(() => freshCliRequire().main());
     const output = JSON.parse(logs[0]);
     assert.equal(output.count, 0);
+  });
+});
+
+// ── budget.js CLI — per-subcommand option validation ─────────────────────────
+
+describe('budget.js CLI — option validation', () => {
+  let origArgv;
+  before(() => {
+    origArgv = process.argv;
+    setupCliTest();
+  });
+  after(() => {
+    cleanupCliTest(origArgv);
+  });
+
+  function runMainTrappingExit() {
+    const origExit = process.exit;
+    const exits = [];
+    const errs = [];
+    const origErr = console.error;
+    process.exit = (code) => {
+      exits.push(code);
+      throw new Error('__exit__');
+    };
+    console.error = (s) => errs.push(String(s));
+    try {
+      freshCliRequire().main();
+    } catch (e) {
+      if (e.message !== '__exit__') throw e;
+    } finally {
+      process.exit = origExit;
+      console.error = origErr;
+    }
+    return { exitCode: exits[0] ?? 0, stderr: errs.join('\n') };
+  }
+
+  it('rejects flags meant for a different subcommand instead of ignoring them', () => {
+    process.argv = ['node', 'blink', 'status', '--force'];
+    const { exitCode, stderr } = runMainTrappingExit();
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /not valid for 'budget status'/);
+  });
+
+  it('rejects --last on reset', () => {
+    process.argv = ['node', 'blink', 'reset', '--last', '5'];
+    const { exitCode } = runMainTrappingExit();
+    assert.equal(exitCode, 1);
+  });
+
+  it('reset --force is accepted and reports the branch', () => {
+    process.argv = ['node', 'blink', 'reset', '--force'];
+    const logs = captureLog(() => freshCliRequire().main());
+    const output = JSON.parse(logs[0]);
+    assert.equal(output.force, true);
+    assert.equal(output.discardedCorrupt, false);
+  });
+
+  it('reset on a corrupt log recovers and says so', () => {
+    // Write a corrupt log into the temp home, then reset must recover.
+    const mod = require(path.join(scriptsDir, '_budget.js'));
+    fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
+    fs.writeFileSync(mod.LOG_FILE, 'not json', 'utf8');
+    process.argv = ['node', 'blink', 'reset'];
+    const logs = captureLog(() => freshCliRequire().main());
+    const output = JSON.parse(logs[0]);
+    assert.equal(output.discardedCorrupt, true);
+    assert.match(output.message, /corrupt/);
   });
 });

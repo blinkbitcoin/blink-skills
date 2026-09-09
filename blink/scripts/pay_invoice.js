@@ -111,7 +111,7 @@ async function main() {
     reservationId = reservation.id;
   }
 
-  const releaseReservationQuietly = () => {
+  const releaseReservationSafely = () => {
     if (reservationId) {
       try {
         releaseReservation(reservationId);
@@ -159,14 +159,14 @@ async function main() {
         (e.message && e.message.toLowerCase().includes('self')),
     );
     if (isSelfPay) {
-      releaseReservationQuietly();
+      releaseReservationSafely();
       throw new Error(
         'Cannot pay your own invoice (CANT_PAY_SELF). ' +
           'L402 round-trip testing requires a second Blink account or a separate wallet.',
       );
     }
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationQuietly();
+    releaseReservationSafely();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -210,10 +210,10 @@ async function main() {
     }
   } else if (result.status === 'ALREADY_PAID') {
     console.error('Invoice was already paid.');
-    releaseReservationQuietly();
+    releaseReservationSafely();
   } else {
     console.error(`Payment status: ${result.status}`);
-    releaseReservationQuietly();
+    releaseReservationSafely();
   }
 
   console.log(JSON.stringify(output, null, 2));

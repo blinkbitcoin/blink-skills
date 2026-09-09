@@ -204,12 +204,24 @@ function releaseLogLock(token) {
  *
  * @param {(log: Array) => any} mutator  Mutates the log array in place; its
  *   return value is passed through.
+ * @param {object} [opts]
+ * @param {boolean} [opts.forgivingCorrupt=false]  Read a corrupt log as empty.
+ *   Only `resetLog` sets this: reset is destructive by design, and it is the
+ *   documented operator recovery for BUDGET_LOG_CORRUPT.
  */
-function mutateLog(mutator) {
+function mutateLog(mutator, opts = {}) {
   const token = acquireLogLock();
   try {
-    const log = readLog();
-    const result = mutator(log);
+    let log;
+    let discardedCorrupt = false;
+    try {
+      log = readLog();
+    } catch (e) {
+      if (!(e.code === 'BUDGET_LOG_CORRUPT' && opts.forgivingCorrupt)) throw e;
+      log = [];
+      discardedCorrupt = true;
+    }
+    const result = mutator(log, { discardedCorrupt });
     let current;
     try {
       current = fs.readFileSync(LOG_LOCK_FILE, 'utf8');
@@ -231,19 +243,54 @@ function mutateLog(mutator) {
 }
 
 /**
- * Read the spending log from disk.
- * Returns an empty array if the file does not exist.
+ * Fail-closed corruption error: the log exists but cannot be read or parsed,
+ * so prior spend is UNKNOWN — treating that as zero would let a configured
+ * budget pass and then overwrite the damaged file with only the new entry.
+ */
+function corruptLogError(detail) {
+  const err = new Error(
+    `BUDGET_LOG_CORRUPT: ${LOG_FILE} is unreadable (${detail}); prior spending is unknown. ` +
+      `Fix or remove the file manually, or discard it with \`blink budget reset --force\`.`,
+  );
+  err.code = 'BUDGET_LOG_CORRUPT';
+  return err;
+}
+
+/**
+ * Read the spending log from disk. FAILS CLOSED: an empty array is returned
+ * ONLY when the file does not exist. A file that cannot be read, is not valid
+ * JSON, is not a top-level array, or contains malformed entries throws
+ * BUDGET_LOG_CORRUPT — prior spend is then unknown and must never be treated
+ * as zero by a budget check or a writer.
  *
  * @returns {Array<{ ts: number, sats: number, command: string, domain: string|null }>}
  */
 function readLog() {
+  let content;
   try {
-    const content = fs.readFileSync(LOG_FILE, 'utf8');
-    const parsed = JSON.parse(content);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+    content = fs.readFileSync(LOG_FILE, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw corruptLogError(e.message); // EACCES, EISDIR, etc.
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    throw corruptLogError(`invalid JSON: ${e.message}`);
+  }
+  if (!Array.isArray(parsed)) throw corruptLogError('expected a top-level JSON array');
+  for (const [i, entry] of parsed.entries()) {
+    const malformed =
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof entry.ts !== 'number' ||
+      typeof entry.sats !== 'number' ||
+      typeof entry.command !== 'string' ||
+      (entry.state === 'reserved' && typeof entry.id !== 'string');
+    if (malformed) throw corruptLogError(`entry ${i} is malformed`);
+  }
+  return parsed;
 }
 
 /**
@@ -492,7 +539,7 @@ function recordSpend({ sats, command, domain = null }) {
 //
 //   reserveBudget()   decision + reservation append in ONE critical section
 //   ... payment executes ...
-//   finalizeReservation()  reservation becomes a normal spend entry
+//   finalizeOrRecord()  reservation becomes a normal spend entry (idempotent)
 //   releaseReservation()   payment failed — remove the reservation
 //
 // A reservation that is never finalized (crash between send and finalize)
@@ -657,21 +704,24 @@ function getLog(limit = 20) {
  *
  * @param {object} [opts]
  * @param {boolean} [opts.force=false]  Also clear active reservations.
- * @returns {{ removed: number, keptReserved: number }}
+ * @returns {{ removed: number, keptReserved: number, discardedCorrupt: boolean }}
  */
 function resetLog({ force = false } = {}) {
-  return mutateLog((log) => {
-    if (force) {
-      const removed = log.length;
+  return mutateLog(
+    (log, { discardedCorrupt }) => {
+      if (force) {
+        const removed = log.length;
+        log.length = 0;
+        return { removed, keptReserved: 0, discardedCorrupt };
+      }
+      const kept = log.filter((e) => e.state === 'reserved');
+      const removed = log.length - kept.length;
       log.length = 0;
-      return { removed, keptReserved: 0 };
-    }
-    const kept = log.filter((e) => e.state === 'reserved');
-    const removed = log.length - kept.length;
-    log.length = 0;
-    log.push(...kept);
-    return { removed, keptReserved: kept.length };
-  });
+      log.push(...kept);
+      return { removed, keptReserved: kept.length, discardedCorrupt };
+    },
+    { forgivingCorrupt: true },
+  );
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

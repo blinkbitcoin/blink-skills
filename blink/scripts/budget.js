@@ -26,6 +26,16 @@
 
 const { getConfig, writeConfig, getStatus, getLog, resetLog, CONFIG_FILE, LOG_FILE } = require('./_budget');
 
+// Options are scoped per subcommand; a flag meant for another subcommand is
+// rejected instead of silently ignored (e.g. `budget status --force`).
+const SUBCOMMAND_OPTIONS = {
+  status: [],
+  set: ['--hourly', '--daily', '--off'],
+  log: ['--last'],
+  reset: ['--force'],
+  allowlist: [],
+};
+
 function main() {
   const args = process.argv.slice(2);
   const subcommand = args[0];
@@ -39,6 +49,14 @@ function main() {
     console.error('  blink budget reset [--force]');
     console.error('  blink budget allowlist list|add|remove <domain>');
     process.exit(1);
+  }
+
+  if (subcommand in SUBCOMMAND_OPTIONS) {
+    const bad = args.slice(1).filter((a) => a.startsWith('--') && !SUBCOMMAND_OPTIONS[subcommand].includes(a));
+    if (bad.length > 0) {
+      console.error(`Error: option(s) ${bad.join(', ')} not valid for 'budget ${subcommand}'.`);
+      process.exit(1);
+    }
   }
 
   if (subcommand === 'status') {
@@ -149,16 +167,14 @@ function main() {
 
   if (subcommand === 'reset') {
     const force = args.includes('--force');
-    const { removed, keptReserved } = resetLog({ force });
-    const output = {
-      removed,
-      keptReserved,
-      force,
-      message: force
+    const { removed, keptReserved, discardedCorrupt } = resetLog({ force });
+    const message =
+      (force
         ? `Cleared ${removed} spending log entries (including any active reservations — use only while no payments are in flight).`
-        : `Cleared ${removed} spending log entries. Kept ${keptReserved} active reservation(s); use --force to clear those too (unsafe while payments run).`,
-    };
-    console.error(output.message);
+        : `Cleared ${removed} spending log entries. Kept ${keptReserved} active reservation(s); use --force to clear those too (unsafe while payments run).`) +
+      (discardedCorrupt ? ' The previous log was corrupt and was discarded.' : '');
+    const output = { removed, keptReserved, discardedCorrupt, force, message };
+    console.error(message);
     console.log(JSON.stringify(output, null, 2));
     return;
   }
