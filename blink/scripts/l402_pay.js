@@ -59,7 +59,7 @@ const { saveToken, getToken } = require('./l402_store');
 
 const {
   reserveBudget,
-  finalizeReservation,
+  finalizeOrRecord,
   releaseReservation,
   recordSpend,
   checkBudget,
@@ -598,9 +598,12 @@ async function main() {
 
   // Budget reservation state at function scope: the reservation happens inside
   // the enforcement block below, but the pay section that follows must be able
-  // to finalize it (success) or release it (failure) — and max-amount refusals
-  // in between must release it too.
+  // to finalize it (success) or release it (known failure) — and max-amount
+  // refusals in between must release it too. Credentials are likewise resolved
+  // BEFORE the reservation so a missing key cannot orphan it.
   let reservationId = null;
+  let apiKey = null;
+  let apiUrl = null;
   const releaseReservationQuietly = () => {
     if (reservationId) {
       try {
@@ -655,8 +658,11 @@ async function main() {
     // ── Budget reservation (fail closed for autonomous auto-pay) ──
     // The limit decision AND the reservation append happen under one lock, so
     // two concurrent payments can never both pass the same remaining budget.
-    // (reservationId and its release helper live at function scope because the
-    // pay section below must be able to finalize or release.)
+    // Credentials are resolved FIRST: a missing API key must not orphan the
+    // reservation (no payment is attempted in that case, so nothing should
+    // stay reserved).
+    apiKey = getApiKey();
+    apiUrl = getApiUrl();
     const reservation = reserveBudget({ sats: satoshis, command: 'l402-pay', domain }, { requireConfigured: true });
     if (!reservation.allowed) {
       const output = {
@@ -721,12 +727,10 @@ async function main() {
   }
 
   // ── Pay the invoice ──
-  // Every throw between here and a successful payment must release the
-  // budget reservation — the payment did not happen. After SUCCESS the
-  // reservation is finalized instead (funds moved, even if a later step fails).
-  const apiKey = getApiKey();
-  const apiUrl = getApiUrl();
-
+  // apiKey/apiUrl were resolved in the enforcement block above, before the
+  // reservation. Every throw between here and a successful payment must
+  // RELEASE the reservation when it happens before dispatch (setup failures)
+  // and KEEP it after dispatch (outcome unknown — the payment may settle).
   let wallet;
   let payData;
   try {
@@ -775,20 +779,40 @@ async function main() {
       timeoutMs: MUTATION_TIMEOUT_MS,
     });
   } catch (e) {
-    releaseReservationQuietly();
+    // Outcome-unknown after dispatch (timeout, lost response, transport
+    // reset): the payment may still settle, so the reservation STAYS —
+    // freeing it would let another auto-pay double-spend the same window.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
     throw e;
   }
 
   const payResult = payData.lnInvoicePaymentSend;
 
   if (payResult.errors && payResult.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
     releaseReservationQuietly();
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
   if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
-    releaseReservationQuietly();
+    // PENDING is in flight: count it against the budget like the one-shot pay
+    // commands do, then surface the failure — the preimage will not resolve.
+    if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
+      try {
+        finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
+      } catch {
+        /* recording failure after a moving payment is warned about below-equivalently; keep going */
+      }
+      reservationId = null;
+    } else {
+      releaseReservationQuietly();
+    }
     throw new Error(`Payment not successful: status=${payResult.status}`);
   }
 
@@ -850,11 +874,20 @@ async function main() {
   // ── Record spend in budget log ──
   // Finalize the reservation (funds moved) — or, when no budget is configured
   // (nothing was reserved), record the spend directly so the log stays
-  // complete for unconfigured users too.
+  // complete for unconfigured users too. finalizeOrRecord restores the entry
+  // if the reservation was erased externally (e.g. by `budget reset`).
   if (satoshis !== null) {
     try {
-      if (reservationId) finalizeReservation(reservationId);
-      else recordSpend({ sats: satoshis, command: 'l402-pay', domain });
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: satoshis, command: 'l402-pay', domain });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: satoshis, command: 'l402-pay', domain });
+      }
     } catch (err) {
       console.error(`Warning: could not record spend: ${err.message}`);
     }

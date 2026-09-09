@@ -103,8 +103,8 @@ describe('sumSpending', () => {
   it('separates hourly vs daily entries', () => {
     const now = Date.now();
     const log = [
-      { ts: now - 2 * 60 * 60 * 1000, sats: 500, command: 'test' },  // 2h ago (daily only)
-      { ts: now - 30 * 60 * 1000, sats: 100, command: 'test' },       // 30min ago (both)
+      { ts: now - 2 * 60 * 60 * 1000, sats: 500, command: 'test' }, // 2h ago (daily only)
+      { ts: now - 30 * 60 * 1000, sats: 100, command: 'test' }, // 30min ago (both)
     ];
     const { hourlySpent, dailySpent } = mod.sumSpending(log, now);
     assert.equal(hourlySpent, 100);
@@ -115,7 +115,7 @@ describe('sumSpending', () => {
     const now = Date.now();
     const log = [
       { ts: now - 25 * 60 * 60 * 1000, sats: 9999, command: 'test' }, // 25h ago
-      { ts: now - 100, sats: 50, command: 'test' },                     // just now
+      { ts: now - 100, sats: 50, command: 'test' }, // just now
     ];
     const { hourlySpent, dailySpent } = mod.sumSpending(log, now);
     assert.equal(hourlySpent, 50);
@@ -178,7 +178,11 @@ describe('getConfig', () => {
     assert.equal(config.hourlyLimitSats, 999);
     assert.equal(config.dailyLimitSats, 500); // from file
     // Cleanup
-    try { fs.unlinkSync(mod.CONFIG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('treats invalid env var as null', () => {
@@ -208,7 +212,11 @@ describe('checkBudget', () => {
     delete process.env.BLINK_BUDGET_HOURLY_SATS;
     delete process.env.BLINK_BUDGET_DAILY_SATS;
     // Clear log
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('denies when no limits are set (fail closed by default)', () => {
@@ -254,9 +262,7 @@ describe('checkBudget', () => {
     // Write a log entry for 80 sats spent in last hour
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 10 * 60 * 1000, sats: 80, command: 'test' },
-    ]));
+    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([{ ts: now - 10 * 60 * 1000, sats: 80, command: 'test' }]));
     const result = mod.checkBudget(50, { nowMs: now });
     assert.equal(result.allowed, false);
     assert.match(result.reason, /Hourly budget exceeded/);
@@ -267,9 +273,7 @@ describe('checkBudget', () => {
     process.env.BLINK_BUDGET_HOURLY_SATS = '100';
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 5 * 60 * 1000, sats: 50, command: 'test' },
-    ]));
+    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([{ ts: now - 5 * 60 * 1000, sats: 50, command: 'test' }]));
     const result = mod.checkBudget(50, { nowMs: now });
     assert.equal(result.allowed, true);
   });
@@ -278,9 +282,7 @@ describe('checkBudget', () => {
     process.env.BLINK_BUDGET_DAILY_SATS = '500';
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 3 * 60 * 60 * 1000, sats: 400, command: 'test' },
-    ]));
+    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([{ ts: now - 3 * 60 * 60 * 1000, sats: 400, command: 'test' }]));
     const result = mod.checkBudget(200, { nowMs: now });
     assert.equal(result.allowed, false);
     assert.match(result.reason, /Daily budget exceeded/);
@@ -291,9 +293,7 @@ describe('checkBudget', () => {
     process.env.BLINK_BUDGET_DAILY_SATS = '500';
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 30 * 60 * 1000, sats: 70, command: 'test' },
-    ]));
+    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([{ ts: now - 30 * 60 * 1000, sats: 70, command: 'test' }]));
     const result = mod.checkBudget(10, { nowMs: now });
     assert.equal(result.allowed, true);
     assert.equal(result.hourlyRemaining, 30);
@@ -364,7 +364,11 @@ describe('recordSpend and log pruning', () => {
     cleanupTempDir();
   });
   afterEach(() => {
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('appends an entry to the spending log', () => {
@@ -387,7 +391,7 @@ describe('recordSpend and log pruning', () => {
   it('writeLog prunes entries older than 25 hours', () => {
     const now = Date.now();
     const entries = [
-      { ts: now - 26 * 60 * 60 * 1000, sats: 999, command: 'old' },  // 26h ago — pruned
+      { ts: now - 26 * 60 * 60 * 1000, sats: 999, command: 'old' }, // 26h ago — pruned
       { ts: now - 1 * 60 * 60 * 1000, sats: 100, command: 'recent' }, // 1h ago — kept
     ];
     mod.writeLog(entries);
@@ -446,8 +450,16 @@ describe('spending-log lock ownership', () => {
   });
   afterEach(() => {
     mod.setLockTiming({ acquireTimeoutMs: 2000, staleMs: 5000 });
-    try { fs.rmSync(lockPath, { force: true }); } catch { /* ok */ }
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try {
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      /* ok */
+    }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('throws BUDGET_LOCK_TIMEOUT against a live foreign lock and never deletes it', () => {
@@ -519,8 +531,16 @@ describe('reserveBudget / finalizeReservation / releaseReservation', () => {
     cleanupTempDir();
   });
   beforeEach(() => {
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
-    try { fs.unlinkSync(mod.CONFIG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
+    try {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('with no budget configured: allowed with id null (nothing to finalize)', () => {
@@ -590,7 +610,11 @@ describe('reserveBudget / finalizeReservation / releaseReservation', () => {
     const next = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
     assert.equal(next.allowed, true, 'the pruned orphan must no longer count');
     const log = mod.readLog();
-    assert.equal(log.some((e) => e.id === orphan.id), false, 'the orphan was pruned away');
+    assert.equal(
+      log.some((e) => e.id === orphan.id),
+      false,
+      'the orphan was pruned away',
+    );
   });
 
   it('resetLog clears reservations too and returns the count', () => {
@@ -599,6 +623,88 @@ describe('reserveBudget / finalizeReservation / releaseReservation', () => {
     mod.recordSpend({ sats: 10, command: 'y' });
     assert.equal(mod.resetLog(), 2);
     assert.deepEqual(mod.readLog(), []);
+  });
+
+  it('finalizeOrRecord restores the spend when the reservation was erased by a reset', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 60, command: 'in-flight' }, { requireConfigured: false });
+    mod.resetLog(); // operator clears while the payment is in flight
+    const outcome = mod.finalizeOrRecord(r.id, { sats: 60, command: 'in-flight', domain: null });
+    assert.equal(outcome, 'restored');
+    const log = mod.readLog();
+    assert.equal(log.length, 1, 'the settled payment must be recorded even after a reset');
+    assert.equal(log[0].sats, 60);
+    assert.equal(log[0].state, undefined, 'restored entries are normal spends, not reservations');
+  });
+
+  it('finalizeOrRecord on a live reservation finalizes it', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 60, command: 'x' }, { requireConfigured: false });
+    assert.equal(mod.finalizeOrRecord(r.id, { sats: 60, command: 'x' }), 'finalized');
+    const log = mod.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, undefined);
+  });
+
+  it('finalizeOrRecord with a null id is a no-op', () => {
+    assert.equal(mod.finalizeOrRecord(null, { sats: 1, command: 'x' }), 'dropped');
+    assert.deepEqual(mod.readLog(), []);
+  });
+});
+
+// ── mutateLog ownership loss (stale break + takeover while stalled) ──────────
+
+describe('mutateLog ownership re-check', () => {
+  let mod;
+  let lockPath;
+  before(() => {
+    setupTempDir();
+    saveEnv();
+    patchHomedir();
+    delete require.cache[require.resolve(path.join(scriptsDir, '_budget.js'))];
+    mod = require(path.join(scriptsDir, '_budget.js'));
+    lockPath = path.join(path.dirname(mod.LOG_FILE), '.spending-log.lock');
+  });
+  after(() => {
+    restoreHomedir();
+    restoreEnv();
+    cleanupTempDir();
+  });
+  afterEach(() => {
+    try {
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      /* ok */
+    }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
+  });
+
+  it('refuses to write when the lock was taken over mid-mutation (BUDGET_LOCK_LOST)', () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    // Simulate: we acquire, stall past staleness, a successor breaks the lock
+    // and writes its own token before our mutation finishes.
+    assert.throws(
+      () =>
+        mod.mutateLog((log) => {
+          log.push({ ts: Date.now(), sats: 1, command: 'stalled' });
+          fs.writeFileSync(lockPath, 'successor-token', 'utf8'); // takeover during our "stall"
+        }),
+      (e) => e.code === 'BUDGET_LOCK_LOST',
+      'a lost lock must fail loudly instead of clobbering the successor',
+    );
+    assert.deepEqual(mod.readLog(), [], 'the takeover state must not be clobbered by our write');
+  });
+
+  it('does not falsely trip when we still hold the lock', () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    mod.mutateLog((log) => {
+      log.push({ ts: Date.now(), sats: 1, command: 'ok' });
+    });
+    assert.equal(mod.readLog().length, 1);
   });
 });
 
@@ -619,16 +725,23 @@ describe('getLog and resetLog', () => {
     cleanupTempDir();
   });
   afterEach(() => {
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('returns newest entries first', () => {
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 1000, sats: 10, command: 'first' },
-      { ts: now, sats: 20, command: 'second' },
-    ]));
+    fs.writeFileSync(
+      mod.LOG_FILE,
+      JSON.stringify([
+        { ts: now - 1000, sats: 10, command: 'first' },
+        { ts: now, sats: 20, command: 'second' },
+      ]),
+    );
     const entries = mod.getLog(10);
     assert.equal(entries.length, 2);
     assert.equal(entries[0].command, 'second');
@@ -638,7 +751,9 @@ describe('getLog and resetLog', () => {
   it('respects limit parameter', () => {
     const now = Date.now();
     const log = Array.from({ length: 50 }, (_, i) => ({
-      ts: now - (50 - i) * 1000, sats: 1, command: `cmd-${i}`,
+      ts: now - (50 - i) * 1000,
+      sats: 1,
+      command: `cmd-${i}`,
     }));
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
     fs.writeFileSync(mod.LOG_FILE, JSON.stringify(log));
@@ -648,10 +763,13 @@ describe('getLog and resetLog', () => {
 
   it('resetLog clears all entries and returns count', () => {
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: Date.now(), sats: 1, command: 'test' },
-      { ts: Date.now(), sats: 2, command: 'test' },
-    ]));
+    fs.writeFileSync(
+      mod.LOG_FILE,
+      JSON.stringify([
+        { ts: Date.now(), sats: 1, command: 'test' },
+        { ts: Date.now(), sats: 2, command: 'test' },
+      ]),
+    );
     const removed = mod.resetLog();
     assert.equal(removed, 2);
     assert.equal(mod.readLog().length, 0);
@@ -677,7 +795,11 @@ describe('getStatus', () => {
   afterEach(() => {
     delete process.env.BLINK_BUDGET_HOURLY_SATS;
     delete process.env.BLINK_BUDGET_DAILY_SATS;
-    try { fs.unlinkSync(mod.LOG_FILE); } catch { /* ok */ }
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
   });
 
   it('returns full status object', () => {
@@ -685,9 +807,7 @@ describe('getStatus', () => {
     process.env.BLINK_BUDGET_DAILY_SATS = '5000';
     const now = Date.now();
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
-    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([
-      { ts: now - 10 * 60 * 1000, sats: 200, command: 'test' },
-    ]));
+    fs.writeFileSync(mod.LOG_FILE, JSON.stringify([{ ts: now - 10 * 60 * 1000, sats: 200, command: 'test' }]));
     const status = mod.getStatus({ nowMs: now });
     assert.equal(status.enabled, true);
     assert.equal(status.hourlyLimit, 1000);

@@ -1423,7 +1423,7 @@ blink budget status                              # Show current spend vs limits
 blink budget set --hourly 1000 --daily 5000      # Set spending limits
 blink budget set --off                           # Remove all limits
 blink budget log [--last 10]                     # Show recent spending entries
-blink budget reset                               # Clear spending history
+blink budget reset                               # Clear spending history (also clears active reservations)
 blink budget allowlist list                      # Show allowed L402 domains
 blink budget allowlist add satring.com           # Add domain to allowlist
 blink budget allowlist remove satring.com        # Remove domain from allowlist
@@ -1451,7 +1451,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### How Budget Enforcement Works
 
 - **Checked before every outbound payment:** `pay-invoice`, `pay-lnaddress`, `pay-lnurl`, `l402-pay`, `spark-send` (after fee resolution, before signing)
-- **Reserved, not just checked:** the amount is **reserved** under the budget lock before the payment executes, then finalized (success/pending) or released (failure) — two concurrent payments can never both pass the same remaining budget. A crash between payment and finalization leaves the reservation counting (fail-closed) until the 25h prune; reserved entries appear in `budget log` with `"state": "reserved"`.
+- **Reserved, not just checked:** the amount is **reserved** under the budget lock before the payment executes, then finalized (success/pending) or released (known failure) — two concurrent payments can never both pass the same remaining budget. **Outcome-unknown errors after dispatch** (timeout, lost response) keep the reservation in place: the payment may still settle, so the budget stays blocked until the 25h prune. A crash between payment and finalization behaves the same; reserved entries appear in `budget log` with `"state": "reserved"`.
 - **Principal only:** budgets count the payment amount, not the routing fee — for the custodial commands and `spark-send` alike
 - **Unconfigured budget:** allowed for explicit one-shot payments; **denied** for `l402-pay` auto-pay
 - **Domain allowlist:** checked for `l402-pay` only — an empty allowlist blocks all auto-pay
@@ -1460,6 +1460,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **`--dry-run` shows budget impact:** dry-run output includes a `budget` field showing remaining budget (dry-run never pays, so it works without configuration)
 - **Spending recorded after success:** only successful/pending payments are logged
 - **Auto-pruning:** log entries older than 25 hours are removed automatically
+- **`budget reset` and in-flight reservations:** reset clears everything, including active reservations. If a payment that was reserved before the reset later completes, the spend is re-recorded (accounting restored), but the freed allowance could briefly be reused by a concurrent payment. Do not reset while payments are in flight.
 
 > **AGENT:** Before making a payment, check budget status with `blink budget status` to see remaining budget. If budget is exceeded, inform the user and suggest increasing limits with `blink budget set`.
 

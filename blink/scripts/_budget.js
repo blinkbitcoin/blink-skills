@@ -151,13 +151,23 @@ function acquireLogLock() {
       return token;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let stale = false;
+      let stat1;
       try {
-        stale = Date.now() - fs.statSync(LOG_LOCK_FILE).mtimeMs > lockTiming.staleMs;
+        stat1 = fs.statSync(LOG_LOCK_FILE);
       } catch {
         continue; // lock vanished between open and stat — retry immediately
       }
-      if (stale) {
+      if (Date.now() - stat1.mtimeMs > lockTiming.staleMs) {
+        // Narrow the two-waiters race: both can decide the same old lock is
+        // stale, and one could unlink the other's freshly created replacement.
+        // Re-stat immediately before unlinking and abort if the lock changed.
+        let stat2;
+        try {
+          stat2 = fs.statSync(LOG_LOCK_FILE);
+        } catch {
+          continue; // already gone
+        }
+        if (stat2.mtimeMs !== stat1.mtimeMs) continue; // broken & recreated — wait for the new lock
         try {
           fs.unlinkSync(LOG_LOCK_FILE);
         } catch (unlinkErr) {
@@ -209,6 +219,10 @@ function releaseLogLock(token) {
  * mutation path can bypass the lock (recordSpend, resetLog, reservations).
  * The lock is never held across a payment — mutations are short.
  *
+ * Ownership is re-checked before the write: if our lock was declared stale
+ * and replaced while a mutation stalled, writing would clobber the
+ * successor's state — refuse loudly instead.
+ *
  * @param {(log: Array) => any} mutator  Mutates the log array in place; its
  *   return value is passed through.
  */
@@ -217,6 +231,19 @@ function mutateLog(mutator) {
   try {
     const log = readLog();
     const result = mutator(log);
+    let current;
+    try {
+      current = fs.readFileSync(LOG_LOCK_FILE, 'utf8');
+    } catch {
+      current = null; // vanished — could be a stale break + replacement
+    }
+    if (current !== token) {
+      const err = new Error(
+        'Budget lock was lost to staleness before the write completed — refusing to clobber a successor\u2019s log state.',
+      );
+      err.code = 'BUDGET_LOCK_LOST';
+      throw err;
+    }
     writeLog(log);
     return result;
   } finally {
@@ -599,6 +626,34 @@ function releaseReservation(id) {
   });
 }
 
+/**
+ * Finalize a reservation OR restore accounting when it is missing.
+ *
+ * `budget reset` clears active reservations while a payment may still be in
+ * flight; if the reservation is gone when finalize arrives, finalize alone
+ * would return false and the settled payment would escape the log entirely —
+ * later budget checks would overestimate what is left. This helper writes a
+ * normal spend entry in that case (conservative restoration) and returns
+ * 'finalized' or 'restored' so the caller can warn on the latter.
+ *
+ * @returns {'finalized' | 'restored' | 'dropped'}  'dropped' only when id is null.
+ */
+function finalizeOrRecord(id, { sats, command, domain = null } = {}) {
+  if (id === null || id === undefined) return 'dropped';
+  return mutateLog((log) => {
+    const i = log.findIndex((e) => e.state === 'reserved' && e.id === id);
+    if (i !== -1) {
+      const { ts } = log[i];
+      log[i] = { ts, sats, command, domain };
+      return 'finalized';
+    }
+    // Reservation was erased externally (budget reset) or pruned: the payment
+    // moved funds, so restore the accounting with a normal spend entry.
+    log.push({ ts: Date.now(), sats, command, domain });
+    return 'restored';
+  });
+}
+
 // ── Log management ───────────────────────────────────────────────────────────
 
 /**
@@ -664,6 +719,7 @@ module.exports = {
   // Reservations (reserve before the payment executes; finalize or release after)
   reserveBudget,
   finalizeReservation,
+  finalizeOrRecord,
   releaseReservation,
 
   // Domain

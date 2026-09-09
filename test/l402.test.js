@@ -1374,6 +1374,146 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     void code;
   });
 
+  // ── reservation lifecycle (review: keep reservations conservative) ─────────
+  //
+  // These tests exercise the full payment path with a controllable GraphQL
+  // backend, asserting on the budget log after runPay.
+
+  /**
+   * Mock the 402 challenge AND the Blink GraphQL backend. The mutation's
+   * outcome is driven by options: a status string, or a transport-level throw
+   * that mimics "timeout after the payment was dispatched".
+   */
+  function mockPayment({ status = 'SUCCESS', throwOnMutation = false, invoice = INVOICE_100K } = {}) {
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          if (throwOnMutation) throw new Error('network timeout after dispatch');
+          return respond({
+            lnInvoicePaymentSend: {
+              status,
+              errors: [],
+              transaction:
+                status === 'SUCCESS'
+                  ? { settlementVia: { preImage: 'a'.repeat(64) }, initiationVia: { paymentHash: 'b'.repeat(64) } }
+                  : null,
+            },
+          });
+        }
+        if (q.includes('transactions')) return respond({ transactions: { edges: [] } });
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        const hasAuth = opts && opts.headers && opts.headers.Authorization;
+        if (hasAuth) {
+          return { status: 200, url: u, headers: { get: () => null }, text: async () => JSON.stringify({ ok: true }) };
+        }
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${invoice}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
+  }
+
+  function readSpendLog() {
+    const budget = require(budgetPath);
+    return budget.readLog();
+  }
+
+  function configureAutoPay() {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'paywall.example.com';
+    process.env.BLINK_BUDGET_DAILY_SATS = '200000';
+  }
+
+  it('a PENDING payment finalizes the reservation (in flight counts against the budget)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'the in-flight payment must stay on the budget');
+    assert.equal(log[0].sats, 100000);
+    assert.equal(log[0].state, undefined, 'finalized — a normal spend entry, not a reservation');
+  });
+
+  it('a transport error after dispatch KEEPS the reservation (fail-closed)', async () => {
+    configureAutoPay();
+    mockPayment({ throwOnMutation: true });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'outcome unknown — the budget must stay blocked');
+    assert.equal(log[0].state, 'reserved');
+  });
+
+  it('an explicit server rejection frees the reservation (nothing moved)', async () => {
+    configureAutoPay();
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          return respond({ lnInvoicePaymentSend: { status: 'FAILURE', errors: [{ message: 'Route not found' }] } });
+        }
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${INVOICE_100K}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
+  });
+
+  it('a missing API key orphans no reservation (credentials resolve before reserving)', async () => {
+    configureAutoPay();
+    const savedKey = process.env.BLINK_API_KEY;
+    delete process.env.BLINK_API_KEY;
+    try {
+      mock402(INVOICE_100K);
+      await runPay(['https://paywall.example.com/resource', '--no-store']);
+      assert.deepEqual(readSpendLog(), [], 'no payment was attempted, so nothing may stay reserved');
+    } finally {
+      process.env.BLINK_API_KEY = savedKey;
+    }
+  });
+
   it('dry-run still reports an undecodable amount instead of refusing', async () => {
     mock402(INVOICE_NO_AMOUNT);
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);

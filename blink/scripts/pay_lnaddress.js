@@ -34,7 +34,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 
 const PAY_LN_ADDRESS_MUTATION = `
   mutation LnAddressPaymentSend($input: LnAddressPaymentSendInput!) {
@@ -128,8 +128,16 @@ async function main() {
   };
   const recordOrFinalize = () => {
     try {
-      if (reservationId) finalizeReservation(reservationId);
-      else recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: amountSats, command: 'pay-lnaddress', domain: null });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: amountSats, command: 'pay-lnaddress', domain: null });
+      }
     } catch (e) {
       console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
     }
@@ -169,12 +177,20 @@ async function main() {
       timeoutMs: MUTATION_TIMEOUT_MS,
     });
   } catch (e) {
-    releaseReservationQuietly();
+    // Outcome-unknown after dispatch: the payment may still settle, so the
+    // reservation STAYS (fail-closed) rather than freeing budget for a retry.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
     throw e;
   }
   const result = data.lnAddressPaymentSend;
 
   if (result.errors && result.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
     releaseReservationQuietly();
     throw new Error(`Payment failed: ${errMsg}`);

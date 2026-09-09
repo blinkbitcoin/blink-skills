@@ -32,7 +32,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 const { decodeBolt11AmountSats } = require('./l402_discover');
 
 const PAY_INVOICE_MUTATION = `
@@ -136,13 +136,21 @@ async function main() {
       timeoutMs: MUTATION_TIMEOUT_MS,
     });
   } catch (e) {
-    // The payment did not happen — do not let the reservation keep blocking.
-    releaseReservationQuietly();
+    // Outcome-unknown after dispatch (timeout, lost response, transport
+    // reset): the payment may still settle, so the reservation STAYS —
+    // freeing it would let a retry double-spend the same budget window.
+    if (reservationId) {
+      console.error(
+        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+      );
+    }
     throw e;
   }
   const result = data.lnInvoicePaymentSend;
 
   if (result.errors && result.errors.length > 0) {
+    // Explicit server-side rejection — nothing moved; the budget is freed.
     const isSelfPay = result.errors.some(
       (e) =>
         (e.code && e.code.toString().toUpperCase().includes('CANT_PAY_SELF')) ||
@@ -173,8 +181,16 @@ async function main() {
 
   const recordOrFinalize = () => {
     try {
-      if (reservationId) finalizeReservation(reservationId);
-      else recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+      if (reservationId) {
+        const outcome = finalizeOrRecord(reservationId, { sats: invoiceSats, command: 'pay-invoice', domain: null });
+        if (outcome === 'restored') {
+          console.error(
+            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+          );
+        }
+      } else {
+        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
+      }
     } catch (e) {
       console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
     }

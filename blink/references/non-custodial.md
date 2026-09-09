@@ -172,11 +172,12 @@ the custodial commands:
   custodial pay commands' convention.
 - **Enforcement is reservation-based.** `reserveBudget` decides AND reserves
   under one lock before the send executes, so concurrent sends can never
-  jointly exceed a limit. Success/pending finalizes the reservation; failure
-  releases it. A crash between payment and finalization leaves the
-  reservation counting (fail-closed) until the 25h prune; a failed recording
-  after settlement keeps blocking conservatively rather than letting the next
-  send through.
+  jointly exceed a limit. Success/pending finalizes the reservation; an
+  explicit terminal failure releases it. An outcome-unknown error after
+  dispatch (timeout, lost response, SDK error) **keeps** the reservation —
+  the payment may still settle, so freeing the budget for a retry would
+  reopen the race; it is pruned fail-closed after 25h. A failed recording
+  after settlement behaves the same way.
 
 ## The Breez API key (`BREEZ_API_KEY`)
 

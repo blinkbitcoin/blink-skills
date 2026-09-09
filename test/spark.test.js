@@ -560,7 +560,10 @@ describe('spark_send.classifyDestination', () => {
 
   it('rejects malformed parse results rather than guessing', () => {
     for (const bad of [null, undefined, {}, { type: '' }, 'bolt11Invoice']) {
-      assert.throws(() => classifyDestination(bad), (e) => e.code === 'UNSUPPORTED_DESTINATION');
+      assert.throws(
+        () => classifyDestination(bad),
+        (e) => e.code === 'UNSUPPORTED_DESTINATION',
+      );
     }
   });
 });
@@ -730,11 +733,14 @@ describe('spark_send main() destination routing', () => {
 
   it('rejects an unsupported SDK destination type before any prepare call', async () => {
     installMock({ parseType: 'bitcoinAddress' });
-    await assert.rejects(() => runMain(['bc1qxyz', '100']), (e) => {
-      assert.match(e.message, /Unsupported destination type 'bitcoinaddress'/);
-      assert.equal(e.code, 'UNSUPPORTED_DESTINATION');
-      return true;
-    });
+    await assert.rejects(
+      () => runMain(['bc1qxyz', '100']),
+      (e) => {
+        assert.match(e.message, /Unsupported destination type 'bitcoinaddress'/);
+        assert.equal(e.code, 'UNSUPPORTED_DESTINATION');
+        return true;
+      },
+    );
     assert.deepEqual(calls, ['parse'], 'must stop after parse, before any prepare/send');
   });
 
@@ -872,8 +878,8 @@ describe('spark_send budget integration', () => {
   it('a failed finalization leaves the reservation counting (fail-closed) and warns', async () => {
     budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
     installMock({});
-    const savedFinalize = budget.finalizeReservation;
-    budget.finalizeReservation = () => {
+    const savedFinalize = budget.finalizeOrRecord;
+    budget.finalizeOrRecord = () => {
       throw new Error('disk full');
     };
     try {
@@ -884,8 +890,34 @@ describe('spark_send budget integration', () => {
       assert.equal(log.length, 1);
       assert.equal(log[0].state, 'reserved', 'the orphaned reservation must keep blocking the budget');
     } finally {
-      budget.finalizeReservation = savedFinalize;
+      budget.finalizeOrRecord = savedFinalize;
     }
+  });
+
+  it('an outcome-unknown SDK error after dispatch KEEPS the reservation (fail-closed)', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    installMock({});
+    // Replace sendPayment with a transport-level failure after dispatch.
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    const fake = require.cache[sdkPath].exports;
+    const fakeSdk = {
+      async parse() {
+        return { type: 'bolt11Invoice' };
+      },
+      async prepareSendPayment() {
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
+      },
+      async sendPayment() {
+        throw new Error('transport reset after dispatch');
+      },
+    };
+    fake.connect = async () => ({ sdk: fakeSdk, disconnect: async () => {} });
+    delete require.cache[sparkSendPath];
+    await assert.rejects(() => runMain(['lnbc100n1p...', '100']), /transport reset/);
+    const log = budget.readLog();
+    assert.equal(log.length, 1, 'the reservation must stay — the payment may still settle');
+    assert.equal(log[0].state, 'reserved');
+    assert.match(lastErr, /outcome is unknown.*25h prune/s);
   });
 
   it('an unconfigured budget allows an explicit send and records the spend', async () => {

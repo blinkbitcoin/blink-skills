@@ -48,7 +48,7 @@
  */
 
 const { connect } = require('./_spark_sdk');
-const { reserveBudget, finalizeReservation, releaseReservation, recordSpend } = require('./_budget');
+const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 
 function parseArgs(argv) {
   let destination = null;
@@ -286,18 +286,19 @@ async function main() {
     }
 
     // 3. Send (signs locally) via the matching path. A throw after the send
-    // started must release the reservation — the payment did not happen.
+    // was dispatched (timeout, lost response, SDK error) does NOT prove the
+    // payment failed — the payment may still settle. Keep the reservation
+    // reserved (fail-closed) rather than freeing the budget for a retry.
     let result;
     try {
       result =
         dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
     } catch (e) {
       if (reservationId) {
-        try {
-          releaseReservation(reservationId);
-        } catch {
-          /* the orphaned reservation counts conservatively until pruned */
-        }
+        console.error(
+          `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+            `(fail-closed, auto-cleared by the 25h prune). Inspect \`spark-transactions\` before retrying.`,
+        );
       }
       throw e;
     }
@@ -310,13 +311,25 @@ async function main() {
     // log would make later budget checks overestimate what is left.
     if (!isFailedStatus(status)) {
       try {
-        if (reservationId) finalizeReservation(reservationId);
-        else recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
+        if (reservationId) {
+          const outcome = finalizeOrRecord(reservationId, {
+            sats: args.amountSats,
+            command: 'spark-send',
+            domain: null,
+          });
+          if (outcome === 'restored') {
+            console.error(
+              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+            );
+          }
+        } else {
+          recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
+        }
       } catch (e) {
         console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
       }
     } else if (reservationId) {
-      // The payment did not happen — do not let the reservation keep blocking.
+      // Explicit terminal failure — the payment did not happen, free the budget.
       try {
         releaseReservation(reservationId);
       } catch {
