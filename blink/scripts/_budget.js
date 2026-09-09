@@ -57,20 +57,11 @@ function corruptConfigError(detail) {
  *
  * @returns {object} the validated config (possibly {})
  */
-function readConfigFile() {
-  let content;
-  try {
-    content = fs.readFileSync(CONFIG_FILE, 'utf8');
-  } catch (e) {
-    if (e.code === 'ENOENT') return {};
-    throw corruptConfigError(e.message); // EACCES, EISDIR, etc.
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch (e) {
-    throw corruptConfigError(`invalid JSON: ${e.message}`);
-  }
+/**
+ * Shared config-object schema — used by BOTH the reader (readConfigFile) and
+ * the writer (writeConfig), so no path can persist state the reader rejects.
+ */
+function validateConfigObject(parsed) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw corruptConfigError('expected a top-level JSON object');
   }
@@ -87,7 +78,37 @@ function readConfigFile() {
       throw corruptConfigError('allowlist must be an array of domain strings');
     }
   }
+}
+
+function readConfigFile() {
+  let content;
+  try {
+    content = fs.readFileSync(CONFIG_FILE, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw corruptConfigError(e.message); // EACCES, EISDIR, etc.
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    throw corruptConfigError(`invalid JSON: ${e.message}`);
+  }
+  validateConfigObject(parsed);
   return parsed;
+}
+
+/**
+ * Dedicated env-var error: names the variable and the correct recovery
+ * (correct or unset it) — NOT file corruption, so it must not tell the
+ * operator to touch budget.json.
+ */
+function envInvalidLimitError(name, value) {
+  const err = new Error(
+    `BUDGET_ENV_INVALID: env var ${name} is not a positive integer (got "${value}"). ` + 'Correct it or unset it.',
+  );
+  err.code = 'BUDGET_ENV_INVALID';
+  return err;
 }
 
 /**
@@ -99,7 +120,7 @@ function envLimitOrNull(name, value) {
   if (value === undefined || value === '') return null;
   const n = Number(value);
   if (!Number.isSafeInteger(n) || n <= 0 || String(n) !== String(value).trim()) {
-    throw corruptConfigError(`env var ${name} is not a positive integer`);
+    throw envInvalidLimitError(name, value);
   }
   return n;
 }
@@ -155,6 +176,9 @@ function getConfig() {
  * @param {object} config
  */
 function writeConfig(config) {
+  // Writers and readers share one schema: refuse to persist state the reader
+  // would reject (e.g. an unsafe-integer limit rounded by a permissive parse).
+  validateConfigObject(config);
   fs.mkdirSync(BLINK_DIR, { recursive: true });
   const tmp = `${CONFIG_FILE}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf8');
@@ -322,6 +346,34 @@ function corruptLogError(detail) {
   );
   err.code = 'BUDGET_LOG_CORRUPT';
   return err;
+}
+
+/**
+ * Writer-side entry validation. Writers and readers share ONE schema: nothing
+ * may be persisted that readLog() would reject. Timestamp rules are skipped
+ * here — writers stamp Date.now() themselves.
+ */
+function invalidEntryError(detail) {
+  const err = new Error(`BUDGET_INVALID_ENTRY: ${detail}`);
+  err.code = 'BUDGET_INVALID_ENTRY';
+  return err;
+}
+function invalidAmountError(value) {
+  const err = new Error(
+    `BUDGET_INVALID_AMOUNT: spend entries require a positive safe-integer number of sats (got ${String(value)}). ` +
+      'Sub-satoshi or rounded amounts must be rejected by the payment command before reaching the budget.',
+  );
+  err.code = 'BUDGET_INVALID_AMOUNT';
+  return err;
+}
+function validateNewEntry({ sats, command, domain }) {
+  if (!Number.isSafeInteger(sats) || sats <= 0) throw invalidAmountError(sats);
+  if (typeof command !== 'string' || command.length === 0) {
+    throw invalidEntryError('command must be a non-empty string');
+  }
+  if (domain !== undefined && domain !== null && typeof domain !== 'string') {
+    throw invalidEntryError('domain must be a string or null');
+  }
 }
 
 /**
@@ -623,6 +675,7 @@ function checkDomainAllowed(domain, opts = {}) {
  * @param {string|null} entry.domain  Domain (for L402 payments) or null.
  */
 function recordSpend({ sats, command, domain = null }) {
+  validateNewEntry({ sats, command, domain });
   return mutateLog((log) => {
     log.push({ ts: Date.now(), sats, command, domain });
   });
@@ -665,6 +718,10 @@ const NO_BUDGET_CONFIGURED_REASON =
  * @returns {{ allowed: true, id: string|null } | { allowed: false, reason: string }}
  */
 function reserveBudget({ sats, command, domain = null }, opts = {}) {
+  // Validate BEFORE reading config or touching the log: an amount that cannot
+  // be represented as positive safe-integer sats (e.g. a sub-satoshi BOLT-11
+  // rounding to 0) must never be persisted as a reservation.
+  validateNewEntry({ sats, command, domain });
   const requireConfigured = opts.requireConfigured !== false;
   const config = getConfig();
 
@@ -756,6 +813,7 @@ function releaseReservation(id) {
  */
 function finalizeOrRecord(id, { sats, command, domain = null } = {}) {
   if (id === null || id === undefined) return 'dropped';
+  validateNewEntry({ sats, command, domain });
   return mutateLog((log) => {
     const i = log.findIndex((e) => e.state === 'reserved' && e.id === id);
     if (i !== -1) {

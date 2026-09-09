@@ -637,19 +637,19 @@ async function main() {
       process.exit(1);
     }
 
-    // An undecodable amount cannot be budget-checked, so paying it would spend
-    // an unknown sum against limits that were never applied. Refuse rather
-    // than delegate the decision to the backend: `checkBudget` was previously
-    // skipped entirely when `satoshis` was null, which silently defeated both
-    // the budget and --max-amount guards for amountless invoices.
-    if (satoshis === null) {
+    // An undecodable — or sub-satoshi — amount cannot be budget-checked, so
+    // paying it would spend a sum against limits that were never applied
+    // (decodeBolt11AmountSats rounds a valid sub-satoshi invoice like 10p to
+    // 0, which passes a plain `!== null` guard). Refuse rather than delegate
+    // the decision to the backend.
+    if (satoshis === null || satoshis <= 0) {
       const output = {
         event: 'l402_amount_undecodable',
         url: args.url,
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         invoice: challenge.invoice,
         message:
-          'Refusing to pay: the amount could not be decoded from the L402 invoice, so budget ' +
+          'Refusing to pay: the invoice amount could not be decoded or is below 1 satoshi, so budget ' +
           'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
           'invoice explicitly with `blink pay-invoice` if you trust it.',
       };

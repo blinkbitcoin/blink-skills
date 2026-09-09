@@ -87,27 +87,34 @@ function main() {
     let hourly = config.hourlyLimitSats;
     let daily = config.dailyLimitSats;
 
-    const hourlyIdx = args.indexOf('--hourly');
-    if (hourlyIdx !== -1 && args[hourlyIdx + 1]) {
-      const n = parseInt(args[hourlyIdx + 1], 10);
-      if (isNaN(n) || n <= 0) {
-        console.error('Error: --hourly must be a positive integer (sats)');
+    // Strict positive-safe-integer parsing: permissive parseInt would round an
+    // unsafe magnitude, accept 1000oops, or accept 1e5 — writing a value the
+    // validated reader would then reject. (writeConfig also refuses, but the
+    // CLI should fail with a clear, flag-level error first.)
+    const parseLimitFlag = (flag) => {
+      const idx = args.indexOf(flag);
+      if (idx === -1) return null;
+      const raw = args[idx + 1];
+      if (raw === undefined || !/^[0-9]+$/.test(raw)) {
+        console.error(
+          `Error: ${flag} requires a positive integer value in sats (digits only, no suffixes or exponents).`,
+        );
         process.exit(1);
       }
-      hourly = n;
-    }
-
-    const dailyIdx = args.indexOf('--daily');
-    if (dailyIdx !== -1 && args[dailyIdx + 1]) {
-      const n = parseInt(args[dailyIdx + 1], 10);
-      if (isNaN(n) || n <= 0) {
-        console.error('Error: --daily must be a positive integer (sats)');
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n <= 0) {
+        console.error(`Error: ${flag} is outside the safe-integer range.`);
         process.exit(1);
       }
-      daily = n;
-    }
+      return n;
+    };
 
-    if (hourlyIdx === -1 && dailyIdx === -1) {
+    const parsedHourly = parseLimitFlag('--hourly');
+    if (parsedHourly !== null) hourly = parsedHourly;
+    const parsedDaily = parseLimitFlag('--daily');
+    if (parsedDaily !== null) daily = parsedDaily;
+
+    if (!args.includes('--hourly') && !args.includes('--daily')) {
       console.error('Error: provide --hourly <sats> and/or --daily <sats>, or --off to remove limits.');
       process.exit(1);
     }
@@ -179,7 +186,7 @@ function main() {
         source: envOverride ? 'BLINK_L402_ALLOWED_DOMAINS env var' : 'config file',
         message:
           config.allowlist.length === 0
-            ? 'No domain restrictions — all domains allowed for L402 auto-pay.'
+            ? 'No allowlist configured — L402 auto-pay is BLOCKED until a domain is added: blink budget allowlist add <domain>'
             : `${config.allowlist.length} domain(s) allowed for L402 auto-pay.`,
       };
       console.log(JSON.stringify(output, null, 2));

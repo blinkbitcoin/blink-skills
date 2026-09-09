@@ -185,11 +185,15 @@ describe('getConfig', () => {
     }
   });
 
-  it('a garbage env var fails closed instead of silently disabling the limit', () => {
-    process.env.BLINK_BUDGET_HOURLY_SATS = 'not_a_number';
+  it('a garbage env var names the variable and the correct recovery (not the file)', () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = 'abc';
     assert.throws(
       () => mod.getConfig(),
-      (e) => e.code === 'BUDGET_CONFIG_CORRUPT',
+      (e) =>
+        e.code === 'BUDGET_ENV_INVALID' &&
+        e.message.includes('BLINK_BUDGET_DAILY_SATS') &&
+        /unset it/.test(e.message) &&
+        !/budget\.json/.test(e.message),
     );
   });
 
@@ -903,6 +907,44 @@ describe('corrupt spending log fails closed', () => {
     const r = mod.resetLog();
     assert.equal(r.discardedCorrupt, false);
   });
+
+  it('writers refuse reader-invalid entries (writer/reader share one schema)', () => {
+    // reserveBudget with sats 0 is the sub-satoshi BOLT-11 path: decodeBolt11
+    // rounds 10p to 0, and a plain !== null guard lets it through.
+    assert.throws(
+      () => mod.reserveBudget({ sats: 0, command: 'x' }, { requireConfigured: false }),
+      (e) => e.code === 'BUDGET_INVALID_AMOUNT',
+    );
+    assert.throws(
+      () => mod.reserveBudget({ sats: -100, command: 'x' }, { requireConfigured: false }),
+      (e) => e.code === 'BUDGET_INVALID_AMOUNT',
+    );
+    assert.throws(
+      () => mod.recordSpend({ sats: 0, command: 'x' }),
+      (e) => e.code === 'BUDGET_INVALID_AMOUNT',
+    );
+    assert.throws(
+      () => mod.finalizeOrRecord('some-id', { sats: 0.5, command: 'x' }),
+      (e) => e.code === 'BUDGET_INVALID_AMOUNT',
+    );
+    assert.throws(
+      () => mod.recordSpend({ sats: 10, command: '' }),
+      (e) => e.code === 'BUDGET_INVALID_ENTRY',
+    );
+    assert.throws(
+      () => mod.recordSpend({ sats: 10, command: 'x', domain: 42 }),
+      (e) => e.code === 'BUDGET_INVALID_ENTRY',
+    );
+    assert.deepEqual(mod.readLog(), [], 'nothing was persisted that the reader would reject');
+  });
+
+  it('writeConfig refuses to persist a value the reader would reject', () => {
+    assert.throws(
+      () => mod.writeConfig({ dailyLimitSats: 9007199254740992 }),
+      (e) => e.code === 'BUDGET_CONFIG_CORRUPT',
+    );
+    assert.doesNotThrow(() => mod.getConfig(), 'nothing was written');
+  });
 });
 
 // ── getLog / resetLog ────────────────────────────────────────────────────────
@@ -1145,12 +1187,13 @@ describe('budget.js CLI — allowlist', () => {
     cleanupCliTest(origArgv);
   });
 
-  it('allowlist list shows empty list', () => {
+  it('allowlist list with no domains states that auto-pay is BLOCKED (not the opposite)', () => {
     process.argv = ['node', 'blink', 'allowlist', 'list'];
     const logs = captureLog(() => freshCliRequire().main());
     const output = JSON.parse(logs[0]);
     assert.equal(output.count, 0);
     assert.deepEqual(output.allowlist, []);
+    assert.match(output.message, /auto-pay is BLOCKED/);
   });
 
   it('allowlist add then list shows domain', () => {
@@ -1229,6 +1272,21 @@ describe('budget.js CLI — option validation', () => {
     assert.equal(exitCode, 1);
     assert.match(stderr, /Unknown subcommand/);
     assert.equal(stderr.includes('TypeError'), false, 'must not crash on the prototype key');
+  });
+
+  it('set rejects unsafe, fractional, exponential, suffixed, and missing limit values', () => {
+    for (const argv of [
+      ['set', '--daily', '9007199254740993'], // rounds to an unsafe integer
+      ['set', '--daily', '1.5'], // fractional
+      ['set', '--daily', '1e5'], // exponential notation
+      ['set', '--hourly', '1000oops'], // suffixed
+      ['set', '--daily'], // missing value
+    ]) {
+      process.argv = ['node', 'blink', ...argv];
+      const { exitCode, stderr } = runMainTrappingExit();
+      assert.equal(exitCode, 1, `must reject: ${argv.join(' ')}`);
+      assert.match(stderr, /digits only|safe-integer/i, `clear flag-level error for: ${argv.join(' ')}`);
+    }
   });
 
   it('reset --force is accepted and reports the branch', () => {

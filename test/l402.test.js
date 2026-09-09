@@ -1501,6 +1501,19 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.deepEqual(readSpendLog(), [], 'nothing moved — the budget must be fully free again');
   });
 
+  it('a sub-satoshi invoice amount is refused like an undecodable one', async () => {
+    configureAutoPay();
+    // 'lnbc10p...' ≈ 0.001 sats — decodeBolt11AmountSats rounds it to 0, which
+    // must NOT slip past the amount guard into a zero-value reservation.
+    mock402('lnbc10p1p0subsat');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_amount_undecodable');
+    assert.match(out.message, /below 1 satoshi/);
+    assert.deepEqual(readSpendLog(), [], 'no zero-value reservation may be persisted');
+  });
+
   it('SUCCESS with a live reservation finalizes it into a domain-tagged spend', async () => {
     configureAutoPay();
     mockPayment({ status: 'SUCCESS' });
