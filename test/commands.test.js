@@ -175,7 +175,7 @@ describe('pay_invoice', () => {
     assert.equal(log[0].sats, 2, 'the budget must charge ceil, never round-to-nearest');
   });
 
-  it('a below-1-sat invoice skips budget tracking instead of reserving 0 or 1', async () => {
+  it('a 500-msat invoice charges 1 sat — explicit payments can never move funds untracked', async () => {
     process.env.BLINK_BUDGET_DAILY_SATS = '100';
     global.fetch = async (url, opts) => {
       const body = JSON.parse(opts.body);
@@ -194,11 +194,30 @@ describe('pay_invoice', () => {
     process.argv = ['node', 'pay_invoice.js', 'lnbc5000p1p0frac'];
     const { main } = freshRequire('pay_invoice.js');
     await main();
-    assert.equal(
-      fs.existsSync(path.join(env.tmpHome, '.blink', 'spending-log.json')),
-      false,
-      'a sub-satoshi invoice is not budget-tracked (the API enforces wallet limits)',
-    );
+    const log = JSON.parse(fs.readFileSync(path.join(env.tmpHome, '.blink', 'spending-log.json'), 'utf8'));
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 1, 'any positive decodable amount charges at least 1 sat');
+  });
+
+  it('exhausted budget refuses the SECOND of two 500-msat payments', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '1';
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+    process.argv = ['node', 'pay_invoice.js', 'lnbc5000p1p0frac'];
+    await freshRequire('pay_invoice.js').main(); // first payment consumes the whole 1-sat allowance
+    await assert.rejects(() => freshRequire('pay_invoice.js').main(), /Budget exceeded/);
   });
 
   it('--dry-run outputs JSON with dryRun: true and does not send mutation', async () => {

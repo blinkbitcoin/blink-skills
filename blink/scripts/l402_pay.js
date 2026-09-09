@@ -52,7 +52,7 @@ const {
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,
-  budgetSatsFromInvoice,
+  budgetChargeFromInvoice,
   fetchL402ProtocolInvoice,
 } = require('./l402_discover');
 
@@ -590,11 +590,13 @@ async function main() {
   console.error(`Format: ${challenge.format}`);
 
   const satoshis = decodeBolt11AmountSats(challenge.invoice);
-  // The amount CHARGED to the budget: ceil(msats/1000), null when undecodable
-  // or below 1 sat. Enforcement (refusal, --max-amount, reservation, record)
-  // uses this — never the round-to-nearest display value, which can push a
-  // sub-satoshi invoice up to 1 sat or shave fractions off larger ones.
-  const budgetSats = budgetSatsFromInvoice(challenge.invoice);
+  // The budget charge, structured: msats=null means undecodable; any positive
+  // decodable amount charges max(1, ceil(msats/1000)). Enforcement (refusal,
+  // --max-amount, reservation, record) uses the charge — never the
+  // round-to-nearest display value, which can push a sub-satoshi invoice up
+  // to 1 sat or shave fractions off larger ones.
+  const charge = budgetChargeFromInvoice(challenge.invoice);
+  const budgetSats = charge.budgetSats;
 
   if (satoshis === null) {
     console.error('Warning: could not decode amount from invoice.');
@@ -603,6 +605,26 @@ async function main() {
   }
   if (budgetSats !== null && budgetSats !== satoshis) {
     console.error(`Note: budget charges ${budgetSats} sats conservatively for this fractional-satoshi invoice.`);
+  }
+
+  // An undecodable — or sub-satoshi — amount cannot be budget-checked, so
+  // paying it would spend a sum against limits that were never applied.
+  // Refusal applies to dry-run exactly like real execution: a preview must
+  // never green-light what execution rejects.
+  if (charge.msats === null || charge.msats < 1000) {
+    const output = {
+      event: 'l402_amount_undecodable',
+      url: args.url,
+      canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+      invoice: challenge.invoice,
+      invoiceMsats: charge.msats,
+      message:
+        'Refusing to pay: the invoice amount could not be decoded or is below 1 satoshi, so budget ' +
+        'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
+        'invoice explicitly with `blink pay-invoice` if you trust it.',
+    };
+    console.log(JSON.stringify(output, null, 2));
+    process.exit(1);
   }
 
   // Budget reservation state at function scope: the reservation happens inside
@@ -646,26 +668,6 @@ async function main() {
       process.exit(1);
     }
 
-    // An undecodable — or sub-satoshi — amount cannot be budget-checked, so
-    // paying it would spend a sum against limits that were never applied
-    // (decodeBolt11AmountSats rounds a valid sub-satoshi invoice like 10p to
-    // 0, which passes a plain `!== null` guard). Refuse rather than delegate
-    // the decision to the backend.
-    if (budgetSats === null) {
-      const output = {
-        event: 'l402_amount_undecodable',
-        url: args.url,
-        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        invoice: challenge.invoice,
-        message:
-          'Refusing to pay: the invoice amount could not be decoded or is below 1 satoshi, so budget ' +
-          'and --max-amount limits cannot be enforced. Inspect it with --dry-run, or pay the ' +
-          'invoice explicitly with `blink pay-invoice` if you trust it.',
-      };
-      console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
-    }
-
     // ── Budget reservation (fail closed for autonomous auto-pay) ──
     // The limit decision AND the reservation append happen under one lock, so
     // two concurrent payments can never both pass the same remaining budget.
@@ -699,7 +701,7 @@ async function main() {
       canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
       satoshis,
       maxAmount: args.maxAmount,
-      message: `Payment of ${satoshis} sats exceeds --max-amount of ${args.maxAmount} sats. Aborting.`,
+      message: `Payment of ${budgetSats} sats exceeds --max-amount of ${args.maxAmount} sats. Aborting.`,
     };
     console.log(JSON.stringify(output, null, 2));
     process.exit(1);
@@ -707,9 +709,12 @@ async function main() {
 
   // ── Dry-run: report price and exit ──
   if (args.dryRun) {
-    // Reporting only — dry-run never spends. Opt out of the fail-closed default
-    // so an unconfigured budget shows remaining limits instead of a denial.
-    const budgetInfo = satoshis !== null ? checkBudget(satoshis, { requireConfigured: false }) : null;
+    // Reporting only — dry-run never spends. The preview uses the SAME
+    // conservative charge as real execution (ceil, never round-to-nearest),
+    // and the below-1-sat refusal above already mirrored execution.
+    // Opt out of the fail-closed default so an unconfigured budget shows
+    // remaining limits instead of a denial.
+    const budgetInfo = budgetSats !== null ? checkBudget(budgetSats, { requireConfigured: false }) : null;
     const output = {
       event: 'l402_dry_run',
       url: args.url,
@@ -717,9 +722,11 @@ async function main() {
       format: challenge.format,
       invoice: challenge.invoice,
       satoshis,
+      invoiceMsats: charge.msats,
+      budgetSats,
       satoshisFormatted: satoshis !== null ? `${satoshis} sats` : null,
       maxAmount: args.maxAmount,
-      withinBudget: args.maxAmount !== null && satoshis !== null ? satoshis <= args.maxAmount : null,
+      withinBudget: args.maxAmount !== null && budgetSats !== null ? budgetSats <= args.maxAmount : null,
       budget: budgetInfo
         ? {
             allowed: budgetInfo.allowed,
@@ -889,6 +896,8 @@ async function main() {
         preimage,
         invoice: challenge.invoice,
         satoshis: satoshis ?? null,
+        invoiceMsats: charge.msats,
+        budgetSats,
       });
       console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
@@ -950,6 +959,8 @@ async function main() {
     walletId: wallet.id,
     walletCurrency: args.walletCurrency,
     satoshis: satoshis ?? null,
+    invoiceMsats: charge.msats,
+    budgetSats,
     tokenReused: false,
     feeProbe: feeProbeResult
       ? { estimatedFeeSats: feeProbeResult.estimatedFeeSats, error: feeProbeResult.error }

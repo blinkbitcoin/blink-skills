@@ -1061,8 +1061,10 @@ describe('l402_pay redirect handling', () => {
 
 // ── BOLT-11 amount decoding / budget charge rule ─────────────────────────────
 
-describe('budgetSatsFromInvoice and decodeBolt11AmountMsats', () => {
-  const { budgetSatsFromInvoice, decodeBolt11AmountMsats } = require(path.join(scriptsDir, 'l402_discover'));
+describe('budgetChargeFromInvoice and decodeBolt11AmountMsats', () => {
+  const { budgetChargeFromInvoice, decodeBolt11AmountMsats, decodeBolt11AmountSats } = require(
+    path.join(scriptsDir, 'l402_discover'),
+  );
 
   it('decodes millisats with full precision (no rounding)', () => {
     assert.equal(decodeBolt11AmountMsats('lnbc10p1p0x'), 1); // 0.001 sats
@@ -1071,24 +1073,46 @@ describe('budgetSatsFromInvoice and decodeBolt11AmountMsats', () => {
     assert.equal(decodeBolt11AmountMsats('lnbc10n1p0x'), 1000); // exactly 1 sat
     assert.equal(decodeBolt11AmountMsats('lnbc1000n1p0x'), 100_000); // 100 sats
     assert.equal(decodeBolt11AmountMsats('lnbc1000u1p0x'), 100_000_000); // 100_000 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc100m1p0x'), 10_000_000_000); // 100 mBTC → 10_000 sats
+    assert.equal(decodeBolt11AmountMsats('lnbc11p0x'), 100_000_000_000); // 1 BTC (whole-BTC multiplier)
   });
 
-  it('invoices below 1 satoshi decode to null (callers refuse)', () => {
-    assert.equal(budgetSatsFromInvoice('lnbc10p1p0x'), null);
-    assert.equal(budgetSatsFromInvoice('lnbc5000p1p0x'), null);
+  it('keeps BigInt precision near the safe-integer boundary', () => {
+    // 9007199254740993p: Number() would round the digits before multiplying;
+    // BigInt keeps the exact floor of 900719925474099.3 msats.
+    assert.equal(decodeBolt11AmountMsats('lnbc9007199254740993p1p0x'), 900719925474099);
+    assert.deepEqual(budgetChargeFromInvoice('lnbc9007199254740993p1p0x'), {
+      msats: 900719925474099,
+      budgetSats: 900719925475,
+    });
+  });
+
+  it('returns null for amounts beyond a safe integer (unusable, not a charge)', () => {
+    assert.equal(decodeBolt11AmountMsats('lnbc90071992547409920u1p0x'), null);
+  });
+
+  it('legacy sat decode keeps its round-to-nearest display semantics', () => {
+    assert.equal(decodeBolt11AmountSats('lnbc1000u1p0x'), 100_000);
+    assert.equal(decodeBolt11AmountSats('lnbc10p1p0x'), 0);
+    assert.equal(decodeBolt11AmountSats('lnbc5000p1p0x'), 1);
+  });
+
+  it('any positive decodable amount charges at least 1 sat', () => {
+    assert.deepEqual(budgetChargeFromInvoice('lnbc10p1p0x'), { msats: 1, budgetSats: 1 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc5000p1p0x'), { msats: 500, budgetSats: 1 });
   });
 
   it('fractional sats are charged ceil, never round-to-nearest', () => {
-    assert.equal(budgetSatsFromInvoice('lnbc14000p1p0x'), 2); // 1.4 sats → 2
-    assert.equal(budgetSatsFromInvoice('lnbc11n1p0x'), 2); // 1.1 sats → 2
-    assert.equal(budgetSatsFromInvoice('lnbc10n1p0x'), 1); // exactly 1 sat → 1
-    assert.equal(budgetSatsFromInvoice('lnbc20000p1p0x'), 2); // exactly 2 sats → 2
-    assert.equal(budgetSatsFromInvoice('lnbc1000u1p0x'), 100_000); // whole sats → unchanged
+    assert.deepEqual(budgetChargeFromInvoice('lnbc14000p1p0x'), { msats: 1400, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc11n1p0x'), { msats: 1100, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc10n1p0x'), { msats: 1000, budgetSats: 1 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc20000p1p0x'), { msats: 2000, budgetSats: 2 });
+    assert.deepEqual(budgetChargeFromInvoice('lnbc1000u1p0x'), { msats: 100_000_000, budgetSats: 100_000 });
   });
 
-  it('undecodable invoices return null', () => {
-    assert.equal(budgetSatsFromInvoice('lnbc1p0noamount'), null);
-    assert.equal(budgetSatsFromInvoice('not-an-invoice'), null);
+  it('undecodable invoices return nulls (distinguishable from sub-satoshi)', () => {
+    assert.deepEqual(budgetChargeFromInvoice('lnbc1p0noamount'), { msats: null, budgetSats: null });
+    assert.deepEqual(budgetChargeFromInvoice('not-an-invoice'), { msats: null, budgetSats: null });
   });
 });
 
@@ -1577,6 +1601,29 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.deepEqual(readSpendLog(), []);
   });
 
+  it('SUCCESS output and cached token carry invoiceMsats + budgetSats for a fractional invoice', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS', invoice: 'lnbc14000p1p0frac' });
+    await runPay(['https://paywall.example.com/resource']); // no --no-store → token is cached
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.budgetSats, 2);
+    assert.equal(out.invoiceMsats, 1400);
+    const store = JSON.parse(fs.readFileSync(path.join(tmpDir, '.blink', 'l402-tokens.json'), 'utf8'));
+    const token = Object.values(store)[0];
+    assert.equal(token.budgetSats, 2, 'cached metadata must match the budget accounting');
+    assert.equal(token.invoiceMsats, 1400);
+  });
+
+  it('a PENDING 1400-msat payment finalizes at the ceil charge (2 sats)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'PENDING', invoice: 'lnbc14000p1p0frac' });
+    await runPay(['https://paywall.example.com/resource', '--no-store']);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 2);
+  });
+
   it('SUCCESS with a live reservation finalizes it into a domain-tagged spend', async () => {
     configureAutoPay();
     mockPayment({ status: 'SUCCESS' });
@@ -1683,15 +1730,38 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.match(errOut, /could not record the in-flight payment in the budget log.*disk full/s);
   });
 
-  it('dry-run still reports an undecodable amount instead of refusing', async () => {
+  it('dry-run refuses an undecodable amount exactly like execution (preview/execution parity)', async () => {
     mock402(INVOICE_NO_AMOUNT);
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
 
-    // Dry-run never spends, so it is not subject to the fail-closed guards.
-    assert.equal(code, null);
+    // The preview must never green-light what execution rejects.
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_amount_undecodable');
+    assert.equal(blinkApiWasCalled(), false);
+  });
+
+  it('dry-run previews the ceil charge for a 1400-msat invoice (budgetSats field + allowed flag)', async () => {
+    process.env.BLINK_BUDGET_DAILY_SATS = '1';
+    mock402('lnbc14000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
+
+    assert.equal(code, null, 'dry-run reports, it does not exit');
     const out = output();
     assert.equal(out.event, 'l402_dry_run');
-    assert.equal(out.satoshis, null);
-    assert.equal(blinkApiWasCalled(), false);
+    assert.equal(out.invoiceMsats, 1400);
+    assert.equal(out.budgetSats, 2, 'the preview must use the same conservative charge as execution');
+    assert.equal(out.budget.allowed, false, '2 sats against a 1-sat daily limit — preview and execution agree');
+  });
+
+  it('dry-run with a tight --max-amount refuses on the ceil charge, in the same words as execution', async () => {
+    configureAutoPay();
+    mock402('lnbc14000p1p0frac');
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run', '--max-amount', '1']);
+
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_budget_exceeded');
+    assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
   });
 });
