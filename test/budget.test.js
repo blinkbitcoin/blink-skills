@@ -185,8 +185,52 @@ describe('getConfig', () => {
     }
   });
 
-  it('treats invalid env var as null', () => {
+  it('a garbage env var fails closed instead of silently disabling the limit', () => {
     process.env.BLINK_BUDGET_HOURLY_SATS = 'not_a_number';
+    assert.throws(
+      () => mod.getConfig(),
+      (e) => e.code === 'BUDGET_CONFIG_CORRUPT',
+    );
+  });
+
+  it('a corrupt config file fails closed instead of disabling limits', () => {
+    fs.mkdirSync(path.dirname(mod.CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(mod.CONFIG_FILE, '{"hourlyLimitSats":', 'utf8');
+    try {
+      assert.throws(
+        () => mod.getConfig(),
+        (e) => e.code === 'BUDGET_CONFIG_CORRUPT',
+      );
+    } finally {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    }
+  });
+
+  it('structurally invalid config values fail closed', () => {
+    const bad = [
+      JSON.stringify({ hourlyLimitSats: -50 }), // negative limit
+      JSON.stringify({ dailyLimitSats: 1.5 }), // fractional
+      JSON.stringify({ dailyLimitSats: '1000' }), // wrong type
+      JSON.stringify({ allowlist: 'satring.com' }), // allowlist must be an array
+      '[1, 2]', // top-level must be an object
+    ];
+    fs.mkdirSync(path.dirname(mod.CONFIG_FILE), { recursive: true });
+    try {
+      for (const content of bad) {
+        fs.writeFileSync(mod.CONFIG_FILE, content, 'utf8');
+        assert.throws(
+          () => mod.getConfig(),
+          (e) => e.code === 'BUDGET_CONFIG_CORRUPT',
+          content,
+        );
+      }
+    } finally {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    }
+  });
+
+  it('an empty-string env var still means unset (documented idiom)', () => {
+    process.env.BLINK_BUDGET_HOURLY_SATS = '';
     const config = mod.getConfig();
     assert.equal(config.hourlyLimitSats, null);
   });
@@ -740,6 +784,46 @@ describe('corrupt spending log fails closed', () => {
     );
   });
 
+  it('semantic entry validation: values that could inflate the budget are rejected', () => {
+    const bad = [
+      [{ ts: Date.now(), sats: -1000, command: 'x' }], // negative — would CREDIT the budget
+      [{ ts: Date.now(), sats: 0, command: 'x' }], // zero
+      [{ ts: Date.now(), sats: 1.5, command: 'x' }], // fractional
+      [{ ts: Date.now(), sats: Number.MAX_SAFE_INTEGER + 1, command: 'x' }], // unsafe integer
+      [{ ts: Date.now(), sats: 1e21, command: 'x' }], // overflow magnitude
+      [{ ts: Date.now(), sats: '100', command: 'x' }], // wrong type
+      [{ ts: 0, sats: 1, command: 'x' }], // zero timestamp
+      [{ ts: -5, sats: 1, command: 'x' }], // negative timestamp
+      [{ ts: Date.now() + 10 * 60_000, sats: 1, command: 'x' }], // far-future timestamp
+      [{ ts: Date.now(), sats: 1, command: 'x', state: 'pending' }], // unknown state
+      [{ ts: Date.now(), sats: 1, command: 'x', domain: 42 }], // wrong-type domain
+      [{ ts: Date.now(), sats: 1, command: '' }], // empty command
+    ];
+    for (const entries of bad) {
+      writeRaw(JSON.stringify(entries));
+      assert.throws(
+        () => mod.readLog(),
+        (e) => e.code === 'BUDGET_LOG_CORRUPT',
+        `must be rejected: ${JSON.stringify(entries)}`,
+      );
+    }
+  });
+
+  it('duplicate ids are rejected (reservation idempotency relies on uniqueness)', () => {
+    writeRaw(
+      JSON.stringify([
+        { ts: Date.now(), sats: 1, command: 'a', id: 'same' },
+        { ts: Date.now(), sats: 1, command: 'b', id: 'same' },
+      ]),
+    );
+    assert.throws(() => mod.readLog(), /duplicate id/);
+  });
+
+  it('legacy finalized entries (no state/id) remain valid', () => {
+    writeRaw(JSON.stringify([{ ts: Date.now(), sats: 10, command: 'pay-invoice', domain: null }]));
+    assert.equal(mod.readLog().length, 1);
+  });
+
   it('a read error (non-ENOENT) throws instead of returning empty', () => {
     const realRead = fs.readFileSync;
     fs.readFileSync = (p, ...rest) => {
@@ -778,11 +862,33 @@ describe('corrupt spending log fails closed', () => {
     );
   });
 
-  it('budget reset recovers from a corrupt log and reports discardedCorrupt', () => {
+  it('ordinary reset on a corrupt log fails closed and leaves the file untouched', () => {
     writeRaw('garbage');
-    const r = mod.resetLog();
+    assert.throws(
+      () => mod.resetLog(),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+    assert.equal(fs.readFileSync(mod.LOG_FILE, 'utf8'), 'garbage', 'unknown in-flight state must not be discarded');
+  });
+
+  it('mixed valid-reservation + malformed entry: ordinary reset preserves, --force discards', () => {
+    writeRaw(
+      JSON.stringify([
+        { ts: Date.now(), sats: 60, command: 'x', state: 'reserved', id: 'r1' },
+        { ts: Date.now(), sats: 'NaN-ish', command: 'bad' },
+      ]),
+    );
+    // The log is corrupt overall — readLog throws — so an ordinary reset must
+    // not silently discard the (possibly in-flight) reservation.
+    assert.throws(
+      () => mod.resetLog(),
+      (e) => e.code === 'BUDGET_LOG_CORRUPT',
+    );
+    const before = fs.readFileSync(mod.LOG_FILE, 'utf8');
+    assert.ok(before.includes('r1'), 'file untouched');
+    const r = mod.resetLog({ force: true });
     assert.equal(r.discardedCorrupt, true);
-    assert.deepEqual(mod.readLog(), [], 'reset discarded the damaged file');
+    assert.deepEqual(mod.readLog(), []);
   });
 
   it('budget reset --force also recovers from a corrupt log', () => {
@@ -1115,6 +1221,16 @@ describe('budget.js CLI — option validation', () => {
     assert.equal(exitCode, 1);
   });
 
+  it('a prototype-named subcommand reports unknown-subcommand instead of crashing', () => {
+    // "constructor" is an inherited Object.prototype property — an `in` check
+    // would treat it as known and call .includes on a function (TypeError).
+    process.argv = ['node', 'blink', 'constructor', '--force'];
+    const { exitCode, stderr } = runMainTrappingExit();
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /Unknown subcommand/);
+    assert.equal(stderr.includes('TypeError'), false, 'must not crash on the prototype key');
+  });
+
   it('reset --force is accepted and reports the branch', () => {
     process.argv = ['node', 'blink', 'reset', '--force'];
     const logs = captureLog(() => freshCliRequire().main());
@@ -1123,12 +1239,29 @@ describe('budget.js CLI — option validation', () => {
     assert.equal(output.discardedCorrupt, false);
   });
 
-  it('reset on a corrupt log recovers and says so', () => {
-    // Write a corrupt log into the temp home, then reset must recover.
+  it('reset on a corrupt log fails closed; reset --force recovers and says so', () => {
+    // Ordinary reset must not discard unknown in-flight state: it propagates
+    // BUDGET_LOG_CORRUPT (and the error itself points at --force recovery).
     const mod = require(path.join(scriptsDir, '_budget.js'));
     fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
     fs.writeFileSync(mod.LOG_FILE, 'not json', 'utf8');
     process.argv = ['node', 'blink', 'reset'];
+    let err = null;
+    try {
+      freshCliRequire().main();
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'reset must fail, not succeed, on a corrupt log');
+    assert.equal(err.code, 'BUDGET_LOG_CORRUPT');
+    assert.match(err.message, /reset --force/);
+  });
+
+  it('reset --force on a corrupt log recovers and reports discardedCorrupt', () => {
+    const mod = require(path.join(scriptsDir, '_budget.js'));
+    fs.mkdirSync(path.dirname(mod.LOG_FILE), { recursive: true });
+    fs.writeFileSync(mod.LOG_FILE, 'not json', 'utf8');
+    process.argv = ['node', 'blink', 'reset', '--force'];
     const logs = captureLog(() => freshCliRequire().main());
     const output = JSON.parse(logs[0]);
     assert.equal(output.discardedCorrupt, true);

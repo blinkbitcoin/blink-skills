@@ -36,6 +36,75 @@ const PRUNE_THRESHOLD_MS = 25 * ONE_HOUR_MS; // keep 25h for safe daily window
 // ── Config resolution ────────────────────────────────────────────────────────
 
 /**
+ * Fail-closed config error: the config file exists but cannot be read or
+ * parsed, so configured limits are UNKNOWN — treating that as unconfigured
+ * would silently disable spending limits.
+ */
+function corruptConfigError(detail) {
+  const err = new Error(
+    `BUDGET_CONFIG_CORRUPT: ${CONFIG_FILE} is unreadable (${detail}); configured limits are unknown. ` +
+      'Fix or remove the file manually, then re-run `blink budget set ...` to reconfigure.',
+  );
+  err.code = 'BUDGET_CONFIG_CORRUPT';
+  return err;
+}
+
+/**
+ * Read and validate the budget config FILE. FAILS CLOSED: defaults apply only
+ * when the file does not exist. Unreadable, unparsable, or structurally
+ * invalid config throws BUDGET_CONFIG_CORRUPT — an operator who configured
+ * limits must never have them silently dropped by a damaged file.
+ *
+ * @returns {object} the validated config (possibly {})
+ */
+function readConfigFile() {
+  let content;
+  try {
+    content = fs.readFileSync(CONFIG_FILE, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw corruptConfigError(e.message); // EACCES, EISDIR, etc.
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    throw corruptConfigError(`invalid JSON: ${e.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw corruptConfigError('expected a top-level JSON object');
+  }
+  for (const key of ['hourlyLimitSats', 'dailyLimitSats']) {
+    if (key in parsed) {
+      const v = parsed[key];
+      if (v !== null && !(Number.isSafeInteger(v) && v > 0)) {
+        throw corruptConfigError(`${key} must be a positive safe integer or null`);
+      }
+    }
+  }
+  if ('allowlist' in parsed) {
+    if (!Array.isArray(parsed.allowlist) || !parsed.allowlist.every((d) => typeof d === 'string')) {
+      throw corruptConfigError('allowlist must be an array of domain strings');
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Validate an env-supplied limit. An empty string is the documented idiom for
+ * "unset" (overrides file config); any other non-positive-integer value is an
+ * operator mistake that must NOT silently disable the limit.
+ */
+function envLimitOrNull(name, value) {
+  if (value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0 || String(n) !== String(value).trim()) {
+    throw corruptConfigError(`env var ${name} is not a positive integer`);
+  }
+  return n;
+}
+
+/**
  * Read budget config from env vars and ~/.blink/budget.json.
  * Env vars take precedence over the config file.
  *
@@ -47,14 +116,7 @@ const PRUNE_THRESHOLD_MS = 25 * ONE_HOUR_MS; // keep 25h for safe daily window
  * }}
  */
 function getConfig() {
-  // Read config file (if it exists)
-  let fileConfig = {};
-  try {
-    const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-    fileConfig = JSON.parse(content);
-  } catch {
-    // No config file or invalid JSON — use defaults
-  }
+  const fileConfig = readConfigFile();
 
   // Env vars override file config
   const envHourly = process.env.BLINK_BUDGET_HOURLY_SATS;
@@ -62,9 +124,11 @@ function getConfig() {
   const envDomains = process.env.BLINK_L402_ALLOWED_DOMAINS;
 
   const hourlyLimitSats =
-    envHourly !== undefined ? parsePositiveIntOrNull(envHourly) : (fileConfig.hourlyLimitSats ?? null);
+    envHourly !== undefined
+      ? envLimitOrNull('BLINK_BUDGET_HOURLY_SATS', envHourly)
+      : (fileConfig.hourlyLimitSats ?? null);
   const dailyLimitSats =
-    envDaily !== undefined ? parsePositiveIntOrNull(envDaily) : (fileConfig.dailyLimitSats ?? null);
+    envDaily !== undefined ? envLimitOrNull('BLINK_BUDGET_DAILY_SATS', envDaily) : (fileConfig.dailyLimitSats ?? null);
 
   let allowlist;
   if (envDomains !== undefined) {
@@ -84,13 +148,17 @@ function getConfig() {
 }
 
 /**
- * Write budget config to ~/.blink/budget.json.
+ * Write budget config to ~/.blink/budget.json — atomically (temp + rename),
+ * so an interrupted write can never leave the half-written file that the
+ * fail-closed read would reject.
  *
  * @param {object} config
  */
 function writeConfig(config) {
   fs.mkdirSync(BLINK_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  const tmp = `${CONFIG_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf8');
+  fs.renameSync(tmp, CONFIG_FILE);
 }
 
 // ── Spending log I/O ─────────────────────────────────────────────────────────
@@ -257,6 +325,42 @@ function corruptLogError(detail) {
 }
 
 /**
+ * Validate one log entry against the accepted schemas:
+ *   legacy finalized: { ts, sats, command, domain? }
+ *   finalized (id-carrying): above + { id }
+ *   reserved: above + { state: 'reserved', id } (non-empty)
+ * Semantic rules matter as much as types: a negative or non-integer `sats`
+ * would CREDIT the budget (dailySpent goes down), so values are checked, not
+ * just types.
+ */
+function validateLogEntry(entry, i, seenIds) {
+  const bad = (why) => {
+    throw corruptLogError(`entry ${i} is malformed (${why})`);
+  };
+  if (!entry || typeof entry !== 'object') return bad('not an object');
+  if (!Number.isSafeInteger(entry.ts) || entry.ts <= 0) return bad('ts must be a positive safe-integer timestamp');
+  // A timestamp more than a minute in the future is corrupt data (clock skew
+  // allowance only) — it would extend its own counting window indefinitely.
+  if (entry.ts > Date.now() + 60_000) return bad('ts is in the future');
+  if (!Number.isSafeInteger(entry.sats) || entry.sats <= 0) {
+    return bad('sats must be a positive safe integer — anything else can inflate the remaining budget');
+  }
+  if (typeof entry.command !== 'string' || entry.command.length === 0) return bad('command must be a non-empty string');
+  if (entry.domain !== undefined && entry.domain !== null && typeof entry.domain !== 'string') {
+    return bad('domain must be a string or null');
+  }
+  if (entry.state !== undefined && entry.state !== 'reserved') return bad(`unknown state '${entry.state}'`);
+  if (entry.id !== undefined && (typeof entry.id !== 'string' || entry.id.length === 0)) {
+    return bad('id must be a non-empty string');
+  }
+  if (entry.state === 'reserved' && entry.id === undefined) return bad('reserved entry lacks an id');
+  if (entry.id !== undefined) {
+    if (seenIds.has(entry.id)) return bad(`duplicate id '${entry.id}'`);
+    seenIds.add(entry.id);
+  }
+}
+
+/**
  * Read the spending log from disk. FAILS CLOSED: an empty array is returned
  * ONLY when the file does not exist. A file that cannot be read, is not valid
  * JSON, is not a top-level array, or contains malformed entries throws
@@ -280,15 +384,9 @@ function readLog() {
     throw corruptLogError(`invalid JSON: ${e.message}`);
   }
   if (!Array.isArray(parsed)) throw corruptLogError('expected a top-level JSON array');
+  const seenIds = new Set();
   for (const [i, entry] of parsed.entries()) {
-    const malformed =
-      !entry ||
-      typeof entry !== 'object' ||
-      typeof entry.ts !== 'number' ||
-      typeof entry.sats !== 'number' ||
-      typeof entry.command !== 'string' ||
-      (entry.state === 'reserved' && typeof entry.id !== 'string');
-    if (malformed) throw corruptLogError(`entry ${i} is malformed`);
+    validateLogEntry(entry, i, seenIds);
   }
   return parsed;
 }
@@ -702,8 +800,14 @@ function getLog(limit = 20) {
  * the freed allowance can be reused in the interim (brief exceed window) —
  * so --force must be documented as unsafe while payments run.
  *
+ * Corrupt logs: ordinary reset propagates BUDGET_LOG_CORRUPT and leaves the
+ * file untouched — a log we cannot parse might contain active reservations,
+ * and discarding it would defeat the guarantee above. Only --force reads
+ * tolerantly and discards a damaged log (reported as discardedCorrupt),
+ * matching the recovery hint carried by the corruption error.
+ *
  * @param {object} [opts]
- * @param {boolean} [opts.force=false]  Also clear active reservations.
+ * @param {boolean} [opts.force=false]  Also clear active reservations (and discard a corrupt log).
  * @returns {{ removed: number, keptReserved: number, discardedCorrupt: boolean }}
  */
 function resetLog({ force = false } = {}) {
@@ -720,15 +824,8 @@ function resetLog({ force = false } = {}) {
       log.push(...kept);
       return { removed, keptReserved: kept.length, discardedCorrupt };
     },
-    { forgivingCorrupt: true },
+    { forgivingCorrupt: force },
   );
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function parsePositiveIntOrNull(value) {
-  const n = parseInt(value, 10);
-  return isNaN(n) || n <= 0 ? null : n;
 }
 
 // ── Exports ──────────────────────────────────────────────────────────────────
@@ -742,6 +839,7 @@ module.exports = {
 
   // Config
   getConfig,
+  readConfigFile,
   writeConfig,
 
   // Log

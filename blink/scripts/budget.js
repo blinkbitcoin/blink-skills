@@ -24,7 +24,7 @@
 
 'use strict';
 
-const { getConfig, writeConfig, getStatus, getLog, resetLog, CONFIG_FILE, LOG_FILE } = require('./_budget');
+const { getConfig, readConfigFile, writeConfig, getStatus, getLog, resetLog, LOG_FILE } = require('./_budget');
 
 // Options are scoped per subcommand; a flag meant for another subcommand is
 // rejected instead of silently ignored (e.g. `budget status --force`).
@@ -51,7 +51,7 @@ function main() {
     process.exit(1);
   }
 
-  if (subcommand in SUBCOMMAND_OPTIONS) {
+  if (Object.hasOwn(SUBCOMMAND_OPTIONS, subcommand)) {
     const bad = args.slice(1).filter((a) => a.startsWith('--') && !SUBCOMMAND_OPTIONS[subcommand].includes(a));
     if (bad.length > 0) {
       console.error(`Error: option(s) ${bad.join(', ')} not valid for 'budget ${subcommand}'.`);
@@ -67,15 +67,9 @@ function main() {
 
   if (subcommand === 'set') {
     if (args.includes('--off')) {
-      // Preserve allowlist when removing limits
-      let existing = {};
-      try {
-        const fs = require('node:fs');
-        const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-        existing = JSON.parse(content);
-      } catch {
-        /* no existing config */
-      }
+      // Preserve allowlist when removing limits. readConfigFile fails closed
+      // on corrupt config — do not overwrite a damaged file silently.
+      const existing = readConfigFile();
       const preserved = existing.allowlist ? { allowlist: existing.allowlist } : {};
       writeConfig(preserved);
       console.error('Budget limits removed (allowlist preserved).');
@@ -118,15 +112,9 @@ function main() {
       process.exit(1);
     }
 
-    // Read existing config to preserve allowlist
-    let existing = {};
-    try {
-      const fs = require('node:fs');
-      const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-      existing = JSON.parse(content);
-    } catch {
-      // No existing config
-    }
+    // Read existing config to preserve allowlist. readConfigFile fails closed
+    // on corrupt config — do not overwrite a damaged file silently.
+    const existing = readConfigFile();
 
     const newConfig = { ...existing };
     if (hourly !== null) newConfig.hourlyLimitSats = hourly;
@@ -206,15 +194,8 @@ function main() {
       }
       const normalized = domain.toLowerCase().trim();
 
-      // Read existing config
-      let existing = {};
-      try {
-        const fs = require('node:fs');
-        const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-        existing = JSON.parse(content);
-      } catch {
-        // No existing config
-      }
+      // Read existing config (fails closed on corruption — do not overwrite).
+      const existing = readConfigFile();
 
       const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist.map((d) => d.toLowerCase().trim()) : [];
 
@@ -241,15 +222,8 @@ function main() {
       }
       const normalized = domain.toLowerCase().trim();
 
-      // Read existing config
-      let existing = {};
-      try {
-        const fs = require('node:fs');
-        const content = fs.readFileSync(CONFIG_FILE, 'utf8');
-        existing = JSON.parse(content);
-      } catch {
-        // No existing config
-      }
+      // Read existing config (fails closed on corruption — do not overwrite).
+      const existing = readConfigFile();
 
       const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist.map((d) => d.toLowerCase().trim()) : [];
 
