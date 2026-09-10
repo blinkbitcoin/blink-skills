@@ -140,6 +140,32 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.equal(typeof j.tokenBalances['token-1'].balance, 'string');
   });
 
+  it('the standalone wrapper (direct script invocation) drains stdout and exits cleanly', async () => {
+    // The require.main === module runner path is only reachable by invoking
+    // the script directly — bin/blink.js requires the module instead.
+    const scriptPath = path.resolve(__dirname, '..', 'blink', 'scripts', 'spark_info.js');
+    const result = await new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, scriptPath],
+        { env: { ...process.env, SPARK_STUB_BALANCE: '777' }, timeout: 20000, killSignal: 'SIGKILL' },
+        (err, stdout, stderr) => {
+          resolve({
+            code: err ? (err.code === undefined ? 1 : err.code) : 0,
+            stdout,
+            stderr,
+            killed: err && err.killed,
+          });
+        },
+      );
+    });
+    assert.ok(!result.killed, 'must not hang on the SDK event loop');
+    assert.equal(result.code, 0);
+    const j = JSON.parse(result.stdout);
+    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.balanceSats, 777);
+  });
+
   it('spark-transactions exits promptly with JSON', async () => {
     const payments = JSON.stringify([
       { id: 'p1', paymentType: 'send', status: 'completed', amount: 10, fees: 3, timestamp: 1710000000 },

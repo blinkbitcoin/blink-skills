@@ -1069,7 +1069,7 @@ describe('spark_balance.parseArgs', () => {
   });
 });
 
-// ── spark_info.normalizeSdkValue ─────────────────────────────────────────────
+// ── _spark_sdk.normalizeSdkValue ─────────────────────────────────────────────
 
 describe('_spark_sdk.normalizeSdkValue', () => {
   const { normalizeSdkValue } = require('../blink/scripts/_spark_sdk');
