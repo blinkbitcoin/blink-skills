@@ -16,8 +16,7 @@
  *     'dispatch' and the caller KEEPS the reservation (fail-closed).
  */
 
-const { connect } = require('./_spark_sdk');
-const { feeFromPrepare } = require('./spark_send');
+const { connect, feeFromPrepare } = require('./_spark_sdk');
 
 /**
  * Pay a BOLT-11 invoice from a Spark account.
@@ -46,8 +45,18 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
     try {
       result = await sdk.sendPayment({ prepareResponse });
     } catch (e) {
-      e.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
-      throw e;
+      // Promises may reject with arbitrary values; a string or a
+      // non-extensible object would silently drop an attached stage marker
+      // (sloppy-mode no-op), and the caller would then misread a post-dispatch
+      // failure as pre-dispatch and free the budget. Wrap in a dedicated Error
+      // carrying code + stage, with the original preserved as `cause`.
+      const err = new Error(
+        `Spark payment failed after dispatch (outcome unknown): ${e && e.message ? e.message : String(e)}`,
+        { cause: e },
+      );
+      err.code = 'SPARK_DISPATCH_OUTCOME_UNKNOWN';
+      err.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
+      throw err;
     }
 
     const payment = result && result.payment ? result.payment : result;

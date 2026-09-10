@@ -116,6 +116,25 @@ const stub = {
     if (echo) console.error(`STUB_NETWORK=${network}`);
     return { sdk: fakeSdk, disconnect: async () => {} };
   },
+  // Mirror of the real _spark_sdk.feeFromPrepare — spark_send now imports it
+  // from _spark_sdk, which this stub replaces.
+  feeFromPrepare(prepareResponse) {
+    const has = (v) => v !== null && v !== undefined;
+    if (!has(prepareResponse)) return null;
+    if (has(prepareResponse.feeSats)) return Number(prepareResponse.feeSats);
+    const pm = prepareResponse.paymentMethod;
+    if (!pm) return null;
+    if (has(pm.feeSats)) return Number(pm.feeSats);
+    if (has(pm.lightningFeeSats)) {
+      return Number(pm.lightningFeeSats) + (has(pm.sparkTransferFeeSats) ? Number(pm.sparkTransferFeeSats) : 0);
+    }
+    if (has(pm.sparkTransferFeeSats)) return Number(pm.sparkTransferFeeSats);
+    if (has(pm.fee)) {
+      const n = Number(pm.fee);
+      return Number.isNaN(n) ? null : n;
+    }
+    return null;
+  },
   normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
   normalizeSdkValue,
   async waitForStableBalance(sdk) {

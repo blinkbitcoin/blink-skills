@@ -1119,10 +1119,22 @@ function derivePreimageFromInvoice(invoice) {
 }
 
 if (require.main === module) {
-  main().catch((e) => {
-    console.error('Error:', e.message);
-    process.exit(1);
-  });
+  main()
+    .then(async () => {
+      // The Breez SDK (spark backend) keeps event-loop handles open after
+      // disconnect; force a clean exit so direct invocation returns promptly.
+      // Drain stdout first — process.exit() can truncate a pending write when
+      // stdout is a pipe, and the JSON result is this command's whole product.
+      await new Promise((resolve) => {
+        if (process.stdout.writableLength === 0) return resolve();
+        process.stdout.write('', () => resolve());
+      });
+      process.exit(process.exitCode || 0);
+    })
+    .catch((e) => {
+      console.error('Error:', e.message);
+      process.exit(1);
+    });
 }
 
 module.exports = {

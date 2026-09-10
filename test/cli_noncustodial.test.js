@@ -525,6 +525,44 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     }
   });
 
+  it('direct node invocation of l402_pay.js terminates promptly after a spark payment', async () => {
+    // The require.main runner path (not bin/blink.js) — the SDK's event-loop
+    // handles must not hang a direct spark invocation after output is printed.
+    const server = await startServer();
+    const { address, port } = server.address();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const scriptPath = path.resolve(__dirname, '..', 'blink', 'scripts', 'l402_pay.js');
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, scriptPath, `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout, stderr) =>
+            resolve({ err, code: err ? (err.code === undefined ? 1 : err.code) : 0, stdout, stderr }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'direct invocation must terminate promptly');
+      assert.equal(result.code, 0);
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.backend, 'spark');
+      assert.equal(j.paymentStatus, 'SUCCESS');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('cached-token reuse emits the persisted backend field', async () => {
     const server = await startServer();
     const { address, port } = server.address();

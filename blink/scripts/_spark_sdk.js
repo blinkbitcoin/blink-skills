@@ -421,7 +421,10 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
   });
 
   const disconnect = async () => {
-    // Bounded: the SDK's disconnect can hang; never let cleanup block the caller.
+    // Bounded AND non-rejecting by contract: the SDK's disconnect can hang or
+    // reject; cleanup must never block the caller or mask a payment outcome.
+    // Callers that inject alternate connectors (tests) still guard at their
+    // own layer — see the comments in spark_send.js and l402_pay_spark.js.
     try {
       await Promise.race([sdk.disconnect(), new Promise((resolve) => setTimeout(resolve, 5000))]);
     } catch {
@@ -548,6 +551,37 @@ function normalizePayment(p) {
   };
 }
 
+function feeFromPrepare(prepareResponse) {
+  // Fee location varies by destination type / SDK version:
+  //  - LNURL-pay prepare response:      top-level `feeSats`
+  //  - bolt11Invoice send method:       `lightningFeeSats` (+ optional `sparkTransferFeeSats`)
+  //  - sparkAddress send method:        `fee` (string)
+  //  - older builds:                    `feeSats` on paymentMethod
+  const has = (v) => v !== null && v !== undefined;
+  if (!has(prepareResponse)) return null;
+
+  // LNURL: top-level feeSats.
+  if (has(prepareResponse.feeSats)) return Number(prepareResponse.feeSats);
+
+  const pm = prepareResponse.paymentMethod;
+  if (!pm) return null;
+
+  if (has(pm.feeSats)) return Number(pm.feeSats);
+
+  // bolt11Invoice: lightning fee (+ spark transfer fee if the route uses Spark).
+  if (has(pm.lightningFeeSats)) {
+    return Number(pm.lightningFeeSats) + (has(pm.sparkTransferFeeSats) ? Number(pm.sparkTransferFeeSats) : 0);
+  }
+  if (has(pm.sparkTransferFeeSats)) return Number(pm.sparkTransferFeeSats);
+
+  // sparkAddress: `fee` (may be a string).
+  if (has(pm.fee)) {
+    const n = Number(pm.fee);
+    return Number.isNaN(n) ? null : n;
+  }
+  return null;
+}
+
 module.exports = {
   SPARK_PACKAGE,
   DEFAULT_NETWORK,
@@ -562,6 +596,7 @@ module.exports = {
   connect,
   normalizeInfo,
   normalizeSdkValue,
+  feeFromPrepare,
   waitForStableBalance,
   normalizePayment,
 };

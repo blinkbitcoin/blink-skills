@@ -1793,6 +1793,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   function installSparkBackend({
     status = 'completed',
     throwOnSend = false,
+    rejectWith,
     withPreimage = true,
     rejectOnDisconnect = false,
   } = {}) {
@@ -1805,6 +1806,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       },
       async sendPayment() {
         if (throwOnSend) throw new Error('network timeout after dispatch');
+        if (rejectWith !== undefined) return Promise.reject(rejectWith);
         const settled = String(status).toLowerCase() === 'completed' && withPreimage;
         const details = settled
           ? {
@@ -1831,6 +1833,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
         },
         normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
         normalizeSdkValue: (v) => v,
+        // l402_pay_spark imports this from _spark_sdk (which this fake replaces).
+        feeFromPrepare: require('../blink/scripts/_spark_sdk').feeFromPrepare,
         async waitForStableBalance() {
           return { balanceSats: 0, stable: true };
         },
@@ -1985,6 +1989,34 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     const log = readSpendLog();
     assert.equal(log.length, 1);
     assert.equal(log[0].state, undefined, 'funds moved — the budget must count them');
+  });
+
+  it('a PRIMITIVE (string) post-dispatch rejection keeps the reservation (fail-closed)', async () => {
+    // Promises may reject with arbitrary values; a string would silently drop
+    // an attached stage marker, misreading post-dispatch as pre-dispatch.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: 'transport reset' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'outcome unknown — the reservation must stay');
+  });
+
+  it('a NON-EXTENSIBLE post-dispatch rejection keeps the reservation (fail-closed)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: Object.freeze({ note: 'frozen rejection' }) });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'outcome unknown — the reservation must stay');
   });
 
   it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {
