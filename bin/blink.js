@@ -771,6 +771,7 @@ commands['l402-pay'] = {
     'no-store': { type: 'boolean', default: false },
     force: { type: 'boolean', default: false },
     probe: { type: 'boolean', default: false },
+    spark: { type: 'boolean', default: false },
   },
   optMeta: {
     wallet: { description: 'Wallet to pay from', valueName: 'currency' },
@@ -782,12 +783,14 @@ commands['l402-pay'] = {
     'no-store': { description: 'Disable token cache for this request' },
     force: { description: 'Pay fresh even if a valid cached token exists (never bypasses budget/domain checks)' },
     probe: { description: 'Run fee probe before paying; adds feeProbe field to output' },
+    spark: { description: 'Pay from the self-custodial (Spark) wallet via the Breez SDK' },
   },
   examples: [
     'blink l402-pay https://api.example.com/resource --dry-run',
     'blink l402-pay https://api.example.com/resource --max-amount 500',
     'blink l402-pay https://api.example.com/resource --max-amount 500 --probe',
     'blink l402-pay https://api.example.com/resource --force',
+    'blink l402-pay https://api.example.com/resource --spark',
   ],
   action: async (pos, opts) => {
     const argv = [pos[0], '--wallet', opts.wallet];
@@ -802,6 +805,7 @@ commands['l402-pay'] = {
     if (opts['no-store']) argv.push('--no-store');
     if (opts.force) argv.push('--force');
     if (opts.probe) argv.push('--probe');
+    if (opts.spark) argv.push('--spark');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'l402_pay.js'));
     await main();

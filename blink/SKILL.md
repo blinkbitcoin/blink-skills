@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.0.0
+version: 2.1.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.0.0'
+    version: '2.1.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -1124,20 +1124,26 @@ Known public L402 endpoints for testing (use specific paths, not root URLs):
 blink l402-pay <url> [options]
 ```
 
-Makes an HTTP request. If the server returns 402, automatically parses the challenge, pays the invoice via Blink, caches the token, and retries with the payment proof.
+Makes an HTTP request. If the server returns 402, automatically parses the challenge, pays the invoice, caches the token, and retries with the payment proof. Two payment backends:
+
+- **custodial (default)** — the invoice is paid via the Blink API (`lnInvoicePaymentSend`); requires `BLINK_API_KEY` with Write scope.
+- **spark** — the invoice is paid from the self-custodial (Spark) wallet via the Breez SDK (signs locally with the seed); requires `SPARK_MNEMONIC` + `BREEZ_API_KEY`, **no Blink API key**. The preimage comes back in the settled payment's HTLC details.
+
+Both backends share the same budget reservation/enforcement, token cache, and retry flow, and the output carries a `backend` field.
 
 - `url` — URL to access (required)
-- `--wallet BTC|USD` — wallet to pay from (default: BTC)
+- `--wallet BTC|USD` — wallet to pay from (default: BTC; custodial backend only)
+- `--spark` — pay from the self-custodial (Spark) wallet via the Breez SDK (BTC only). Auto-selected when no `BLINK_API_KEY` is set but `SPARK_MNEMONIC` is present
 - `--max-amount <sats>` — refuse to pay more than N sats (safety limit)
-- `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists
+- `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists; uses the same conservative charge as real execution
 - `--method GET|POST|PUT|DELETE|PATCH` — HTTP method (default: GET)
 - `--header key:value` — extra request header (repeatable)
 - `--body <string>` — request body for POST/PUT
 - `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`)
 - `--force` — pay even if a valid cached token exists
-- `--probe` — run a fee probe (`lnInvoiceFeeProbe`) before paying to estimate routing fees; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output
+- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output
 
-**Requires Write scope on the API key.**
+**Requires Write scope on the API key (custodial backend) or `SPARK_MNEMONIC` + `BREEZ_API_KEY` (spark backend).**
 
 > **AGENT:** Always run with `--dry-run` first to show the satoshi cost to the user. Confirm the amount and target URL before executing without `--dry-run`.
 
