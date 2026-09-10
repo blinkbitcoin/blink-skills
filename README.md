@@ -19,14 +19,14 @@ Bitcoin Lightning wallet for the command line — zero required runtime npm depe
 Blink offers two account types. Pick one — the commands you run and the
 credentials you need differ.
 
-|                         | **Custodial**                       | **Non-custodial (Spark)**                                   |
-| ----------------------- | ----------------------------------- | ---------------------------------------------------------- |
-| **Who holds the keys**  | Blink                               | **You** (a 12-word seed)                                |
-| **You need**            | `BLINK_API_KEY`                     | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
-| **Runtime deps**        | None (Node 18+ built-ins)           | Two optional packages, **Node 22+**                        |
-| **Balance / history**   | Blink API                           | Local, via the Breez SDK (not on the Blink API)            |
-| **Receive**             | Blink API invoice                   | Public LNURL-pay on `blink.sv` — **no credentials needed** |
-| **Send**                | Blink API                           | Signed locally by the SDK (not on the Blink API)           |
+|                        | **Custodial**             | **Non-custodial (Spark)**                                  |
+| ---------------------- | ------------------------- | ---------------------------------------------------------- |
+| **Who holds the keys** | Blink                     | **You** (a 12-word seed)                                   |
+| **You need**           | `BLINK_API_KEY`           | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
+| **Runtime deps**       | None (Node 18+ built-ins) | Two optional packages, **Node 22+**                        |
+| **Balance / history**  | Blink API                 | Local, via the Breez SDK (not on the Blink API)            |
+| **Receive**            | Blink API invoice         | Public LNURL-pay on `blink.sv` — **no credentials needed** |
+| **Send**               | Blink API                 | Signed locally by the SDK (not on the Blink API)           |
 
 **Custodial — benefits:** simplest setup (one API key, nothing to build); runs
 on Node 18+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
@@ -109,23 +109,23 @@ full model and the API-growth research.
 **Receive — no credentials, no seed** (works for _any_ Blink Lightning Address,
 custodial or non-custodial; uses public LNURL-pay on `blink.sv`):
 
-| Command                                              | Description                                                             |
-| ---------------------------------------------------- | ---------------------------------------------------------------------- |
-| `blink resolve-receiver <identifier>`                | Classify a `user@blink.sv` / bare username as custodial or Spark        |
-| `blink create-invoice-lnaddress <addr> <sats> [memo]`| Receive to any Blink address via LNURL-pay + LUD-21 verify (no API key) |
+| Command                                               | Description                                                             |
+| ----------------------------------------------------- | ----------------------------------------------------------------------- |
+| `blink resolve-receiver <identifier>`                 | Classify a `user@blink.sv` / bare username as custodial or Spark        |
+| `blink create-invoice-lnaddress <addr> <sats> [memo]` | Receive to any Blink address via LNURL-pay + LUD-21 verify (no API key) |
 
 **Balance / send / history / events — require the account seed** via the Breez
 Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 `SPARK_MNEMONIC` (12/24 BIP39 words — spend authority, keep secret) and
 `BREEZ_API_KEY`:
 
-| Command                                   | Description                                                        |
-| ----------------------------------------- | ----------------------------------------------------------------- |
-| `blink spark-balance`                     | Show a Spark account BTC balance via the SDK                       |
-| `blink spark-info`                        | Show a Spark account info (`getInfo`) via the SDK                  |
-| `blink spark-send <destination> <sats>`   | Sign & send BTC from a Spark account (`--dry-run` shows fees)      |
-| `blink spark-transactions`                | List Spark account payments (SDK-local history)                   |
-| `blink spark-subscribe`                   | Stream live Spark wallet events                                   |
+| Command                                 | Description                                                   |
+| --------------------------------------- | ------------------------------------------------------------- |
+| `blink spark-balance`                   | Show a Spark account BTC balance via the SDK                  |
+| `blink spark-info`                      | Show a Spark account info (`getInfo`) via the SDK             |
+| `blink spark-send <destination> <sats>` | Sign & send BTC from a Spark account (`--dry-run` shows fees) |
+| `blink spark-transactions`              | List Spark account payments (SDK-local history)               |
+| `blink spark-subscribe`                 | Stream live Spark wallet events                               |
 
 **Getting a `BREEZ_API_KEY`.** The `spark-*` commands will not connect without
 one. It is a **Breez infrastructure credential, not custody** — it never touches
@@ -149,8 +149,8 @@ full detail.
 
 #### Installing the Spark dependencies
 
-The `spark-*` commands need two optional packages. Neither is required for any
-custodial command, and neither is loaded unless a `spark-*` command runs:
+The `spark-*` commands and `l402-pay --spark` need two optional packages. Neither is required for any
+custodial command, and neither is loaded unless a `spark-*` command or `l402-pay --spark` runs:
 
 ```bash
 npm install   # installs optionalDependencies by default
@@ -164,10 +164,10 @@ npm install   # installs optionalDependencies by default
 
 Two install flags will leave you with a broken Spark setup:
 
-| Flag | Effect |
-| --- | --- |
-| `--ignore-scripts` | `better-sqlite3` is unpacked but never built. The SDK suppresses the warning, so the install *looks* fine and every `spark-*` command then fails at connect time. Fix with `npm rebuild better-sqlite3`. |
-| `--omit=optional` | Skips both packages. `spark-*` commands refuse to run rather than proceeding without seed validation. |
+| Flag               | Effect                                                                                                                                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--ignore-scripts` | `better-sqlite3` is unpacked but never built. The SDK suppresses the warning, so the install _looks_ fine and every `spark-*` command then fails at connect time. Fix with `npm rebuild better-sqlite3`. |
+| `--omit=optional`  | Skips both packages. `spark-*` commands refuse to run rather than proceeding without seed validation.                                                                                                    |
 
 Both cases are detected at runtime and reported with the fix, rather than
 failing obscurely or — worse — continuing unvalidated.
@@ -181,11 +181,11 @@ failing obscurely or — worse — continuing unvalidated.
 
 ### L402 Consumer (pay paywalls)
 
-| Command                         | Description                                                  |
-| ------------------------------- | ------------------------------------------------------------ |
-| `blink l402-discover <url>`     | Probe a URL for L402 payment requirements (no payment made)  |
-| `blink l402-pay <url>`          | Fetch an L402-gated resource, paying automatically via Blink |
-| `blink l402-store <subcommand>` | Manage the L402 token cache (~/.blink/l402-tokens.json)      |
+| Command                         | Description                                                   |
+| ------------------------------- | ------------------------------------------------------------- |
+| `blink l402-discover <url>`     | Probe a URL for L402 payment requirements (no payment made)   |
+| `blink l402-pay <url>`          | Fetch an L402-gated resource, paying automatically via Blink  |
+| `blink l402-store <subcommand>` | Manage the L402 token cache (~/.blink/l402-tokens.json)       |
 | `blink l402-search [query]`     | Search L402 service directories (l402.directory, 402index.io) |
 | `blink l402-info <service_id>`  | Get full service details + paid health reports                |
 
@@ -198,13 +198,13 @@ failing obscurely or — worse — continuing unvalidated.
 
 ### Budget Controls
 
-| Command                                              | Description                                                       |
-| ---------------------------------------------------- | ----------------------------------------------------------------- |
-| `blink budget status`                                | Show current spend vs rolling limits and remaining budget         |
-| `blink budget set --hourly <sats> --daily <sats>`    | Set per-hour and per-day spending limits                          |
-| `blink budget allowlist list\|add\|remove <domain>`  | Manage L402 domain allowlist                                      |
-| `blink budget log [--last N]`                        | Show recent spending entries                                      |
-| `blink budget reset`                                 | Clear spending history                                            |
+| Command                                             | Description                                               |
+| --------------------------------------------------- | --------------------------------------------------------- |
+| `blink budget status`                               | Show current spend vs rolling limits and remaining budget |
+| `blink budget set --hourly <sats> --daily <sats>`   | Set per-hour and per-day spending limits                  |
+| `blink budget allowlist list\|add\|remove <domain>` | Manage L402 domain allowlist                              |
+| `blink budget log [--last N]`                       | Show recent spending entries                              |
+| `blink budget reset`                                | Clear spending history                                    |
 
 ## Installation
 
@@ -234,14 +234,14 @@ For MCP-native clients (Claude Desktop, Cursor, etc.), see [blink-mcp](https://g
 
 ## Configuration
 
-| Variable              | Required         | Description                                                                                                 |
-| --------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------- |
-| `BLINK_API_KEY`       | Yes (wallet ops) | Blink API key (`blink_...`). Not needed for `price`.                                                        |
-| `BLINK_API_URL`       | No               | Override API endpoint. Default: `https://api.blink.sv/graphql`                                              |
-| `BLINK_L402_ROOT_KEY` | No               | 64-char hex root key for L402 producer HMAC signing. Auto-generated to `~/.blink/l402-root-key` if not set. |
-| `BLINK_BUDGET_HOURLY_SATS` | No          | Max sats spendable in rolling 1-hour window. |
-| `BLINK_BUDGET_DAILY_SATS` | No           | Max sats spendable in rolling 24-hour window. |
-| `BLINK_L402_ALLOWED_DOMAINS` | No        | Comma-separated domain allowlist for L402 auto-pay. |
+| Variable                     | Required         | Description                                                                                                 |
+| ---------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------- |
+| `BLINK_API_KEY`              | Yes (wallet ops) | Blink API key (`blink_...`). Not needed for `price`.                                                        |
+| `BLINK_API_URL`              | No               | Override API endpoint. Default: `https://api.blink.sv/graphql`                                              |
+| `BLINK_L402_ROOT_KEY`        | No               | 64-char hex root key for L402 producer HMAC signing. Auto-generated to `~/.blink/l402-root-key` if not set. |
+| `BLINK_BUDGET_HOURLY_SATS`   | No               | Max sats spendable in rolling 1-hour window.                                                                |
+| `BLINK_BUDGET_DAILY_SATS`    | No               | Max sats spendable in rolling 24-hour window.                                                               |
+| `BLINK_L402_ALLOWED_DOMAINS` | No               | Comma-separated domain allowlist for L402 auto-pay.                                                         |
 
 **Staging / testnet:**
 

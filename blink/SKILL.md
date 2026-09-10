@@ -1141,7 +1141,7 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 - `--body <string>` — request body for POST/PUT
 - `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`)
 - `--force` — pay even if a valid cached token exists
-- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output
+- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there)
 
 **Requires Write scope on the API key (custodial backend) or `SPARK_MNEMONIC` + `BREEZ_API_KEY` (spark backend).**
 

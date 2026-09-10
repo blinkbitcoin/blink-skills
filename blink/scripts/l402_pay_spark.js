@@ -10,10 +10,13 @@
  *
  * Failure stages matter to the caller's reservation semantics:
  *   - connect/prepare failures happen BEFORE dispatch (nothing moved — the
- *     caller releases the budget reservation), so they are rethrown unttagged.
+ *     caller releases the budget reservation), so they are rethrown untagged.
  *   - sendPayment failures happen AFTER dispatch (outcome unknown — the
- *     payment may still settle), so they are rethrown with e.stage set to
- *     'dispatch' and the caller KEEPS the reservation (fail-closed).
+ *     payment may still settle). They are wrapped in a dedicated typed Error
+ *     (code SPARK_DISPATCH_OUTCOME_UNKNOWN, stage 'dispatch', original kept
+ *     as `cause`) so ANY rejection value — a string, a frozen or
+ *     null-prototype object, a throwing Proxy — keeps the classification,
+ *     and the caller KEEPS the reservation (fail-closed).
  */
 
 const { connect, feeFromPrepare } = require('./_spark_sdk');
@@ -45,15 +48,19 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
     try {
       result = await sdk.sendPayment({ prepareResponse });
     } catch (e) {
-      // Promises may reject with arbitrary values; a string or a
+      // Promises may reject with arbitrary values. A string or a
       // non-extensible object would silently drop an attached stage marker
-      // (sloppy-mode no-op), and the caller would then misread a post-dispatch
-      // failure as pre-dispatch and free the budget. Wrap in a dedicated Error
-      // carrying code + stage, with the original preserved as `cause`.
-      const err = new Error(
-        `Spark payment failed after dispatch (outcome unknown): ${e && e.message ? e.message : String(e)}`,
-        { cause: e },
-      );
+      // (sloppy-mode no-op), and a null-prototype object or a Proxy with a
+      // throwing trap cannot even be string-coerced. The typed error must be
+      // constructed NO MATTER WHAT the rejected value is, or the caller would
+      // misread a post-dispatch failure as pre-dispatch and free the budget.
+      let detail;
+      try {
+        detail = e && typeof e.message === 'string' ? e.message : String(e);
+      } catch {
+        detail = '(non-coercible rejection value)';
+      }
+      const err = new Error(`Spark payment failed after dispatch (outcome unknown): ${detail}`, { cause: e });
       err.code = 'SPARK_DISPATCH_OUTCOME_UNKNOWN';
       err.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
       throw err;

@@ -2019,6 +2019,38 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.equal(log[0].state, 'reserved', 'outcome unknown — the reservation must stay');
   });
 
+  it('a NON-STRING-COERCIBLE (null-prototype frozen) post-dispatch rejection keeps the reservation', async () => {
+    // String(Object.freeze(Object.create(null))) throws — a wrapper that
+    // coerces before tagging would produce an untagged TypeError instead.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: Object.freeze(Object.create(null)) });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'the typed error must be constructed for ANY rejection value');
+  });
+
+  it('payInvoiceViaSpark wraps any rejection value with code/stage/cause metadata', async () => {
+    const frozenNullProto = Object.freeze(Object.create(null));
+    installSparkBackend({ rejectWith: frozenNullProto });
+    const legPath = path.join(scriptsDir, 'l402_pay_spark.js');
+    delete require.cache[legPath];
+    const { payInvoiceViaSpark } = require(legPath);
+    await assert.rejects(
+      () => payInvoiceViaSpark('lnbc1000u1p0x', { network: 'regtest' }),
+      (e) => {
+        assert.equal(e.code, 'SPARK_DISPATCH_OUTCOME_UNKNOWN');
+        assert.equal(e.stage, 'dispatch');
+        assert.equal(e.cause, frozenNullProto, 'the original rejection value is preserved as cause');
+        return true;
+      },
+    );
+  });
+
   it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {
     configureAutoPay();
     const savedKey = process.env.BREEZ_API_KEY;
