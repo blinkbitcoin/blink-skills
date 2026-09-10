@@ -67,7 +67,17 @@ const fakeSdk = {
     return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
   },
   async sendPayment() {
-    return { payment: { id: 'bolt-1', status } };
+    return {
+      payment: {
+        id: 'spark-1',
+        status,
+        fees: 0,
+        details: {
+          type: 'lightning',
+          htlcDetails: { paymentHash: 'd'.repeat(64), preimage: 'f'.repeat(64), status: 'preimageShared' },
+        },
+      },
+    };
   },
   async addEventListener(l) {
     setImmediate(() => l.onEvent({ type: 'synced' }));

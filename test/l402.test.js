@@ -1790,7 +1790,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
 
   /** Replace _spark_sdk with a fake whose sendPayment outcome is driven by opts. */
-  function installSparkBackend({ status = 'COMPLETED', throwOnSend = false, withPreimage = true } = {}) {
+  function installSparkBackend({ status = 'completed', throwOnSend = false, withPreimage = true } = {}) {
     const fakeSdk = {
       async parse() {
         return { type: 'bolt11Invoice' };
@@ -1800,14 +1800,14 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       },
       async sendPayment() {
         if (throwOnSend) throw new Error('network timeout after dispatch');
-        const details =
-          status === 'COMPLETED' && withPreimage
-            ? {
-                type: 'lightning',
-                invoice: INVOICE_100K,
-                htlcDetails: { paymentHash: 'b'.repeat(64), preimage: 'c'.repeat(64), status: 'preimageShared' },
-              }
-            : undefined;
+        const settled = String(status).toLowerCase() === 'completed' && withPreimage;
+        const details = settled
+          ? {
+              type: 'lightning',
+              invoice: INVOICE_100K,
+              htlcDetails: { paymentHash: 'b'.repeat(64), preimage: 'c'.repeat(64), status: 'preimageShared' },
+            }
+          : undefined;
         return { payment: { id: 'spark-1', status, amount: 100000n, fees: 1n, details } };
       },
     };
@@ -1844,7 +1844,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     process.env.SPARK_MNEMONIC = 'test seed words for the stub';
     process.env.BREEZ_API_KEY = 'breez-test-key';
     mockPayment({ status: 'SUCCESS' });
-    installSparkBackend({ status: 'COMPLETED' });
+    installSparkBackend({ status: 'completed' });
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
     assert.equal(code, null, 'full flow completes without a forced exit');
     const out = output();
@@ -1867,9 +1867,128 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
     assert.notEqual(code, 0);
     const log = readSpendLog();
-    process.stderr.write('DEBUG-LOG ' + JSON.stringify(log) + ' EXIT ' + code + '\n');
     assert.equal(log.length, 1, 'outcome unknown — the budget must stay blocked');
     assert.equal(log[0].state, 'reserved');
+  });
+
+  it('normalizes the SDK contract status "completed" (lowercase) to a successful payment', async () => {
+    // The HIGH regression: the pinned SDK types PaymentStatus as lowercase —
+    // an uppercase-only comparison rejected a REAL successful payment after
+    // funds moved.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'SUCCESS' });
+    installSparkBackend({ status: 'completed' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    process.stderr.write('DEBUG-OUT ' + JSON.stringify(stdoutLines) + '\n');
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.backend, 'spark');
+    assert.equal(out.paymentStatus, 'SUCCESS');
+    const log = readSpendLog();
+    assert.equal(log[0].state, undefined, 'finalized — the settled payment counts');
+  });
+
+  it('an exact SDK "failed" status releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'failed' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), [], 'nothing settled — the budget is freed');
+  });
+
+  it('an unrecognized SDK status releases the reservation and surfaces raw', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'zzzUnknown' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {
+    configureAutoPay();
+    const savedKey = process.env.BREEZ_API_KEY;
+    delete process.env.BREEZ_API_KEY;
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    try {
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+      assert.notEqual(code, 0);
+      assert.deepEqual(readSpendLog(), [], 'no payment attempted — nothing reserved');
+    } finally {
+      if (savedKey === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = savedKey;
+    }
+  });
+
+  it('--wallet USD with the spark backend is rejected (BTC only)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({});
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark', '--wallet', 'USD']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a credential-free --spark --dry-run previews without any credentials', async () => {
+    const saved = {
+      key: process.env.BLINK_API_KEY,
+      seed: process.env.SPARK_MNEMONIC,
+      breez: process.env.BREEZ_API_KEY,
+    };
+    delete process.env.BLINK_API_KEY;
+    delete process.env.SPARK_MNEMONIC;
+    delete process.env.BREEZ_API_KEY;
+    try {
+      configureAutoPay();
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run', '--spark']);
+      assert.equal(code, null, 'dry-run never dispatches, so it needs no credentials');
+      const out = output();
+      assert.equal(out.event, 'l402_dry_run');
+      assert.equal(out.budgetSats, 100000);
+    } finally {
+      if (saved.key === undefined) delete process.env.BLINK_API_KEY;
+      else process.env.BLINK_API_KEY = saved.key;
+      if (saved.seed === undefined) delete process.env.SPARK_MNEMONIC;
+      else process.env.SPARK_MNEMONIC = saved.seed;
+      if (saved.breez === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = saved.breez;
+    }
+  });
+
+  it('an auto-selected credential-free spark --dry-run still previews', async () => {
+    // No Blink key, but a seed: the spark backend is auto-selected for the
+    // preview even without BREEZ_API_KEY — dry-run dispatches nothing.
+    const savedKey = process.env.BLINK_API_KEY;
+    const savedBreez = process.env.BREEZ_API_KEY;
+    delete process.env.BLINK_API_KEY;
+    delete process.env.BREEZ_API_KEY;
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    try {
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
+      assert.equal(code, null);
+      assert.equal(output().event, 'l402_dry_run');
+    } finally {
+      if (savedKey === undefined) delete process.env.BLINK_API_KEY;
+      else process.env.BLINK_API_KEY = savedKey;
+      if (savedBreez === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = savedBreez;
+    }
   });
 
   it('auto-selects the spark backend when no Blink key exists but a seed is present', async () => {
@@ -1880,7 +1999,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     process.env.BREEZ_API_KEY = 'breez-test-key';
     try {
       mockPayment({ status: 'SUCCESS' });
-      installSparkBackend({ status: 'COMPLETED' });
+      installSparkBackend({ status: 'completed' });
       const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
       assert.equal(code, null);
       const out = output();

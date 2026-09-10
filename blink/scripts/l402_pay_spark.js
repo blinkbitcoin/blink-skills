@@ -26,7 +26,10 @@ const { feeFromPrepare } = require('./spark_send');
  * @param {object} [opts]
  * @param {string} [opts.network]  'mainnet' (default) or 'regtest'.
  * @returns {Promise<{ payment: object, status: string, preimage: string|null, feeSats: number|null }>}
- *   status is the SDK payment status ('COMPLETED', 'pending', 'failed', ...).
+ *   status is NORMALIZED at this boundary, case-insensitively, onto the
+ *   custodial vocabulary: the SDK's 'completed'/'pending'/'failed' (any
+ *   casing) become 'SUCCESS'/'PENDING'/'FAILURE'; unknown statuses pass
+ *   through raw. Callers must branch on these values only.
  */
 async function payInvoiceViaSpark(invoice, { network } = {}) {
   const { sdk, disconnect } = await connect({ network: network || process.env.SPARK_NETWORK || 'mainnet' });
@@ -48,7 +51,14 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
     }
 
     const payment = result && result.payment ? result.payment : result;
-    const status = (payment && payment.status) || 'SUBMITTED';
+    const rawStatus = String((payment && payment.status) || 'SUBMITTED');
+    const lower = rawStatus.toLowerCase();
+
+    let status;
+    if (lower === 'completed' || lower === 'success') status = 'SUCCESS';
+    else if (lower === 'pending' || lower === 'submitted') status = 'PENDING';
+    else if (lower === 'failed' || lower === 'failure') status = 'FAILURE';
+    else status = rawStatus; // unknown — preserved raw so the caller sees the truth
 
     let preimage = null;
     const details = payment && payment.details;

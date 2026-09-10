@@ -759,6 +759,7 @@ commands['l402-discover'] = {
 };
 
 commands['l402-pay'] = {
+  forceExit: true,
   description: 'Fetch an L402-gated resource, paying automatically via Blink if required',
   args: [{ name: 'url', required: true, description: 'URL to access' }],
   options: {

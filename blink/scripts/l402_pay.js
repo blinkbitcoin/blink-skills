@@ -524,6 +524,7 @@ async function main() {
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         status: res.status,
         tokenReused: true,
+        backend: cached.backend ?? null,
         satoshis: cached.satoshis ?? null,
         invoiceMsats: cached.invoiceMsats ?? null,
         budgetSats: cached.budgetSats ?? null,
@@ -636,6 +637,8 @@ async function main() {
   // --spark forces the self-custodial leg (Breez SDK signs locally). Without
   // it, Spark is auto-selected when it is the only available wallet: no
   // Blink API key, but a seed is present. Custodial remains the default.
+  // A dry-run dispatches nothing and loads no SDK, so it is credential-free
+  // for both backends — the checks below are skipped for it.
   const hasBlinkKey = Boolean(process.env.BLINK_API_KEY);
   const hasSparkSeed = Boolean(process.env.SPARK_MNEMONIC);
   let sparkBackend = Boolean(args.spark);
@@ -643,7 +646,7 @@ async function main() {
     sparkBackend = true;
     console.error('No BLINK_API_KEY — paying via the self-custodial (Spark) backend.');
   }
-  if (sparkBackend) {
+  if (sparkBackend && !args.dryRun) {
     if (!hasSparkSeed) {
       console.error('Error: the Spark backend requires SPARK_MNEMONIC.');
       process.exit(1);
@@ -826,14 +829,14 @@ async function main() {
       }
       throw e;
     }
-    // Normalize the SDK status onto the custodial vocabulary for the shared
-    // tail: COMPLETED means the payment settled.
-    paymentStatus = spark.status === 'COMPLETED' ? 'SUCCESS' : spark.status;
+    // Status was normalized at the backend boundary (completed→SUCCESS,
+    // pending→PENDING, failed→FAILURE; unknown passes raw).
+    paymentStatus = spark.status;
     if (spark.feeSats !== null) {
       feeProbeResult = { estimatedFeeSats: spark.feeSats, error: null };
     }
 
-    if (String(paymentStatus).toLowerCase() === 'pending') {
+    if (paymentStatus === 'PENDING') {
       // In flight: count it against the budget like the custodial PENDING
       // path, then surface the failure — no preimage yet, so no token.
       if (reservationId) {
@@ -853,11 +856,9 @@ async function main() {
       }
       throw new Error(`Payment not successful: status=${paymentStatus}`);
     }
-    if (String(paymentStatus).toLowerCase() === 'failed') {
-      releaseReservationSafely();
-      throw new Error(`Payment not successful: status=${paymentStatus}`);
-    }
     if (paymentStatus !== 'SUCCESS') {
+      // Terminal failure (FAILURE or an unrecognized status) — nothing
+      // settled; free the budget.
       releaseReservationSafely();
       throw new Error(`Payment not successful: status=${paymentStatus}`);
     }
@@ -1026,6 +1027,7 @@ async function main() {
         satoshis: satoshis ?? null,
         invoiceMsats: charge.msats,
         budgetSats,
+        backend: sparkBackend ? 'spark' : 'custodial',
       });
       console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
