@@ -443,6 +443,42 @@ function normalizeInfo(info) {
   return { balanceSats: Number(raw) };
 }
 
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE = BigInt(-Number.MAX_SAFE_INTEGER);
+
+/**
+ * Recursively normalize an SDK value for JSON output.
+ *
+ * JSON.stringify cannot represent two SDK shapes:
+ *   - BigInt (throws)        → Number when safe, String when it would round
+ *     unsafely (large token balances must never silently lose precision).
+ *   - Map (always "{}")      → plain object with recursively normalized
+ *     values. The pinned SDK returns tokenBalances as Map<string,
+ *     TokenBalance>; a JSON round-trip would report a wallet WITH tokens
+ *     as holding none.
+ * Arrays and plain objects are normalized recursively; primitives pass through.
+ *
+ * Shared SDK-to-CLI adapter: any command printing raw SDK payloads should use
+ * this rather than a JSON round-trip.
+ */
+function normalizeSdkValue(value) {
+  if (typeof value === 'bigint') {
+    return value <= MAX_SAFE && value >= MIN_SAFE ? Number(value) : value.toString();
+  }
+  if (value instanceof Map) {
+    const out = {};
+    for (const [k, v] of value) out[String(k)] = normalizeSdkValue(v);
+    return out;
+  }
+  if (Array.isArray(value)) return value.map(normalizeSdkValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = normalizeSdkValue(v);
+    return out;
+  }
+  return value;
+}
+
 /**
  * Read a balance that is stable, not a mid-sync transient.
  *
@@ -525,6 +561,7 @@ module.exports = {
   assertStorageAvailable,
   connect,
   normalizeInfo,
+  normalizeSdkValue,
   waitForStableBalance,
   normalizePayment,
 };

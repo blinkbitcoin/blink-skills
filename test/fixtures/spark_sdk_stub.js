@@ -26,9 +26,21 @@ const payments = JSON.parse(process.env.SPARK_STUB_PAYMENTS || '[]');
 const status = process.env.SPARK_STUB_STATUS || 'COMPLETED';
 const echo = process.env.SPARK_STUB_ECHO === '1';
 
+// Optional non-empty tokenBalances, mirroring the pinned SDK's
+// Map<string, TokenBalance> shape (with BigInt balances), so spark-info
+// tests exercise the Map normalization path.
+//   SPARK_STUB_TOKEN_BALANCES='{"token-id-1": {"balance": 5000}}'
+let stubTokenBalances = null;
+if (process.env.SPARK_STUB_TOKEN_BALANCES) {
+  const parsed = JSON.parse(process.env.SPARK_STUB_TOKEN_BALANCES);
+  stubTokenBalances = new Map(Object.entries(parsed).map(([k, v]) => [k, { ...v, balance: BigInt(v.balance) }]));
+}
+
 const fakeSdk = {
   async getInfo() {
-    return { balanceSats: balance };
+    const info = { balanceSats: balance };
+    if (stubTokenBalances) info.tokenBalances = stubTokenBalances;
+    return info;
   },
   async listPayments(req) {
     if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);
@@ -64,6 +76,29 @@ const fakeSdk = {
   async removeEventListener() {},
 };
 
+// Mirror of the real _spark_sdk.normalizeSdkValue — spark-info output
+// behavior (Map conversion, bigint stringification) is asserted against it.
+// Standalone (not a method): spark-info destructures it, losing `this`.
+function normalizeSdkValue(value) {
+  const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+  const MIN_SAFE = BigInt(-Number.MAX_SAFE_INTEGER);
+  if (typeof value === 'bigint') {
+    return value <= MAX_SAFE && value >= MIN_SAFE ? Number(value) : value.toString();
+  }
+  if (value instanceof Map) {
+    const out = {};
+    for (const [k, v] of value) out[String(k)] = normalizeSdkValue(v);
+    return out;
+  }
+  if (Array.isArray(value)) return value.map(normalizeSdkValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = normalizeSdkValue(v);
+    return out;
+  }
+  return value;
+}
+
 const stub = {
   SPARK_PACKAGE: '@breeztech/breez-sdk-spark',
   DEFAULT_NETWORK: 'mainnet',
@@ -72,6 +107,7 @@ const stub = {
     return { sdk: fakeSdk, disconnect: async () => {} };
   },
   normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
+  normalizeSdkValue,
   async waitForStableBalance(sdk) {
     const info = await sdk.getInfo({ ensureSynced: true });
     return { balanceSats: Number(info.balanceSats), stable: true };

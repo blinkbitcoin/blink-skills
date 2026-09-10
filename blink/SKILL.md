@@ -71,7 +71,7 @@ commands). Key concepts:
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
 - **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
@@ -472,6 +472,14 @@ blink spark-balance [--network mainnet|regtest]
 ```
 
 Reads the BTC balance of a self-custodial (Spark) account directly from the wallet via the Breez Spark SDK. Non-custodial balances are **not visible through the Blink API**. Waits briefly for a stable balance after incoming payments (`stable` field in the output).
+
+### Spark Info
+
+```bash
+blink spark-info [--network mainnet|regtest]
+```
+
+Shows a Spark account's info from the SDK's `getInfo()` — balance plus any other fields the SDK version returns. SDK values are normalized for JSON: safe-integer BigInts become **numbers**, BigInts outside the safe range become **decimal strings**, and SDK Maps (e.g. `tokenBalances`) become **plain objects**. Non-custodial counterpart of `account-info`. Requires `SPARK_MNEMONIC` + `BREEZ_API_KEY`.
 
 ### Spark Send
 
@@ -1554,6 +1562,7 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/resolve_receiver.js` — Classify a Blink identifier as custodial or non-custodial (Spark)
 - `{baseDir}/scripts/create_invoice_lnaddress.js` — Receive to any Blink Lightning Address via public LNURL-pay (no credentials)
 - `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
+- `{baseDir}/scripts/spark_info.js` — Non-custodial (Spark) account info via the SDK (getInfo dump)
 - `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
 - `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee to send from a Spark account (prepare only, nothing sent)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)

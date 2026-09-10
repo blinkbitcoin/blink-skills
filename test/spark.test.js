@@ -1069,6 +1069,46 @@ describe('spark_balance.parseArgs', () => {
   });
 });
 
+// ── _spark_sdk.normalizeSdkValue ─────────────────────────────────────────────
+
+describe('_spark_sdk.normalizeSdkValue', () => {
+  const { normalizeSdkValue } = require('../blink/scripts/_spark_sdk');
+
+  it('converts a Map to a plain object with normalized values', () => {
+    const map = new Map([['token-a', { balance: 5000n, tokenMetadata: { name: 'A' } }]]);
+    assert.deepEqual(normalizeSdkValue(map), {
+      'token-a': { balance: 5000, tokenMetadata: { name: 'A' } },
+    });
+  });
+
+  it('keeps safe bigints as numbers and unsafe bigints as strings (no unsafe rounding)', () => {
+    assert.equal(normalizeSdkValue(5n), 5);
+    const huge = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    const out = normalizeSdkValue(huge);
+    assert.equal(out, huge.toString());
+    assert.equal(typeof out, 'string');
+  });
+
+  it('recurses into arrays and plain objects', () => {
+    assert.deepEqual(normalizeSdkValue({ list: [1n, { m: new Map([['k', 2n]]) }] }), {
+      list: [1, { m: { k: 2 } }],
+    });
+  });
+
+  it('passes primitives through', () => {
+    assert.equal(normalizeSdkValue('x'), 'x');
+    assert.equal(normalizeSdkValue(null), null);
+    assert.equal(normalizeSdkValue(42), 42);
+  });
+
+  it('a wallet WITH tokens no longer reports an empty object (jsonSafe regression)', () => {
+    // The pinned SDK returns tokenBalances as Map<string, TokenBalance>;
+    // JSON.stringify(new Map(...)) is "{}", hiding real holdings.
+    const out = normalizeSdkValue({ tokenBalances: new Map([['tok-1', { balance: 7n }]]) });
+    assert.deepEqual(out.tokenBalances, { 'tok-1': { balance: 7 } });
+  });
+});
+
 // ── storage preflight (review finding #1) ────────────────────────────────────
 //
 // The probe must require better-sqlite3 DIRECTLY and open a database, because

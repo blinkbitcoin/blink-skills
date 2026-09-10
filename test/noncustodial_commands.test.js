@@ -48,6 +48,7 @@ afterEach(() => {
   for (const f of [
     'create_invoice_lnaddress.js',
     'spark_balance.js',
+    'spark_info.js',
     'spark_transactions.js',
     'spark_subscribe.js',
     'resolve_receiver.js',
@@ -128,6 +129,8 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
       },
       // spark_balance imports these directly from the module.
       normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
+      // spark_info imports this for its output payload.
+      normalizeSdkValue: (value) => value,
       async waitForStableBalance(sdk) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };
@@ -540,6 +543,42 @@ describe('spark_balance main()', () => {
       else process.env.SPARK_NETWORK = saved;
     }
     assert.equal(connectedNetwork, 'regtest');
+  });
+});
+
+// ── spark-info ───────────────────────────────────────────────────────────────
+
+describe('spark_info main()', () => {
+  it('emits the getInfo payload and disconnects', async () => {
+    let disconnected = false;
+    mockSparkSdk(
+      {
+        async getInfo() {
+          return { balanceSats: 2551n, identityPubkey: '02abcd' };
+        },
+      },
+      { onDisconnect: () => (disconnected = true) },
+    );
+    const r = await runScript('spark_info.js', []);
+    const j = r.json();
+    assert.equal(j.balanceSats, 2551);
+    assert.equal(j.identityPubkey, '02abcd');
+    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(disconnected, true, 'must always disconnect');
+  });
+
+  it('still disconnects when getInfo() rejects', async () => {
+    let disconnected = false;
+    mockSparkSdk(
+      {
+        async getInfo() {
+          throw new Error('sync failed');
+        },
+      },
+      { onDisconnect: () => (disconnected = true) },
+    );
+    await assert.rejects(() => runScript('spark_info.js', []), /sync failed/);
+    assert.equal(disconnected, true);
   });
 });
 

@@ -27,7 +27,14 @@ const os = require('node:os');
 const binPath = path.resolve(__dirname, '..', 'bin', 'blink.js');
 const stubPath = path.resolve(__dirname, 'fixtures', 'spark_sdk_stub.js');
 
-const SPARK_COMMANDS = ['spark-balance', 'spark-send', 'spark-fee-probe', 'spark-transactions', 'spark-subscribe'];
+const SPARK_COMMANDS = [
+  'spark-balance',
+  'spark-send',
+  'spark-fee-probe',
+  'spark-transactions',
+  'spark-subscribe',
+  'spark-info',
+];
 const CREDENTIAL_FREE_COMMANDS = ['resolve-receiver', 'create-invoice-lnaddress'];
 
 // spark-send enforces budget limits and records spends under ~/.blink. Point
@@ -87,6 +94,76 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.ok(!killed, 'command must not hit the timeout');
     assert.equal(code, 0);
     assert.equal(JSON.parse(stdout).balanceSats, 2551);
+  });
+
+  it('spark-info exits promptly with the getInfo payload and network', async () => {
+    const { code, stdout, killed } = await runCli(['spark-info'], { env: { SPARK_STUB_BALANCE: '2551' } });
+    assert.ok(!killed, 'command must not hit the timeout');
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.balanceSats, 2551);
+    assert.equal(j.network, 'mainnet');
+  });
+
+  it('spark-info forwards --network to connect()', async () => {
+    const { code, stderr, stdout } = await runCli(['spark-info', '--network', 'regtest'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.equal(code, 0);
+    assert.match(stderr, /STUB_NETWORK=regtest/);
+    assert.equal(JSON.parse(stdout).network, 'regtest');
+  });
+
+  it('spark-info converts a non-empty tokenBalances Map instead of reporting {}', async () => {
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_TOKEN_BALANCES: JSON.stringify({ 'token-1': { balance: 5000 } }) },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.deepEqual(
+      j.tokenBalances,
+      { 'token-1': { balance: 5000 } },
+      'a wallet holding tokens must not report an empty object',
+    );
+  });
+
+  it('spark-info emits unsafe bigints as decimal strings, never rounded', async () => {
+    // Beyond Number.MAX_SAFE_INTEGER: a JSON number would round to ...992.
+    const huge = '9007199254740993';
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_TOKEN_BALANCES: JSON.stringify({ 'token-1': { balance: huge } }) },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.tokenBalances['token-1'].balance, huge);
+    assert.equal(typeof j.tokenBalances['token-1'].balance, 'string');
+  });
+
+  it('the standalone wrapper (direct script invocation) drains stdout and exits cleanly', async () => {
+    // The require.main === module runner path is only reachable by invoking
+    // the script directly — bin/blink.js requires the module instead.
+    const scriptPath = path.resolve(__dirname, '..', 'blink', 'scripts', 'spark_info.js');
+    const result = await new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, scriptPath],
+        { env: { ...process.env, SPARK_STUB_BALANCE: '777' }, timeout: 20000, killSignal: 'SIGKILL' },
+        (err, stdout, stderr) => {
+          resolve({
+            code: err ? (err.code === undefined ? 1 : err.code) : 0,
+            stdout,
+            stderr,
+            killed: err && err.killed,
+          });
+        },
+      );
+    });
+    assert.ok(!result.killed, 'must not hang on the SDK event loop');
+    assert.equal(result.code, 0);
+    const j = JSON.parse(result.stdout);
+    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.balanceSats, 777);
   });
 
   it('spark-transactions exits promptly with JSON', async () => {

@@ -122,6 +122,7 @@ Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 | Command                                   | Description                                                        |
 | ----------------------------------------- | ----------------------------------------------------------------- |
 | `blink spark-balance`                     | Show a Spark account BTC balance via the SDK                       |
+| `blink spark-info`                        | Show a Spark account info (`getInfo`) via the SDK                  |
 | `blink spark-send <destination> <sats>`   | Sign & send BTC from a Spark account (`--dry-run` shows fees)      |
 | `blink spark-transactions`                | List Spark account payments (SDK-local history)                   |
 | `blink spark-subscribe`                   | Stream live Spark wallet events                                   |

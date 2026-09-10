@@ -468,6 +468,21 @@ commands['spark-transactions'] = {
   },
 };
 
+commands['spark-info'] = {
+  forceExit: true,
+  description: '[non-custodial] Show Spark account info via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [],
+  options: { network: { type: 'string' } },
+  optMeta: { network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' } },
+  examples: ['blink spark-info'],
+  action: async (pos, opts) => {
+    if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
+    setProcessArgv([]);
+    const { main } = require(path.join(scriptsDir, 'spark_info.js'));
+    await main();
+  },
+};
+
 commands['spark-subscribe'] = {
   forceExit: true,
   description: '[non-custodial] Subscribe to Spark wallet events via the Breez SDK (requires SPARK_MNEMONIC)',

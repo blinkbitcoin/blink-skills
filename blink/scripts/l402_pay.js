@@ -522,6 +522,8 @@ async function main() {
         status: res.status,
         tokenReused: true,
         satoshis: cached.satoshis ?? null,
+        invoiceMsats: cached.invoiceMsats ?? null,
+        budgetSats: cached.budgetSats ?? null,
         data,
       };
       console.log(JSON.stringify(output, null, 2));
