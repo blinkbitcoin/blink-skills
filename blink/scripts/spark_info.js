@@ -33,10 +33,37 @@ function parseArgs(argv) {
   return { network };
 }
 
-// JSON.stringify cannot serialize BigInt; coerce to Number (balances fit in
-// a safe integer for any real wallet).
-function jsonSafe(value) {
-  return JSON.parse(JSON.stringify(value, (key, v) => (typeof v === 'bigint' ? Number(v) : v)));
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE = BigInt(-Number.MAX_SAFE_INTEGER);
+
+/**
+ * Recursively normalize an SDK value for JSON output.
+ *
+ * JSON.stringify cannot represent two SDK shapes:
+ *   - BigInt (throws)        → Number when safe, String when it would round
+ *     unsafely (large token balances must never silently lose precision).
+ *   - Map (always "{}")      → plain object with recursively normalized
+ *     values. The pinned SDK returns tokenBalances as Map<string,
+ *     TokenBalance>; a JSON round-trip would report a wallet WITH tokens
+ *     as holding none.
+ * Arrays and plain objects are normalized recursively; primitives pass through.
+ */
+function normalizeSdkValue(value) {
+  if (typeof value === 'bigint') {
+    return value <= MAX_SAFE && value >= MIN_SAFE ? Number(value) : value.toString();
+  }
+  if (value instanceof Map) {
+    const out = {};
+    for (const [k, v] of value) out[String(k)] = normalizeSdkValue(v);
+    return out;
+  }
+  if (Array.isArray(value)) return value.map(normalizeSdkValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = normalizeSdkValue(v);
+    return out;
+  }
+  return value;
 }
 
 async function main() {
@@ -49,7 +76,7 @@ async function main() {
         {
           accountType: 'lnaddress',
           network,
-          ...jsonSafe(info),
+          ...normalizeSdkValue(info),
           // balanceSats re-normalized for a stable contract across SDK versions.
           balanceSats: normalizeInfo(info).balanceSats,
         },
@@ -81,4 +108,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs };
+module.exports = { main, parseArgs, normalizeSdkValue };

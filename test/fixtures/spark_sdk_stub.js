@@ -26,9 +26,21 @@ const payments = JSON.parse(process.env.SPARK_STUB_PAYMENTS || '[]');
 const status = process.env.SPARK_STUB_STATUS || 'COMPLETED';
 const echo = process.env.SPARK_STUB_ECHO === '1';
 
+// Optional non-empty tokenBalances, mirroring the pinned SDK's
+// Map<string, TokenBalance> shape (with BigInt balances), so spark-info
+// tests exercise the Map normalization path.
+//   SPARK_STUB_TOKEN_BALANCES='{"token-id-1": {"balance": 5000}}'
+let stubTokenBalances = null;
+if (process.env.SPARK_STUB_TOKEN_BALANCES) {
+  const parsed = JSON.parse(process.env.SPARK_STUB_TOKEN_BALANCES);
+  stubTokenBalances = new Map(Object.entries(parsed).map(([k, v]) => [k, { ...v, balance: BigInt(v.balance) }]));
+}
+
 const fakeSdk = {
   async getInfo() {
-    return { balanceSats: balance };
+    const info = { balanceSats: balance };
+    if (stubTokenBalances) info.tokenBalances = stubTokenBalances;
+    return info;
   },
   async listPayments(req) {
     if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);

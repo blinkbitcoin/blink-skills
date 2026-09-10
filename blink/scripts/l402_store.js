@@ -239,4 +239,5 @@ module.exports = {
   listTokens,
   clearTokens,
   STORE_FILE,
+  main,
 };

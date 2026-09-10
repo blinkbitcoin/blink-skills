@@ -115,6 +115,19 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.equal(JSON.parse(stdout).network, 'regtest');
   });
 
+  it('spark-info converts a non-empty tokenBalances Map instead of reporting {}', async () => {
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_TOKEN_BALANCES: JSON.stringify({ 'token-1': { balance: 5000 } }) },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.deepEqual(
+      j.tokenBalances,
+      { 'token-1': { balance: 5000 } },
+      'a wallet holding tokens must not report an empty object',
+    );
+  });
+
   it('spark-transactions exits promptly with JSON', async () => {
     const payments = JSON.stringify([
       { id: 'p1', paymentType: 'send', status: 'completed', amount: 10, fees: 3, timestamp: 1710000000 },

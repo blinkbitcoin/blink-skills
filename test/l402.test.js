@@ -315,6 +315,36 @@ describe('l402_store token CRUD', () => {
     assert.equal(entry.budgetSats, null);
   });
 
+  it('CLI get surfaces the new metadata for fresh entries and null for legacy entries', () => {
+    storeModule.saveToken('frac.example', {
+      macaroon: 'MAC',
+      preimage: 'j'.repeat(64),
+      invoiceMsats: 1400,
+      budgetSats: 2,
+    });
+    storeModule.saveToken('legacy.example', { macaroon: 'MAC', preimage: 'k'.repeat(64), satoshis: 10 });
+    const runGet = (domain) => {
+      const origArgv = process.argv;
+      const origLog = console.log;
+      const out = [];
+      process.argv = ['node', 'l402_store.js', 'get', domain];
+      console.log = (s) => out.push(String(s));
+      try {
+        storeModule.main();
+      } finally {
+        process.argv = origArgv;
+        console.log = origLog;
+      }
+      return JSON.parse(out.join('\n'));
+    };
+    const fresh = runGet('frac.example');
+    assert.equal(fresh.invoiceMsats, 1400);
+    assert.equal(fresh.budgetSats, 2);
+    const legacy = runGet('legacy.example');
+    assert.equal(legacy.invoiceMsats, null);
+    assert.equal(legacy.budgetSats, null);
+  });
+
   it('clearTokens() removes all tokens', () => {
     storeModule.saveToken('x.example', { macaroon: 'MAC', preimage: 'f'.repeat(64) });
     storeModule.saveToken('y.example', { macaroon: 'MAC', preimage: 'g'.repeat(64) });
