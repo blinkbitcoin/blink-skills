@@ -1071,8 +1071,8 @@ describe('spark_balance.parseArgs', () => {
 
 // ── spark_info.normalizeSdkValue ─────────────────────────────────────────────
 
-describe('spark_info.normalizeSdkValue', () => {
-  const { normalizeSdkValue } = require('../blink/scripts/spark_info');
+describe('_spark_sdk.normalizeSdkValue', () => {
+  const { normalizeSdkValue } = require('../blink/scripts/_spark_sdk');
 
   it('converts a Map to a plain object with normalized values', () => {
     const map = new Map([['token-a', { balance: 5000n, tokenMetadata: { name: 'A' } }]]);

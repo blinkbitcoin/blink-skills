@@ -128,6 +128,18 @@ describe('CLI: spark commands return instead of hanging', () => {
     );
   });
 
+  it('spark-info emits unsafe bigints as decimal strings, never rounded', async () => {
+    // Beyond Number.MAX_SAFE_INTEGER: a JSON number would round to ...992.
+    const huge = '9007199254740993';
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_TOKEN_BALANCES: JSON.stringify({ 'token-1': { balance: huge } }) },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.tokenBalances['token-1'].balance, huge);
+    assert.equal(typeof j.tokenBalances['token-1'].balance, 'string');
+  });
+
   it('spark-transactions exits promptly with JSON', async () => {
     const payments = JSON.stringify([
       { id: 'p1', paymentType: 'send', status: 'completed', amount: 10, fees: 3, timestamp: 1710000000 },

@@ -10,8 +10,10 @@
  * Blink API at all; they live in the Spark wallet and must be read with the
  * seed via the SDK.
  *
- * Output: the SDK's getInfo() response (BigInt fields coerced to Number),
- * plus accountType and network.
+ * Output: the SDK's getInfo() response plus accountType and network, with
+ * SDK values normalized for JSON: safe-integer BigInts become Numbers,
+ * BigInts outside the safe range become decimal Strings, and SDK Maps
+ * (e.g. tokenBalances) become plain objects.
  *
  * Environment:
  *   SPARK_MNEMONIC  - Required. 12/24-word BIP39 seed (spend authority — keep secret).
@@ -20,7 +22,7 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
-const { connect, normalizeInfo } = require('./_spark_sdk');
+const { connect, normalizeInfo, normalizeSdkValue } = require('./_spark_sdk');
 
 function parseArgs(argv) {
   let network = process.env.SPARK_NETWORK || 'mainnet';
@@ -31,39 +33,6 @@ function parseArgs(argv) {
     }
   }
   return { network };
-}
-
-const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
-const MIN_SAFE = BigInt(-Number.MAX_SAFE_INTEGER);
-
-/**
- * Recursively normalize an SDK value for JSON output.
- *
- * JSON.stringify cannot represent two SDK shapes:
- *   - BigInt (throws)        → Number when safe, String when it would round
- *     unsafely (large token balances must never silently lose precision).
- *   - Map (always "{}")      → plain object with recursively normalized
- *     values. The pinned SDK returns tokenBalances as Map<string,
- *     TokenBalance>; a JSON round-trip would report a wallet WITH tokens
- *     as holding none.
- * Arrays and plain objects are normalized recursively; primitives pass through.
- */
-function normalizeSdkValue(value) {
-  if (typeof value === 'bigint') {
-    return value <= MAX_SAFE && value >= MIN_SAFE ? Number(value) : value.toString();
-  }
-  if (value instanceof Map) {
-    const out = {};
-    for (const [k, v] of value) out[String(k)] = normalizeSdkValue(v);
-    return out;
-  }
-  if (Array.isArray(value)) return value.map(normalizeSdkValue);
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = normalizeSdkValue(v);
-    return out;
-  }
-  return value;
 }
 
 async function main() {
@@ -108,4 +77,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, normalizeSdkValue };
+module.exports = { main, parseArgs };

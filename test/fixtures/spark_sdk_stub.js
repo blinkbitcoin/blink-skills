@@ -76,6 +76,29 @@ const fakeSdk = {
   async removeEventListener() {},
 };
 
+// Mirror of the real _spark_sdk.normalizeSdkValue — spark-info output
+// behavior (Map conversion, bigint stringification) is asserted against it.
+// Standalone (not a method): spark-info destructures it, losing `this`.
+function normalizeSdkValue(value) {
+  const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+  const MIN_SAFE = BigInt(-Number.MAX_SAFE_INTEGER);
+  if (typeof value === 'bigint') {
+    return value <= MAX_SAFE && value >= MIN_SAFE ? Number(value) : value.toString();
+  }
+  if (value instanceof Map) {
+    const out = {};
+    for (const [k, v] of value) out[String(k)] = normalizeSdkValue(v);
+    return out;
+  }
+  if (Array.isArray(value)) return value.map(normalizeSdkValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = normalizeSdkValue(v);
+    return out;
+  }
+  return value;
+}
+
 const stub = {
   SPARK_PACKAGE: '@breeztech/breez-sdk-spark',
   DEFAULT_NETWORK: 'mainnet',
@@ -84,6 +107,7 @@ const stub = {
     return { sdk: fakeSdk, disconnect: async () => {} };
   },
   normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
+  normalizeSdkValue,
   async waitForStableBalance(sdk) {
     const info = await sdk.getInfo({ ensureSynced: true });
     return { balanceSats: Number(info.balanceSats), stable: true };
