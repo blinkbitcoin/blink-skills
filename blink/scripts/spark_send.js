@@ -47,8 +47,8 @@
  * CAUTION: This signs and sends real bitcoin from a self-custodial wallet.
  */
 
-const { connect, feeFromPrepare } = require('./_spark_sdk');
-const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
+const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
+const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
 
 function parseArgs(argv) {
   let destination = null;
@@ -276,36 +276,13 @@ async function main() {
 
     // Record the spend unless the SDK says the payment failed — same rule as
     // the custodial pay commands ("only successful/pending payments are
-    // logged"). Non-fatal, but never silent: a spend that escapes the budget
-    // log would make later budget checks overestimate what is left.
+    // logged"). settleSpend warns — never throws — when accounting fails:
+    // a spend that escapes the log would overestimate what is left.
     if (!isFailedStatus(status)) {
-      try {
-        if (reservationId) {
-          const outcome = finalizeOrRecord(reservationId, {
-            sats: args.amountSats,
-            command: 'spark-send',
-            domain: null,
-          });
-          if (outcome === 'restored') {
-            console.error(
-              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-            );
-          }
-        } else {
-          recordSpend({ sats: args.amountSats, command: 'spark-send', domain: null });
-        }
-      } catch (e) {
-        console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
-      }
+      settleSpend({ reservationId, sats: args.amountSats, command: 'spark-send', domain: null });
     } else if (reservationId) {
       // Explicit terminal failure — the payment did not happen, free the budget.
-      try {
-        releaseReservation(reservationId);
-      } catch (e) {
-        // Not silent: a failed release strands the allowance — fail-closed is
-        // correct for the budget, but the operator must be told.
-        console.error(`Warning: could not release the budget reservation: ${e.message}`);
-      }
+      releaseSpend(reservationId);
     }
 
     console.log(
@@ -340,7 +317,9 @@ async function main() {
     try {
       await disconnect();
     } catch (e) {
-      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${e.message}`);
+      // safeErrorDetail: even the warning must not throw (a throwing getter on
+      // a fake/alternate connector's error would otherwise mask the outcome).
+      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${safeErrorDetail(e)}`);
     }
   }
 }

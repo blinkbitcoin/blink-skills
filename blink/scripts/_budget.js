@@ -898,6 +898,58 @@ function resetLog({ force = false } = {}) {
 
 // ── Exports ──────────────────────────────────────────────────────────────────
 
+// ── Shared settle/release helpers ────────────────────────────────────────────
+//
+// One place for the reserve → settle/release bookkeeping shared by every
+// payment command. Both warn on failure and never throw: the payment itself
+// already happened (or not) by the time these run, and a logging failure must
+// not mask it.
+
+/**
+ * Finalize a reservation (or record directly when unconfigured — no budget
+ * means nothing was reserved), warning when the reservation was erased
+ * externally (restored) or the accounting write failed.
+ *
+ * @param {object}  args
+ * @param {string|null} args.reservationId
+ * @param {number}  args.sats
+ * @param {string}  args.command
+ * @param {string|null} [args.domain]
+ * @param {string}  [args.label]  'the spend' (default) or 'the in-flight payment' (pending)
+ */
+function settleSpend({ reservationId, sats, command, domain = null, label = 'the spend' }) {
+  try {
+    if (reservationId) {
+      const outcome = finalizeOrRecord(reservationId, { sats, command, domain });
+      if (outcome === 'restored') {
+        console.error(
+          'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+        );
+      }
+    } else {
+      recordSpend({ sats, command, domain });
+    }
+  } catch (e) {
+    console.error(`Warning: could not record ${label} in the budget log: ${e.message}`);
+  }
+}
+
+/**
+ * Release a reservation after a known no-movement outcome. Warns — never
+ * throws — when the release fails (a failed release strands the allowance;
+ * fail-closed for the budget, but the operator must be told).
+ *
+ * @param {string|null} reservationId
+ */
+function releaseSpend(reservationId) {
+  if (!reservationId) return;
+  try {
+    releaseReservation(reservationId);
+  } catch (e) {
+    console.error(`Warning: could not release the budget reservation: ${e.message}`);
+  }
+}
+
 module.exports = {
   // Paths (for testing)
   CONFIG_FILE,
@@ -927,6 +979,8 @@ module.exports = {
   reserveBudget,
   finalizeOrRecord,
   releaseReservation,
+  settleSpend,
+  releaseSpend,
 
   // Domain
   checkDomainAllowed,

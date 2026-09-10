@@ -19,7 +19,7 @@
  *     and the caller KEEPS the reservation (fail-closed).
  */
 
-const { connect, feeFromPrepare } = require('./_spark_sdk');
+const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
 
 /**
  * Pay a BOLT-11 invoice from a Spark account.
@@ -54,32 +54,43 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
       // throwing trap cannot even be string-coerced. The typed error must be
       // constructed NO MATTER WHAT the rejected value is, or the caller would
       // misread a post-dispatch failure as pre-dispatch and free the budget.
-      let detail;
-      try {
-        detail = e && typeof e.message === 'string' ? e.message : String(e);
-      } catch {
-        detail = '(non-coercible rejection value)';
-      }
-      const err = new Error(`Spark payment failed after dispatch (outcome unknown): ${detail}`, { cause: e });
+      const err = new Error(`Spark payment failed after dispatch (outcome unknown): ${safeErrorDetail(e)}`, {
+        cause: e,
+      });
       err.code = 'SPARK_DISPATCH_OUTCOME_UNKNOWN';
       err.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
       throw err;
     }
 
-    const payment = result && result.payment ? result.payment : result;
-    const rawStatus = String((payment && payment.status) || 'SUBMITTED');
-    const lower = rawStatus.toLowerCase();
-
+    // The payment was dispatched; a poisoned resolved value (throwing getters
+    // on payment/status/details) would otherwise escape untagged and the
+    // caller would release the reservation. Decode failures after dispatch are
+    // outcome-unknown, same class as a thrown dispatch error.
+    let payment;
     let status;
-    if (lower === 'completed' || lower === 'success') status = 'SUCCESS';
-    else if (lower === 'pending' || lower === 'submitted') status = 'PENDING';
-    else if (lower === 'failed' || lower === 'failure') status = 'FAILURE';
-    else status = rawStatus; // unknown — preserved raw so the caller sees the truth
-
     let preimage = null;
-    const details = payment && payment.details;
-    if (details && details.type === 'lightning' && details.htlcDetails) {
-      preimage = details.htlcDetails.preimage || null;
+    try {
+      payment = result && result.payment ? result.payment : result;
+      const rawStatus = String((payment && payment.status) || 'SUBMITTED');
+      const lower = rawStatus.toLowerCase();
+
+      if (lower === 'completed' || lower === 'success') status = 'SUCCESS';
+      else if (lower === 'pending' || lower === 'submitted') status = 'PENDING';
+      else if (lower === 'failed' || lower === 'failure') status = 'FAILURE';
+      else status = rawStatus; // unknown — preserved raw so the caller sees the truth
+
+      const details = payment && payment.details;
+      if (details && details.type === 'lightning' && details.htlcDetails) {
+        preimage = details.htlcDetails.preimage || null;
+      }
+    } catch (e) {
+      const err = new Error(
+        `Spark payment result could not be decoded after dispatch (outcome unknown): ${safeErrorDetail(e)}`,
+        { cause: e },
+      );
+      err.code = 'SPARK_DISPATCH_OUTCOME_UNKNOWN';
+      err.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
+      throw err;
     }
 
     return { payment, status, preimage, feeSats };
@@ -91,7 +102,9 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
     try {
       await disconnect();
     } catch (e) {
-      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${e.message}`);
+      // safeErrorDetail: even the warning must not throw (a throwing getter on
+      // a fake/alternate connector's error would otherwise replace the result).
+      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${safeErrorDetail(e)}`);
     }
   }
 }

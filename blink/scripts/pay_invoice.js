@@ -32,7 +32,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
+const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
 const { budgetChargeFromInvoice } = require('./l402_discover');
 
 const PAY_INVOICE_MUTATION = `
@@ -119,18 +119,6 @@ async function main() {
     reservationId = reservation.id;
   }
 
-  const releaseReservationSafely = () => {
-    if (reservationId) {
-      try {
-        releaseReservation(reservationId);
-      } catch (e) {
-        // Not silent: a failed release strands the allowance — fail-closed is
-        // correct for the budget, but the operator must be told.
-        console.error(`Warning: could not release the budget reservation: ${e.message}`);
-      }
-    }
-  };
-
   const input = {
     walletId: wallet.id,
     paymentRequest,
@@ -167,14 +155,14 @@ async function main() {
         (e.message && e.message.toLowerCase().includes('self')),
     );
     if (isSelfPay) {
-      releaseReservationSafely();
+      releaseSpend(reservationId);
       throw new Error(
         'Cannot pay your own invoice (CANT_PAY_SELF). ' +
           'L402 round-trip testing requires a second Blink account or a separate wallet.',
       );
     }
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationSafely();
+    releaseSpend(reservationId);
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -189,39 +177,22 @@ async function main() {
     output.balanceBeforeFormatted = `$${(wallet.balance / 100).toFixed(2)}`;
   }
 
-  const recordOrFinalize = () => {
-    try {
-      if (reservationId) {
-        const outcome = finalizeOrRecord(reservationId, { sats: invoiceSats, command: 'pay-invoice', domain: null });
-        if (outcome === 'restored') {
-          console.error(
-            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-          );
-        }
-      } else {
-        recordSpend({ sats: invoiceSats, command: 'pay-invoice', domain: null });
-      }
-    } catch (e) {
-      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
-    }
-  };
-
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
     if (invoiceSats !== null) {
-      recordOrFinalize();
+      settleSpend({ reservationId, sats: invoiceSats, command: 'pay-invoice', domain: null });
     }
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
     if (invoiceSats !== null) {
-      recordOrFinalize();
+      settleSpend({ reservationId, sats: invoiceSats, command: 'pay-invoice', domain: null });
     }
   } else if (result.status === 'ALREADY_PAID') {
     console.error('Invoice was already paid.');
-    releaseReservationSafely();
+    releaseSpend(reservationId);
   } else {
     console.error(`Payment status: ${result.status}`);
-    releaseReservationSafely();
+    releaseSpend(reservationId);
   }
 
   console.log(JSON.stringify(output, null, 2));

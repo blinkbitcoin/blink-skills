@@ -58,14 +58,7 @@ const {
 
 const { saveToken, getToken } = require('./l402_store');
 
-const {
-  reserveBudget,
-  finalizeOrRecord,
-  releaseReservation,
-  recordSpend,
-  checkBudget,
-  checkDomainAllowed,
-} = require('./_budget');
+const { reserveBudget, checkBudget, checkDomainAllowed, settleSpend, releaseSpend } = require('./_budget');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -671,17 +664,6 @@ async function main() {
   let apiKey = null;
   let apiUrl = null;
   let wallet = null;
-  const releaseReservationSafely = () => {
-    if (reservationId) {
-      try {
-        releaseReservation(reservationId);
-      } catch (e) {
-        // Not silent: a failed release strands the allowance — fail-closed is
-        // correct for the budget, but the operator must be told.
-        console.error(`Warning: could not release the budget reservation: ${e.message}`);
-      }
-    }
-  };
 
   // ── Payment enforcement (fail closed) ──
   // A payment is about to be made: require an explicitly configured domain
@@ -734,7 +716,7 @@ async function main() {
 
   // ── Per-request max-amount check ──
   if (args.maxAmount !== null && budgetSats !== null && budgetSats > args.maxAmount) {
-    releaseReservationSafely();
+    releaseSpend(reservationId);
     const output = {
       event: 'l402_budget_exceeded',
       url: args.url,
@@ -820,7 +802,7 @@ async function main() {
         }
       } else {
         // Pre-dispatch failure (connect, prepare): nothing moved.
-        releaseReservationSafely();
+        releaseSpend(reservationId);
       }
       throw e;
     }
@@ -835,26 +817,30 @@ async function main() {
       // In flight: count it against the budget like the custodial PENDING
       // path, then surface the failure — no preimage yet, so no token.
       if (reservationId) {
-        try {
-          const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
-          if (outcome === 'restored') {
-            console.error(
-              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-            );
-          }
-        } catch (err) {
-          console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
-        }
+        settleSpend({ reservationId, sats: budgetSats, command: 'l402-pay', domain, label: 'the in-flight payment' });
         reservationId = null;
       } else {
-        releaseReservationSafely();
+        releaseSpend(reservationId);
       }
       throw new Error(`Payment not successful: status=${paymentStatus}`);
     }
+    if (paymentStatus === 'FAILURE') {
+      // The only post-dispatch status that proves nothing settled — the
+      // reservation is freed.
+      releaseSpend(reservationId);
+      throw new Error(`Payment not successful: status=${paymentStatus}`);
+    }
     if (paymentStatus !== 'SUCCESS') {
-      // Terminal failure (FAILURE or an unrecognized status) — nothing
-      // settled; free the budget.
-      releaseReservationSafely();
+      // Unknown post-dispatch status: the pinned SDK union is completed |
+      // pending | failed, but a future status may mean "still in flight" —
+      // keep the reservation fail-closed rather than freeing budget for a
+      // retry of a payment that may settle.
+      if (reservationId) {
+        console.error(
+          `Warning: unrecognized payment status '${paymentStatus}' after dispatch — the budget reservation stays in place ` +
+            '(fail-closed, auto-cleared by the 25h prune). Inspect spark-transactions before retrying.',
+        );
+      }
       throw new Error(`Payment not successful: status=${paymentStatus}`);
     }
     console.error('Payment successful!');
@@ -863,12 +849,8 @@ async function main() {
       // Funds moved — the budget must count them — but the L402 token cannot
       // be constructed without the preimage.
       if (reservationId) {
-        try {
-          finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
-          reservationId = null;
-        } catch (err) {
-          console.error(`Warning: could not record the spend in the budget log: ${err.message}`);
-        }
+        settleSpend({ reservationId, sats: budgetSats, command: 'l402-pay', domain });
+        reservationId = null;
       }
       throw new Error('Spark payment completed but the preimage was not returned — cannot build the L402 token.');
     }
@@ -879,13 +861,13 @@ async function main() {
     try {
       wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
     } catch (e) {
-      releaseReservationSafely();
+      releaseSpend(reservationId);
       throw e;
     }
     console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
 
     if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
-      releaseReservationSafely();
+      releaseSpend(reservationId);
       throw new Error('Insufficient balance: BTC wallet has 0 sats.');
     }
 
@@ -938,7 +920,7 @@ async function main() {
     if (payResult.errors && payResult.errors.length > 0) {
       // Explicit server-side rejection — nothing moved; the budget is freed.
       const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-      releaseReservationSafely();
+      releaseSpend(reservationId);
       throw new Error(`Payment failed: ${errMsg}`);
     }
 
@@ -947,19 +929,10 @@ async function main() {
       // commands do, then surface the failure — the preimage will not resolve.
       // Same warn-on-restored / warn-on-throw accounting as the normal record path.
       if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
-        try {
-          const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
-          if (outcome === 'restored') {
-            console.error(
-              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-            );
-          }
-        } catch (err) {
-          console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
-        }
+        settleSpend({ reservationId, sats: budgetSats, command: 'l402-pay', domain, label: 'the in-flight payment' });
         reservationId = null;
       } else {
-        releaseReservationSafely();
+        releaseSpend(reservationId);
       }
       throw new Error(`Payment not successful: status=${payResult.status}`);
     }
@@ -971,7 +944,7 @@ async function main() {
     // reservation instead of finalizing it (pay_invoice releases for the same
     // status; finalizing here would double-count the invoice against the budget).
     if (payResult.status === 'ALREADY_PAID') {
-      releaseReservationSafely();
+      releaseSpend(reservationId);
       reservationId = null;
     }
 
@@ -1037,20 +1010,7 @@ async function main() {
   // if the reservation was erased externally (e.g. by `budget reset`).
   // ALREADY_PAID is excluded above (nothing moved this invocation).
   if (budgetSats !== null && paymentStatus === 'SUCCESS') {
-    try {
-      if (reservationId) {
-        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
-        if (outcome === 'restored') {
-          console.error(
-            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-          );
-        }
-      } else {
-        recordSpend({ sats: budgetSats, command: 'l402-pay', domain });
-      }
-    } catch (err) {
-      console.error(`Warning: could not record spend: ${err.message}`);
-    }
+    settleSpend({ reservationId, sats: budgetSats, command: 'l402-pay', domain });
   }
 
   // ── Retry request with proof of payment ──

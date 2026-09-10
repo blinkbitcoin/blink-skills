@@ -582,6 +582,25 @@ function feeFromPrepare(prepareResponse) {
   return null;
 }
 
+/**
+ * Safely extract a human-readable detail from ANY thrown/rejected value.
+ * Property access and string coercion can both throw — a null-prototype
+ * object has no toString, and a Proxy may have throwing traps — so a warning
+ * built from `${e.message}` would itself throw and replace the real outcome
+ * (see l402_pay_spark.js's dispatch catch). Use this in every catch that
+ * must not throw.
+ *
+ * @param {*} value
+ * @returns {string}
+ */
+function safeErrorDetail(value) {
+  try {
+    return value && typeof value.message === 'string' ? value.message : String(value);
+  } catch {
+    return '(non-coercible error value)';
+  }
+}
+
 module.exports = {
   SPARK_PACKAGE,
   DEFAULT_NETWORK,
@@ -597,6 +616,7 @@ module.exports = {
   normalizeInfo,
   normalizeSdkValue,
   feeFromPrepare,
+  safeErrorDetail,
   waitForStableBalance,
   normalizePayment,
 };

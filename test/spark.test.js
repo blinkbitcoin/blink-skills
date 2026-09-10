@@ -627,6 +627,7 @@ describe('spark_send main() destination routing', () => {
           return { sdk: fakeSdk, disconnect: async () => {} };
         },
         feeFromPrepare: spark.feeFromPrepare,
+        safeErrorDetail: spark.safeErrorDetail,
       },
     };
     // Force spark_send to be re-required so it binds to the mocked connect.
@@ -821,6 +822,7 @@ describe('spark_send budget integration', () => {
           return { sdk: fakeSdk, disconnect: async () => {} };
         },
         feeFromPrepare: spark.feeFromPrepare,
+        safeErrorDetail: spark.safeErrorDetail,
       },
     };
     delete require.cache[sparkSendPath];
@@ -862,37 +864,56 @@ describe('spark_send budget integration', () => {
   }
 
   it('a failed budget-log recording warns on stderr but never masks the payment', async () => {
+    // Real path: this test holds the budget lock while the command runs, so
+    // settleSpend's recordSpend times out and must surface a warning — the
+    // payment result is unaffected.
     installMock({});
-    const savedRecord = budget.recordSpend;
-    budget.recordSpend = () => {
-      throw new Error('disk full');
-    };
+    budget.setLockTiming({ acquireTimeoutMs: 60 });
+    const token = budget.acquireLogLock();
     try {
       const out = await runMain(['lnbc100n1p...', '100']);
       assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
       assert.ok(!process.exitCode);
-      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+      assert.match(lastErr, /could not record the spend in the budget log.*Timed out/s);
     } finally {
-      budget.recordSpend = savedRecord;
+      budget.releaseLogLock(token);
+      budget.setLockTiming({ acquireTimeoutMs: 2000 });
     }
   });
 
   it('a failed finalization leaves the reservation counting (fail-closed) and warns', async () => {
+    // Real path: the lock is held only for the finalize window (grabbing it
+    // earlier would block the reservation itself), so finalizeOrRecord times
+    // out and settleSpend warns; the reservation stays fail-closed.
     budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
     installMock({});
-    const savedFinalize = budget.finalizeOrRecord;
-    budget.finalizeOrRecord = () => {
-      throw new Error('disk full');
+    budget.setLockTiming({ acquireTimeoutMs: 60 });
+    let token = null;
+    // Hook: hold the lock once the reservation exists (send time).
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    const held = require.cache[sdkPath].exports;
+    const origConnect = held.connect;
+    held.connect = async (opts) => {
+      const r = await origConnect(opts);
+      const sdk = r.sdk;
+      const origSend = sdk.sendPayment.bind(sdk);
+      sdk.sendPayment = async (req) => {
+        token = budget.acquireLogLock(); // reservation already exists now
+        return origSend(req);
+      };
+      return { sdk, disconnect: r.disconnect };
     };
     try {
       const out = await runMain(['lnbc100n1p...', '100']);
       assert.equal(JSON.parse(out).status, 'COMPLETED', 'the payment result is still emitted');
-      assert.match(lastErr, /could not record the spend in the budget log.*disk full/s);
+      assert.match(lastErr, /could not record the spend in the budget log.*Timed out/s);
       const log = budget.readLog();
       assert.equal(log.length, 1);
       assert.equal(log[0].state, 'reserved', 'the orphaned reservation must keep blocking the budget');
     } finally {
-      budget.finalizeOrRecord = savedFinalize;
+      if (token) budget.releaseLogLock(token);
+      held.connect = origConnect;
+      budget.setLockTiming({ acquireTimeoutMs: 2000 });
     }
   });
 
