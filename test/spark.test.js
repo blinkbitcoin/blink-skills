@@ -626,6 +626,7 @@ describe('spark_send main() destination routing', () => {
         async connect() {
           return { sdk: fakeSdk, disconnect: async () => {} };
         },
+        feeFromPrepare: spark.feeFromPrepare,
       },
     };
     // Force spark_send to be re-required so it binds to the mocked connect.
@@ -819,6 +820,7 @@ describe('spark_send budget integration', () => {
         async connect() {
           return { sdk: fakeSdk, disconnect: async () => {} };
         },
+        feeFromPrepare: spark.feeFromPrepare,
       },
     };
     delete require.cache[sparkSendPath];

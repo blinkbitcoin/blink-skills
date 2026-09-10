@@ -205,13 +205,16 @@ function parseArgs(argv) {
   let noStore = false;
   let force = false;
   let probe = false;
+  let spark = false;
   let body = null;
   const headers = {};
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
 
-    if (arg === '--wallet' && i + 1 < argv.length) {
+    if (arg === '--spark') {
+      spark = true;
+    } else if (arg === '--wallet' && i + 1 < argv.length) {
       walletCurrency = argv[++i].toUpperCase();
       if (!['BTC', 'USD'].includes(walletCurrency)) {
         console.error('Error: --wallet must be BTC or USD');
@@ -253,7 +256,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { url, walletCurrency, maxAmount, dryRun, method, noStore, force, probe, headers, body };
+  return { url, walletCurrency, maxAmount, dryRun, method, noStore, force, probe, spark, headers, body };
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -521,6 +524,7 @@ async function main() {
         canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
         status: res.status,
         tokenReused: true,
+        backend: cached.backend ?? null,
         satoshis: cached.satoshis ?? null,
         invoiceMsats: cached.invoiceMsats ?? null,
         budgetSats: cached.budgetSats ?? null,
@@ -629,14 +633,44 @@ async function main() {
     process.exit(1);
   }
 
+  // ── Payment backend selection ──
+  // --spark forces the self-custodial leg (Breez SDK signs locally). Without
+  // it, Spark is auto-selected when it is the only available wallet: no
+  // Blink API key, but a seed is present. Custodial remains the default.
+  // A dry-run dispatches nothing and loads no SDK, so it is credential-free
+  // for both backends — the checks below are skipped for it.
+  const hasBlinkKey = Boolean(process.env.BLINK_API_KEY);
+  const hasSparkSeed = Boolean(process.env.SPARK_MNEMONIC);
+  let sparkBackend = Boolean(args.spark);
+  if (!args.spark && !hasBlinkKey && hasSparkSeed) {
+    sparkBackend = true;
+    console.error('No BLINK_API_KEY — paying via the self-custodial (Spark) backend.');
+  }
+  if (sparkBackend && !args.dryRun) {
+    if (!hasSparkSeed) {
+      console.error('Error: the Spark backend requires SPARK_MNEMONIC.');
+      process.exit(1);
+    }
+    if (!process.env.BREEZ_API_KEY) {
+      console.error('Error: the Spark backend requires BREEZ_API_KEY (get one at breez.technology).');
+      process.exit(1);
+    }
+    if (args.walletCurrency === 'USD') {
+      console.error('Error: the Spark backend pays from the Spark wallet (BTC only); remove --wallet USD.');
+      process.exit(1);
+    }
+  }
+
   // Budget reservation state at function scope: the reservation happens inside
   // the enforcement block below, but the pay section that follows must be able
   // to finalize it (success) or release it (known failure) — and max-amount
   // refusals in between must release it too. Credentials are likewise resolved
-  // BEFORE the reservation so a missing key cannot orphan it.
+  // BEFORE the reservation (per backend) so a missing credential cannot orphan
+  // it.
   let reservationId = null;
   let apiKey = null;
   let apiUrl = null;
+  let wallet = null;
   const releaseReservationSafely = () => {
     if (reservationId) {
       try {
@@ -673,11 +707,15 @@ async function main() {
     // ── Budget reservation (fail closed for autonomous auto-pay) ──
     // The limit decision AND the reservation append happen under one lock, so
     // two concurrent payments can never both pass the same remaining budget.
-    // Credentials are resolved FIRST: a missing API key must not orphan the
-    // reservation (no payment is attempted in that case, so nothing should
-    // stay reserved).
-    apiKey = getApiKey();
-    apiUrl = getApiUrl();
+    // Credentials are resolved FIRST (per backend): a missing credential must
+    // not orphan the reservation — no payment is attempted in that case, so
+    // nothing should stay reserved. (Spark credential presence was validated
+    // at backend selection, before this reservation; connect() re-validates
+    // fully at dispatch.)
+    if (!sparkBackend) {
+      apiKey = getApiKey();
+      apiUrl = getApiUrl();
+    }
     const reservation = reserveBudget({ sats: budgetSats, command: 'l402-pay', domain }, { requireConfigured: true });
     if (!reservation.allowed) {
       const output = {
@@ -747,148 +785,232 @@ async function main() {
   }
 
   // ── Pay the invoice ──
-  // apiKey/apiUrl were resolved in the enforcement block above, before the
-  // reservation. Every throw between here and a successful payment must
-  // RELEASE the reservation when it happens before dispatch (setup failures)
-  // and KEEP it after dispatch (outcome unknown — the payment may settle).
-  let wallet;
-  let payData;
-  try {
-    wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
-  } catch (e) {
-    releaseReservationSafely();
-    throw e;
-  }
-  console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
-
-  if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
-    releaseReservationSafely();
-    throw new Error('Insufficient balance: BTC wallet has 0 sats.');
-  }
-
-  // ── Optional fee probe (--probe) ──
-  // Run lnInvoiceFeeProbe before paying to check the route exists.
-  // On failure: warn to stderr and continue — probe errors don't mean payment
-  // will fail (the probe is best-effort). On success: log estimated fee.
+  // Two payment backends:
+  //   custodial (default) — lnInvoicePaymentSend via the Blink API; the
+  //     preimage is resolved via the inline/ladder/placeholder fallbacks.
+  //   spark (--spark, or auto when no Blink key but a seed) — the Breez SDK
+  //     signs locally with the seed; the preimage comes back in the settled
+  //     payment's HTLC details.
+  // Both legs share the reservation semantics: setup failures RELEASE the
+  // reservation, outcome-unknown post-dispatch failures KEEP it, terminal
+  // failures release it, and success finalizes via the shared record below.
+  let paymentStatus = null;
+  let preimage = null;
   let feeProbeResult = null;
-  if (args.probe) {
-    console.error('Running fee probe...');
-    feeProbeResult = await runFeeProbe(challenge.invoice, {
-      walletId: wallet.id,
-      walletCurrency: args.walletCurrency,
-      apiKey,
-      apiUrl,
-    });
-    if (feeProbeResult.error) {
-      console.error(`Warning: fee probe failed (${feeProbeResult.error}) — proceeding with payment anyway.`);
-    } else {
-      console.error(
-        `Fee probe: estimated routing fee = ${feeProbeResult.estimatedFeeSats ?? 0} sats. Proceeding with payment.`,
-      );
-    }
-  }
+  const macaroon = challenge.macaroon;
 
-  console.error(`Paying ${satoshis ?? '?'} sats via Blink...`);
-
-  try {
-    payData = await graphqlRequest({
-      query: PAY_INVOICE_MUTATION,
-      variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
-      apiKey,
-      apiUrl,
-      timeoutMs: MUTATION_TIMEOUT_MS,
-    });
-  } catch (e) {
-    // Outcome-unknown after dispatch (timeout, lost response, transport
-    // reset): the payment may still settle, so the reservation STAYS —
-    // freeing it would let another auto-pay double-spend the same window.
-    if (reservationId) {
-      console.error(
-        `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
-          `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
-      );
-    }
-    throw e;
-  }
-
-  const payResult = payData.lnInvoicePaymentSend;
-
-  if (payResult.errors && payResult.errors.length > 0) {
-    // Explicit server-side rejection — nothing moved; the budget is freed.
-    const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationSafely();
-    throw new Error(`Payment failed: ${errMsg}`);
-  }
-
-  if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
-    // PENDING is in flight: count it against the budget like the one-shot pay
-    // commands do, then surface the failure — the preimage will not resolve.
-    // Same warn-on-restored / warn-on-throw accounting as the normal record path.
-    if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
-      try {
-        const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
-        if (outcome === 'restored') {
+  if (sparkBackend) {
+    // ── Spark (self-custodial) backend ──
+    const { payInvoiceViaSpark } = require('./l402_pay_spark');
+    console.error(`Paying ${budgetSats} sats via Spark (self-custodial, signs locally)...`);
+    let spark;
+    try {
+      spark = await payInvoiceViaSpark(challenge.invoice, {
+        network: process.env.SPARK_NETWORK || 'mainnet',
+      });
+    } catch (e) {
+      if (e.stage === 'dispatch') {
+        // Outcome unknown — the payment may still settle. Keep the
+        // reservation (fail-closed) rather than freeing it for a retry.
+        if (reservationId) {
           console.error(
-            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+            'Warning: payment outcome is unknown after this error, so the budget reservation stays in place ' +
+              '(fail-closed, auto-cleared by the 25h prune). Inspect spark-transactions before retrying.',
           );
         }
-      } catch (err) {
-        console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
+      } else {
+        // Pre-dispatch failure (connect, prepare): nothing moved.
+        releaseReservationSafely();
       }
-      reservationId = null;
-    } else {
-      releaseReservationSafely();
+      throw e;
     }
-    throw new Error(`Payment not successful: status=${payResult.status}`);
-  }
+    // Status was normalized at the backend boundary (completed→SUCCESS,
+    // pending→PENDING, failed→FAILURE; unknown passes raw).
+    paymentStatus = spark.status;
+    if (spark.feeSats !== null) {
+      feeProbeResult = { estimatedFeeSats: spark.feeSats, error: null };
+    }
 
-  console.error(`Payment ${payResult.status === 'ALREADY_PAID' ? 'already paid' : 'successful'}!`);
+    if (paymentStatus === 'PENDING') {
+      // In flight: count it against the budget like the custodial PENDING
+      // path, then surface the failure — no preimage yet, so no token.
+      if (reservationId) {
+        try {
+          const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
+          if (outcome === 'restored') {
+            console.error(
+              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+            );
+          }
+        } catch (err) {
+          console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
+        }
+        reservationId = null;
+      } else {
+        releaseReservationSafely();
+      }
+      throw new Error(`Payment not successful: status=${paymentStatus}`);
+    }
+    if (paymentStatus !== 'SUCCESS') {
+      // Terminal failure (FAILURE or an unrecognized status) — nothing
+      // settled; free the budget.
+      releaseReservationSafely();
+      throw new Error(`Payment not successful: status=${paymentStatus}`);
+    }
+    console.error('Payment successful!');
+    preimage = spark.preimage;
+    if (!preimage) {
+      // Funds moved — the budget must count them — but the L402 token cannot
+      // be constructed without the preimage.
+      if (reservationId) {
+        try {
+          finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
+          reservationId = null;
+        } catch (err) {
+          console.error(`Warning: could not record the spend in the budget log: ${err.message}`);
+        }
+      }
+      throw new Error('Spark payment completed but the preimage was not returned — cannot build the L402 token.');
+    }
+    console.error('Preimage received from the Spark payment details.');
+  } else {
+    // ── Custodial backend (Blink API) ──
+    let payData;
+    try {
+      wallet = await getWallet({ apiKey, apiUrl, currency: args.walletCurrency });
+    } catch (e) {
+      releaseReservationSafely();
+      throw e;
+    }
+    console.error(`Using ${args.walletCurrency} wallet ${wallet.id} (balance: ${formatBalance(wallet)})`);
 
-  // ALREADY_PAID means THIS invocation moved no funds — release the current
-  // reservation instead of finalizing it (pay_invoice releases for the same
-  // status; finalizing here would double-count the invoice against the budget).
-  if (payResult.status === 'ALREADY_PAID') {
-    releaseReservationSafely();
-    reservationId = null;
-  }
+    if (args.walletCurrency === 'BTC' && wallet.balance === 0) {
+      releaseReservationSafely();
+      throw new Error('Insufficient balance: BTC wallet has 0 sats.');
+    }
 
-  // ── Resolve preimage ──
-  // Option A (primary): preImage returned inline via settlementVia in the mutation response.
-  // Option B (fallback): second query to transactions, match by paymentHash.
-  //   Covers edge cases where inline resolution is unavailable (race condition, network issue).
-  // Option C (last resort): SHA-256(invoice) placeholder — works with non-strict servers only.
-  let preimage = payResult.transaction?.settlementVia?.preImage ?? null;
-  const paymentHash = payResult.transaction?.initiationVia?.paymentHash ?? null;
-
-  if (preimage) {
-    console.error('Preimage received inline from payment response.');
-  } else if (paymentHash) {
-    console.error(`Fetching preimage via transactions query (paymentHash: ${paymentHash.slice(0, 16)}…)`);
-    // Poll for up to ~5 seconds (5 attempts × 1 s delay) — the Blink API may
-    // not index the settlement immediately after the mutation returns SUCCESS.
-    for (let attempt = 1; attempt <= 5 && !preimage; attempt++) {
-      preimage = await fetchPreimageByPaymentHash(paymentHash, {
+    // ── Optional fee probe (--probe) ──
+    // Run lnInvoiceFeeProbe before paying to check the route exists.
+    // On failure: warn to stderr and continue — probe errors don't mean payment
+    // will fail (the probe is best-effort). On success: log estimated fee.
+    if (args.probe) {
+      console.error('Running fee probe...');
+      feeProbeResult = await runFeeProbe(challenge.invoice, {
+        walletId: wallet.id,
+        walletCurrency: args.walletCurrency,
         apiKey,
         apiUrl,
-        walletId: wallet.id,
       });
-      if (!preimage && attempt < 5) {
-        console.error(`Preimage not yet indexed (attempt ${attempt}/5), retrying in 1s...`);
-        await new Promise((r) => setTimeout(r, 1000));
+      if (feeProbeResult.error) {
+        console.error(`Warning: fee probe failed (${feeProbeResult.error}) — proceeding with payment anyway.`);
+      } else {
+        console.error(
+          `Fee probe: estimated routing fee = ${feeProbeResult.estimatedFeeSats ?? 0} sats. Proceeding with payment.`,
+        );
       }
     }
+
+    console.error(`Paying ${satoshis ?? '?'} sats via Blink...`);
+
+    try {
+      payData = await graphqlRequest({
+        query: PAY_INVOICE_MUTATION,
+        variables: { input: { walletId: wallet.id, paymentRequest: challenge.invoice } },
+        apiKey,
+        apiUrl,
+        timeoutMs: MUTATION_TIMEOUT_MS,
+      });
+    } catch (e) {
+      // Outcome-unknown after dispatch (timeout, lost response, transport
+      // reset): the payment may still settle, so the reservation STAYS —
+      // freeing it would let another auto-pay double-spend the same window.
+      if (reservationId) {
+        console.error(
+          `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
+            `(fail-closed, auto-cleared by the 25h prune). Inspect \`transactions\` before retrying.`,
+        );
+      }
+      throw e;
+    }
+
+    const payResult = payData.lnInvoicePaymentSend;
+
+    if (payResult.errors && payResult.errors.length > 0) {
+      // Explicit server-side rejection — nothing moved; the budget is freed.
+      const errMsg = payResult.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
+      releaseReservationSafely();
+      throw new Error(`Payment failed: ${errMsg}`);
+    }
+
+    if (payResult.status !== 'SUCCESS' && payResult.status !== 'ALREADY_PAID') {
+      // PENDING is in flight: count it against the budget like the one-shot pay
+      // commands do, then surface the failure — the preimage will not resolve.
+      // Same warn-on-restored / warn-on-throw accounting as the normal record path.
+      if (payResult.status === 'PENDING' && reservationId && satoshis !== null) {
+        try {
+          const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
+          if (outcome === 'restored') {
+            console.error(
+              'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
+            );
+          }
+        } catch (err) {
+          console.error(`Warning: could not record the in-flight payment in the budget log: ${err.message}`);
+        }
+        reservationId = null;
+      } else {
+        releaseReservationSafely();
+      }
+      throw new Error(`Payment not successful: status=${payResult.status}`);
+    }
+
+    console.error(`Payment ${payResult.status === 'ALREADY_PAID' ? 'already paid' : 'successful'}!`);
+    paymentStatus = payResult.status;
+
+    // ALREADY_PAID means THIS invocation moved no funds — release the current
+    // reservation instead of finalizing it (pay_invoice releases for the same
+    // status; finalizing here would double-count the invoice against the budget).
+    if (payResult.status === 'ALREADY_PAID') {
+      releaseReservationSafely();
+      reservationId = null;
+    }
+
+    // ── Resolve preimage ──
+    // Option A (primary): preImage returned inline via settlementVia in the mutation response.
+    // Option B (fallback): second query to transactions, match by paymentHash.
+    //   Covers edge cases where inline resolution is unavailable (race condition, network issue).
+    // Option C (last resort): SHA-256(invoice) placeholder — works with non-strict servers only.
+    preimage = payResult.transaction?.settlementVia?.preImage ?? null;
+    const paymentHash = payResult.transaction?.initiationVia?.paymentHash ?? null;
+
     if (preimage) {
-      console.error('Preimage resolved via transactions query.');
+      console.error('Preimage received inline from payment response.');
+    } else if (paymentHash) {
+      console.error(`Fetching preimage via transactions query (paymentHash: ${paymentHash.slice(0, 16)}…)`);
+      // Poll for up to ~5 seconds (5 attempts × 1 s delay) — the Blink API may
+      // not index the settlement immediately after the mutation returns SUCCESS.
+      for (let attempt = 1; attempt <= 5 && !preimage; attempt++) {
+        preimage = await fetchPreimageByPaymentHash(paymentHash, {
+          apiKey,
+          apiUrl,
+          walletId: wallet.id,
+        });
+        if (!preimage && attempt < 5) {
+          console.error(`Preimage not yet indexed (attempt ${attempt}/5), retrying in 1s...`);
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+      if (preimage) {
+        console.error('Preimage resolved via transactions query.');
+      } else {
+        console.error('Warning: preimage not available after 5 attempts. Using placeholder (non-strict servers only).');
+        preimage = derivePreimageFromInvoice(challenge.invoice);
+      }
     } else {
-      console.error('Warning: preimage not available after 5 attempts. Using placeholder (non-strict servers only).');
+      console.error('Warning: paymentHash not returned by API. Using preimage placeholder (non-strict servers only).');
       preimage = derivePreimageFromInvoice(challenge.invoice);
     }
-  } else {
-    console.error('Warning: paymentHash not returned by API. Using preimage placeholder (non-strict servers only).');
-    preimage = derivePreimageFromInvoice(challenge.invoice);
   }
-
-  const macaroon = challenge.macaroon;
 
   // ── Save token to store ──
   if (!args.noStore) {
@@ -900,6 +1022,7 @@ async function main() {
         satoshis: satoshis ?? null,
         invoiceMsats: charge.msats,
         budgetSats,
+        backend: sparkBackend ? 'spark' : 'custodial',
       });
       console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
@@ -913,7 +1036,7 @@ async function main() {
   // complete for unconfigured users too. finalizeOrRecord restores the entry
   // if the reservation was erased externally (e.g. by `budget reset`).
   // ALREADY_PAID is excluded above (nothing moved this invocation).
-  if (budgetSats !== null && payResult.status === 'SUCCESS') {
+  if (budgetSats !== null && paymentStatus === 'SUCCESS') {
     try {
       if (reservationId) {
         const outcome = finalizeOrRecord(reservationId, { sats: budgetSats, command: 'l402-pay', domain });
@@ -957,9 +1080,9 @@ async function main() {
     url: args.url,
     canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
     format: challenge.format,
-    paymentStatus: payResult.status,
-    walletId: wallet.id,
-    walletCurrency: args.walletCurrency,
+    backend: sparkBackend ? 'spark' : 'custodial',
+    paymentStatus,
+    ...(sparkBackend ? {} : { walletId: wallet.id, walletCurrency: args.walletCurrency }),
     satoshis: satoshis ?? null,
     invoiceMsats: charge.msats,
     budgetSats,
@@ -996,10 +1119,22 @@ function derivePreimageFromInvoice(invoice) {
 }
 
 if (require.main === module) {
-  main().catch((e) => {
-    console.error('Error:', e.message);
-    process.exit(1);
-  });
+  main()
+    .then(async () => {
+      // The Breez SDK (spark backend) keeps event-loop handles open after
+      // disconnect; force a clean exit so direct invocation returns promptly.
+      // Drain stdout first — process.exit() can truncate a pending write when
+      // stdout is a pipe, and the JSON result is this command's whole product.
+      await new Promise((resolve) => {
+        if (process.stdout.writableLength === 0) return resolve();
+        process.stdout.write('', () => resolve());
+      });
+      process.exit(process.exitCode || 0);
+    })
+    .catch((e) => {
+      console.error('Error:', e.message);
+      process.exit(1);
+    });
 }
 
 module.exports = {

@@ -47,7 +47,7 @@
  * CAUTION: This signs and sends real bitcoin from a self-custodial wallet.
  */
 
-const { connect } = require('./_spark_sdk');
+const { connect, feeFromPrepare } = require('./_spark_sdk');
 const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
 
 function parseArgs(argv) {
@@ -74,37 +74,6 @@ function parseArgs(argv) {
     }
   }
   return { destination, amountSats, dryRun, force, network };
-}
-
-function feeFromPrepare(prepareResponse) {
-  // Fee location varies by destination type / SDK version:
-  //  - LNURL-pay prepare response:      top-level `feeSats`
-  //  - bolt11Invoice send method:       `lightningFeeSats` (+ optional `sparkTransferFeeSats`)
-  //  - sparkAddress send method:        `fee` (string)
-  //  - older builds:                    `feeSats` on paymentMethod
-  const has = (v) => v !== null && v !== undefined;
-  if (!has(prepareResponse)) return null;
-
-  // LNURL: top-level feeSats.
-  if (has(prepareResponse.feeSats)) return Number(prepareResponse.feeSats);
-
-  const pm = prepareResponse.paymentMethod;
-  if (!pm) return null;
-
-  if (has(pm.feeSats)) return Number(pm.feeSats);
-
-  // bolt11Invoice: lightning fee (+ spark transfer fee if the route uses Spark).
-  if (has(pm.lightningFeeSats)) {
-    return Number(pm.lightningFeeSats) + (has(pm.sparkTransferFeeSats) ? Number(pm.sparkTransferFeeSats) : 0);
-  }
-  if (has(pm.sparkTransferFeeSats)) return Number(pm.sparkTransferFeeSats);
-
-  // sparkAddress: `fee` (may be a string).
-  if (has(pm.fee)) {
-    const n = Number(pm.fee);
-    return Number.isNaN(n) ? null : n;
-  }
-  return null;
 }
 
 /**
@@ -365,7 +334,14 @@ async function main() {
       console.error(`Payment reported status '${status}'. Exiting non-zero.`);
     }
   } finally {
-    await disconnect();
+    // Cleanup must never mask the payment outcome: a disconnect rejection
+    // after dispatch would otherwise REPLACE the result (and its exit code)
+    // with an error, inviting a retry of an already-settled payment.
+    try {
+      await disconnect();
+    } catch (e) {
+      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${e.message}`);
+    }
   }
 }
 

@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.0.0
+version: 2.1.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.0.0'
+    version: '2.1.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -38,10 +38,10 @@ metadata:
     homepage: 'https://github.com/blinkbitcoin/blink-skills'
     security:
       secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
-      network: 'outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient''s address/callback hosts during SDK parse/prepare (before a budget rejection)'
-      filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command is used'
+      network: "outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands and l402-pay --spark; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient's address/callback hosts during SDK parse/prepare (before a budget rejection)"
+      filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command or l402-pay --spark is used'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
-      notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
+      notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands and l402-pay --spark: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command or l402-pay --spark is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
 ---
 
 # Blink Skill
@@ -67,12 +67,12 @@ commands). Key concepts:
 
 ## Environment
 
-- Requires `bash` and Node.js 18+ (Node 22+ for the non-custodial `spark-*` commands and for WebSocket subscriptions; Node 20+ can use `--experimental-websocket`).
+- Requires `bash` and Node.js 18+ (Node 22+ for the non-custodial `spark-*` commands, `l402-pay --spark`, and WebSocket subscriptions; Node 20+ can use `--experimental-websocket`).
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
-- **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`, and `l402-pay --spark`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+- **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and `l402-pay --spark`, and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
 
@@ -1124,20 +1124,26 @@ Known public L402 endpoints for testing (use specific paths, not root URLs):
 blink l402-pay <url> [options]
 ```
 
-Makes an HTTP request. If the server returns 402, automatically parses the challenge, pays the invoice via Blink, caches the token, and retries with the payment proof.
+Makes an HTTP request. If the server returns 402, automatically parses the challenge, pays the invoice, caches the token, and retries with the payment proof. Two payment backends:
+
+- **custodial (default)** — the invoice is paid via the Blink API (`lnInvoicePaymentSend`); requires `BLINK_API_KEY` with Write scope.
+- **spark** — the invoice is paid from the self-custodial (Spark) wallet via the Breez SDK (signs locally with the seed); requires `SPARK_MNEMONIC` + `BREEZ_API_KEY`, **no Blink API key**. The preimage comes back in the settled payment's HTLC details.
+
+Both backends share the same budget reservation/enforcement, token cache, and retry flow, and the output carries a `backend` field.
 
 - `url` — URL to access (required)
-- `--wallet BTC|USD` — wallet to pay from (default: BTC)
+- `--wallet BTC|USD` — wallet to pay from (default: BTC; custodial backend only)
+- `--spark` — pay from the self-custodial (Spark) wallet via the Breez SDK (BTC only). Auto-selected when no `BLINK_API_KEY` is set but `SPARK_MNEMONIC` is present
 - `--max-amount <sats>` — refuse to pay more than N sats (safety limit)
-- `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists
+- `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists; uses the same conservative charge as real execution
 - `--method GET|POST|PUT|DELETE|PATCH` — HTTP method (default: GET)
 - `--header key:value` — extra request header (repeatable)
 - `--body <string>` — request body for POST/PUT
 - `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`)
 - `--force` — pay even if a valid cached token exists
-- `--probe` — run a fee probe (`lnInvoiceFeeProbe`) before paying to estimate routing fees; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output
+- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there)
 
-**Requires Write scope on the API key.**
+**Requires Write scope on the API key (custodial backend) or `SPARK_MNEMONIC` + `BREEZ_API_KEY` (spark backend).**
 
 > **AGENT:** Always run with `--dry-run` first to show the satoshi cost to the user. Confirm the amount and target URL before executing without `--dry-run`.
 
@@ -1491,7 +1497,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **Outbound WSS** to `ws.blink.sv` (or `BLINK_WS_URL` override) for subscription WebSockets.
 - **L402 requests** go directly to the third-party URL you provide to `l402-discover` or `l402-pay`. The Blink API is contacted only when a payment is needed.
 - **LNURL receive** (`resolve-receiver`, `create-invoice-lnaddress`) contacts the Blink API host (`BLINK_API_URL`) for an **unauthenticated `accountDefaultWallet` classification probe**, then `blink.sv` and its LNURL service host `lnurl.blink.sv` — all allowlisted, every redirect re-validated. A transport/5xx failure of the probe aborts (`CUSTODIAL_PROBE_FAILED`) rather than assuming the recipient is non-custodial; only an authoritative "no such custodial account" answer falls through to LNURL. Blocking the GraphQL host therefore breaks both credential-free commands.
-- **`spark-*` commands** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). `spark-send` and `spark-fee-probe` with a Lightning Address or LNURL destination also contact the **recipient's LNURL service** — the address domain and its callback host — during SDK parse/prepare. Note this happens *before* a configured budget can reject an over-limit send. Signing happens locally; the seed never leaves the machine.
+- **`spark-*` commands and `l402-pay --spark`** additionally contact Breez/Spark infrastructure (authenticated with `BREEZ_API_KEY`). `l402-pay --spark` contacts the target resource's host (any URL you provide) plus Breez/Spark for the payment. `spark-send` and `spark-fee-probe` with a Lightning Address or LNURL destination also contact the **recipient's LNURL service** — the address domain and its callback host — during SDK parse/prepare. Note this happens _before_ a configured budget can reject an over-limit send. Signing happens locally; the seed never leaves the machine.
 - **No other network calls** beyond those listed here. Scripts do not phone home, send telemetry, or contact any undisclosed third-party services.
 
 ### Filesystem Access
@@ -1500,7 +1506,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 - **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
 - **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimages for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
 - **Budget files:** Budget config at `~/.blink/budget.json` and spending log at `~/.blink/spending-log.json`. The spending log is auto-pruned (entries older than 25h removed). Use `blink budget reset` to clear the log.
-- **Spark SDK state:** `spark-*` commands write Breez SDK wallet state to `~/.blink/spark/<network>-<hash>` (the directory name is a non-reversible sha256 prefix of the seed). Delete the directory to remove all local state.
+- **Spark SDK state:** `spark-*` commands and `l402-pay --spark` write Breez SDK wallet state to `~/.blink/spark/<network>-<hash>` (the directory name is a non-reversible sha256 prefix of the seed). Delete the directory to remove all local state.
 
 ### Stateless Design
 

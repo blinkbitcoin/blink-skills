@@ -1302,6 +1302,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   const storePath = path.join(scriptsDir, 'l402_store.js');
   const budgetPath = path.join(scriptsDir, '_budget.js');
   const clientPath = path.resolve(__dirname, '..', 'blink', 'scripts', '_blink_client.js');
+  const sparkPayPath = path.join(scriptsDir, 'l402_pay_spark.js');
 
   const BLINK_API = 'https://api.test.blink.sv/graphql';
   // lnbc1000u = 100_000 sats
@@ -1341,6 +1342,11 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     // developer's real files, and starts unconfigured for every test.
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-enforce-'));
     os.homedir = () => tmpDir;
+    // Re-bind the budget module to this test's tmpDir: BLINK_DIR resolves
+    // os.homedir() at module load, and a file-load-time instance (bound to
+    // the real home) would otherwise leak across tests — reading and writing
+    // the developer's real spending log.
+    delete require.cache[require.resolve(budgetPath)];
     delete process.env.BLINK_BUDGET_HOURLY_SATS;
     delete process.env.BLINK_BUDGET_DAILY_SATS;
     delete process.env.BLINK_L402_ALLOWED_DOMAINS;
@@ -1356,7 +1362,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     } catch {
       /* best-effort */
     }
-    for (const p of [payPath, discoverPath, storePath, budgetPath, clientPath]) {
+    for (const p of [payPath, discoverPath, storePath, budgetPath, clientPath, sparkPayPath]) {
       delete require.cache[require.resolve(p)];
     }
   });
@@ -1776,6 +1782,386 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       assert.deepEqual(readSpendLog(), [], 'no payment was attempted, so nothing may stay reserved');
     } finally {
       process.env.BLINK_API_KEY = savedKey;
+    }
+  });
+
+  // ── spark backend (--spark / auto-selection) ─────────────────────────────
+
+  const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
+
+  /** Replace _spark_sdk with a fake whose sendPayment outcome is driven by opts. */
+  function installSparkBackend({
+    status = 'completed',
+    throwOnSend = false,
+    rejectWith,
+    withPreimage = true,
+    rejectOnDisconnect = false,
+  } = {}) {
+    const fakeSdk = {
+      async parse() {
+        return { type: 'bolt11Invoice' };
+      },
+      async prepareSendPayment() {
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 1 } };
+      },
+      async sendPayment() {
+        if (throwOnSend) throw new Error('network timeout after dispatch');
+        if (rejectWith !== undefined) return Promise.reject(rejectWith);
+        const settled = String(status).toLowerCase() === 'completed' && withPreimage;
+        const details = settled
+          ? {
+              type: 'lightning',
+              invoice: INVOICE_100K,
+              htlcDetails: { paymentHash: 'b'.repeat(64), preimage: 'c'.repeat(64), status: 'preimageShared' },
+            }
+          : undefined;
+        return { payment: { id: 'spark-1', status, amount: 100000n, fees: 1n, details } };
+      },
+    };
+    require.cache[sparkSdkPath] = {
+      id: sparkSdkPath,
+      filename: sparkSdkPath,
+      loaded: true,
+      exports: {
+        async connect() {
+          return {
+            sdk: fakeSdk,
+            disconnect: async () => {
+              if (rejectOnDisconnect) throw new Error('disconnect failed after settlement');
+            },
+          };
+        },
+        normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
+        normalizeSdkValue: (v) => v,
+        // l402_pay_spark imports this from _spark_sdk (which this fake replaces).
+        feeFromPrepare: require('../blink/scripts/_spark_sdk').feeFromPrepare,
+        async waitForStableBalance() {
+          return { balanceSats: 0, stable: true };
+        },
+      },
+    };
+    // l402_pay_spark binds _spark_sdk at require time — bust it so the fresh
+    // l402_pay require chain picks up this test's fake.
+    delete require.cache[sparkPayPath];
+    const payPath2 = path.join(scriptsDir, 'l402_pay.js');
+    delete require.cache[payPath2];
+  }
+
+  afterEach(() => {
+    delete process.env.SPARK_MNEMONIC;
+    delete process.env.BREEZ_API_KEY;
+    delete require.cache[sparkSdkPath];
+  });
+
+  it('a spark SUCCESS pays via the SDK, extracts the preimage, and finalizes the budget', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'SUCCESS' });
+    installSparkBackend({ status: 'completed' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.equal(code, null, 'full flow completes without a forced exit');
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.backend, 'spark');
+    assert.equal(out.paymentStatus, 'SUCCESS');
+    assert.equal(out.budgetSats, 100000);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 100000);
+    assert.equal(log[0].state, undefined, 'finalized — not still reserved');
+  });
+
+  it('an outcome-unknown spark send error keeps the reservation (fail-closed)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ throwOnSend: true });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1, 'outcome unknown — the budget must stay blocked');
+    assert.equal(log[0].state, 'reserved');
+  });
+
+  it('normalizes the SDK contract status "completed" (lowercase) to a successful payment', async () => {
+    // The HIGH regression: the pinned SDK types PaymentStatus as lowercase —
+    // an uppercase-only comparison rejected a REAL successful payment after
+    // funds moved.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'SUCCESS' });
+    installSparkBackend({ status: 'completed' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.backend, 'spark');
+    assert.equal(out.paymentStatus, 'SUCCESS');
+    const log = readSpendLog();
+    assert.equal(log[0].state, undefined, 'finalized — the settled payment counts');
+  });
+
+  it('an exact SDK "failed" status releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'failed' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), [], 'nothing settled — the budget is freed');
+  });
+
+  it('an unrecognized SDK status releases the reservation and surfaces raw', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'zzzUnknown' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  // ── disconnect rejection must never mask the payment outcome (HIGH fix) ───
+
+  it('a completed payment SURVIVES a disconnect rejection: finalized, not released', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'SUCCESS' });
+    installSparkBackend({ status: 'completed', rejectOnDisconnect: true });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.equal(code, null, 'the settled payment must still succeed');
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, undefined, 'finalized — funds moved, the budget counts them');
+  });
+
+  it('a PENDING payment survives a disconnect rejection: finalized at the ceil charge', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'PENDING' });
+    installSparkBackend({ status: 'pending', rejectOnDisconnect: true });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0, 'no preimage — the failure still surfaces');
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, undefined, 'the in-flight payment counts (finalized)');
+  });
+
+  it('a failed payment with a disconnect rejection still releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'failed', rejectOnDisconnect: true });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), [], 'nothing settled — the budget is freed');
+  });
+
+  it('a send error with a disconnect rejection keeps the reservation (tag survives)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'COMPLETED', throwOnSend: true, rejectOnDisconnect: true });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'outcome unknown — fail-closed');
+  });
+
+  it('a completed payment without a preimage finalizes the budget but fails the flow', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mockPayment({ status: 'SUCCESS' });
+    installSparkBackend({ status: 'completed', withPreimage: false });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0, 'no preimage — the L402 token cannot be built');
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, undefined, 'funds moved — the budget must count them');
+  });
+
+  it('a PRIMITIVE (string) post-dispatch rejection keeps the reservation (fail-closed)', async () => {
+    // Promises may reject with arbitrary values; a string would silently drop
+    // an attached stage marker, misreading post-dispatch as pre-dispatch.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: 'transport reset' });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'outcome unknown — the reservation must stay');
+  });
+
+  it('a NON-EXTENSIBLE post-dispatch rejection keeps the reservation (fail-closed)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: Object.freeze({ note: 'frozen rejection' }) });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'outcome unknown — the reservation must stay');
+  });
+
+  it('a NON-STRING-COERCIBLE (null-prototype frozen) post-dispatch rejection keeps the reservation', async () => {
+    // String(Object.freeze(Object.create(null))) throws — a wrapper that
+    // coerces before tagging would produce an untagged TypeError instead.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ rejectWith: Object.freeze(Object.create(null)) });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'the typed error must be constructed for ANY rejection value');
+  });
+
+  it('payInvoiceViaSpark wraps any rejection value with code/stage/cause metadata', async () => {
+    const frozenNullProto = Object.freeze(Object.create(null));
+    installSparkBackend({ rejectWith: frozenNullProto });
+    const legPath = path.join(scriptsDir, 'l402_pay_spark.js');
+    delete require.cache[legPath];
+    const { payInvoiceViaSpark } = require(legPath);
+    await assert.rejects(
+      () => payInvoiceViaSpark('lnbc1000u1p0x', { network: 'regtest' }),
+      (e) => {
+        assert.equal(e.code, 'SPARK_DISPATCH_OUTCOME_UNKNOWN');
+        assert.equal(e.stage, 'dispatch');
+        assert.equal(e.cause, frozenNullProto, 'the original rejection value is preserved as cause');
+        return true;
+      },
+    );
+  });
+
+  it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {
+    configureAutoPay();
+    const savedKey = process.env.BREEZ_API_KEY;
+    delete process.env.BREEZ_API_KEY;
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    try {
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+      assert.notEqual(code, 0);
+      assert.deepEqual(readSpendLog(), [], 'no payment attempted — nothing reserved');
+    } finally {
+      if (savedKey === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = savedKey;
+    }
+  });
+
+  it('--wallet USD with the spark backend is rejected (BTC only)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({});
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark', '--wallet', 'USD']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a credential-free --spark --dry-run previews without any credentials', async () => {
+    const saved = {
+      key: process.env.BLINK_API_KEY,
+      seed: process.env.SPARK_MNEMONIC,
+      breez: process.env.BREEZ_API_KEY,
+    };
+    delete process.env.BLINK_API_KEY;
+    delete process.env.SPARK_MNEMONIC;
+    delete process.env.BREEZ_API_KEY;
+    try {
+      configureAutoPay();
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run', '--spark']);
+      assert.equal(code, null, 'dry-run never dispatches, so it needs no credentials');
+      const out = output();
+      assert.equal(out.event, 'l402_dry_run');
+      assert.equal(out.budgetSats, 100000);
+    } finally {
+      if (saved.key === undefined) delete process.env.BLINK_API_KEY;
+      else process.env.BLINK_API_KEY = saved.key;
+      if (saved.seed === undefined) delete process.env.SPARK_MNEMONIC;
+      else process.env.SPARK_MNEMONIC = saved.seed;
+      if (saved.breez === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = saved.breez;
+    }
+  });
+
+  it('an auto-selected credential-free spark --dry-run still previews', async () => {
+    // No Blink key, but a seed: the spark backend is auto-selected for the
+    // preview even without BREEZ_API_KEY — dry-run dispatches nothing.
+    const savedKey = process.env.BLINK_API_KEY;
+    const savedBreez = process.env.BREEZ_API_KEY;
+    delete process.env.BLINK_API_KEY;
+    delete process.env.BREEZ_API_KEY;
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    try {
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--dry-run']);
+      assert.equal(code, null);
+      assert.equal(output().event, 'l402_dry_run');
+    } finally {
+      if (savedKey === undefined) delete process.env.BLINK_API_KEY;
+      else process.env.BLINK_API_KEY = savedKey;
+      if (savedBreez === undefined) delete process.env.BREEZ_API_KEY;
+      else process.env.BREEZ_API_KEY = savedBreez;
+    }
+  });
+
+  it('auto-selects the spark backend when no Blink key exists but a seed is present', async () => {
+    configureAutoPay();
+    const savedKey = process.env.BLINK_API_KEY;
+    delete process.env.BLINK_API_KEY;
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    try {
+      mockPayment({ status: 'SUCCESS' });
+      installSparkBackend({ status: 'completed' });
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+      assert.equal(code, null);
+      const out = output();
+      assert.equal(out.backend, 'spark', 'auto-selected when Spark is the only wallet');
+    } finally {
+      if (savedKey === undefined) delete process.env.BLINK_API_KEY;
+      else process.env.BLINK_API_KEY = savedKey;
+    }
+  });
+
+  it('--spark without credentials fails before reserving (no orphan)', async () => {
+    configureAutoPay();
+    const savedSeed = process.env.SPARK_MNEMONIC;
+    delete process.env.SPARK_MNEMONIC;
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    try {
+      mock402(INVOICE_100K);
+      installSparkBackend({});
+      const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+      assert.notEqual(code, 0);
+      assert.deepEqual(readSpendLog(), [], 'no payment was attempted, so nothing may stay reserved');
+    } finally {
+      if (savedSeed === undefined) delete process.env.SPARK_MNEMONIC;
+      else process.env.SPARK_MNEMONIC = savedSeed;
     }
   });
 

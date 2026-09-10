@@ -456,6 +456,152 @@ describe('CLI: budget reset through the public dispatcher', () => {
   });
 });
 
+// ── l402-pay --spark through the public CLI (forceExit + full flow) ─────────
+
+describe('CLI: l402-pay --spark lifecycle', () => {
+  const http = require('node:http');
+
+  /** Local server: 402 challenge without auth, 200 JSON with it. */
+  function startServer() {
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        if (req.headers.authorization) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(402, {
+          'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"',
+        });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => server);
+  }
+
+  function seededHome(budget) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-l402-'));
+    fs.mkdirSync(path.join(home, '.blink'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.blink', 'budget.json'), JSON.stringify(budget), 'utf8');
+    return home;
+  }
+
+  it('pays via the spark backend, retries, and terminates promptly (forceExit)', async () => {
+    const server = await startServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const { address, port } = server.address();
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout) => resolve({ err, stdout }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'must terminate promptly — the SDK must not hang the CLI');
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.backend, 'spark');
+      assert.equal(j.paymentStatus, 'SUCCESS');
+      const log = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'spending-log.json'), 'utf8'));
+      assert.equal(log.length, 1);
+      assert.equal(log[0].sats, 100000);
+      assert.equal(log[0].state, undefined, 'finalized spend');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('direct node invocation of l402_pay.js terminates promptly after a spark payment', async () => {
+    // The require.main runner path (not bin/blink.js) — the SDK's event-loop
+    // handles must not hang a direct spark invocation after output is printed.
+    const server = await startServer();
+    const { address, port } = server.address();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const scriptPath = path.resolve(__dirname, '..', 'blink', 'scripts', 'l402_pay.js');
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, scriptPath, `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout, stderr) =>
+            resolve({ err, code: err ? (err.code === undefined ? 1 : err.code) : 0, stdout, stderr }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'direct invocation must terminate promptly');
+      assert.equal(result.code, 0);
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.backend, 'spark');
+      assert.equal(j.paymentStatus, 'SUCCESS');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('cached-token reuse emits the persisted backend field', async () => {
+    const server = await startServer();
+    const { address, port } = server.address();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-l402-'));
+    fs.mkdirSync(path.join(home, '.blink'), { recursive: true });
+    const store = {};
+    // extractStoreKey = hostname + pathname (no port)
+    store[`127.0.0.1/resource`] = {
+      macaroon: 'MAC',
+      preimage: 'f'.repeat(64),
+      invoice: 'lnbc1000u1p0x',
+      satoshis: 100000,
+      invoiceMsats: 100000000,
+      budgetSats: 100000,
+      backend: 'spark',
+    };
+    fs.writeFileSync(path.join(home, '.blink', 'l402-tokens.json'), JSON.stringify(store), 'utf8');
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/resource`],
+          { env: { ...process.env, HOME: home }, timeout: 15000, killSignal: 'SIGKILL' },
+          (err, stdout, stderr) =>
+            resolve({ err, code: err ? (err.code === undefined ? 1 : err.code) : 0, stdout, stderr }),
+        );
+      });
+      if (result.code !== 0) process.stderr.write('DEBUG-REUSE ' + result.stderr + '\n');
+      assert.equal(result.code, 0);
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.tokenReused, true);
+      assert.equal(j.backend, 'spark');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── credential-free commands need no API key ─────────────────────────────────
 
 describe('CLI: credential-free commands run without BLINK_API_KEY', () => {
