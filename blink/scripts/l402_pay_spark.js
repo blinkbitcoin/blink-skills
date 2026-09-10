@@ -68,7 +68,15 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
 
     return { payment, status, preimage, feeSats };
   } finally {
-    await disconnect();
+    // Cleanup must never mask the payment outcome: a disconnect rejection
+    // after dispatch would otherwise REPLACE the successful result with an
+    // untagged error, and the caller — reading it as a pre-dispatch failure —
+    // would release the budget reservation after funds moved.
+    try {
+      await disconnect();
+    } catch (e) {
+      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${e.message}`);
+    }
   }
 }
 

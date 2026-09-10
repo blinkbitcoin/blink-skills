@@ -365,7 +365,14 @@ async function main() {
       console.error(`Payment reported status '${status}'. Exiting non-zero.`);
     }
   } finally {
-    await disconnect();
+    // Cleanup must never mask the payment outcome: a disconnect rejection
+    // after dispatch would otherwise REPLACE the result (and its exit code)
+    // with an error, inviting a retry of an already-settled payment.
+    try {
+      await disconnect();
+    } catch (e) {
+      console.error(`Warning: Spark disconnect failed (payment result is unaffected): ${e.message}`);
+    }
   }
 }
 

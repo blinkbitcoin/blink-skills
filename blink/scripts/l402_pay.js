@@ -709,15 +709,10 @@ async function main() {
     // two concurrent payments can never both pass the same remaining budget.
     // Credentials are resolved FIRST (per backend): a missing credential must
     // not orphan the reservation — no payment is attempted in that case, so
-    // nothing should stay reserved.
-    if (sparkBackend) {
-      // Presence was checked at backend selection; connect() re-validates
-      // fully at dispatch.
-      if (!process.env.SPARK_MNEMONIC || !process.env.BREEZ_API_KEY) {
-        console.error('Error: the Spark backend requires SPARK_MNEMONIC and BREEZ_API_KEY.');
-        process.exit(1);
-      }
-    } else {
+    // nothing should stay reserved. (Spark credential presence was validated
+    // at backend selection, before this reservation; connect() re-validates
+    // fully at dispatch.)
+    if (!sparkBackend) {
       apiKey = getApiKey();
       apiUrl = getApiUrl();
     }
