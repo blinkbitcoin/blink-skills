@@ -135,6 +135,13 @@ const stub = {
     }
     return null;
   },
+  safeErrorDetail(value) {
+    try {
+      return value && typeof value.message === 'string' ? value.message : String(value);
+    } catch {
+      return '(non-coercible error value)';
+    }
+  },
   normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
   normalizeSdkValue,
   async waitForStableBalance(sdk) {

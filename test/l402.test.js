@@ -1724,20 +1724,21 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   });
 
   it('a restored finalization (reservation erased externally) warns on stderr', async () => {
+    // Real path: the fake's sendPayment force-resets the budget log mid-flight,
+    // so finalizeOrRecord finds no reservation and returns 'restored'.
     configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
     mockPayment({ status: 'SUCCESS' });
-    const budget = require(budgetPath);
-    const savedFinalize = budget.finalizeOrRecord;
+    installSparkBackend({ status: 'completed', resetDuringSend: true });
     const originalStderr = console.error;
     let errOut = '';
-    budget.finalizeOrRecord = () => 'restored';
     console.error = (s) => {
       errOut += String(s) + '\n';
     };
     try {
-      await runPay(['https://paywall.example.com/resource', '--no-store']);
+      await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
     } finally {
-      budget.finalizeOrRecord = savedFinalize;
       console.error = originalStderr;
     }
     assert.match(errOut, /budget reservation was missing.*recorded anyway/s);
@@ -1751,25 +1752,66 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   });
 
   it('a failing release on ALREADY_PAID warns on stderr instead of being swallowed', async () => {
+    // Real path: the lock is grabbed inside the mocked mutation handler, so
+    // the command's release (after ALREADY_PAID) times out and the helper
+    // must surface it. (Holding it earlier would block the reservation too.)
     configureAutoPay();
-    mockPayment({ status: 'ALREADY_PAID' });
     const budget = require(budgetPath);
-    const savedRelease = budget.releaseReservation;
+    budget.setLockTiming({ acquireTimeoutMs: 60 });
+    let token = null;
+    const INVOICE = INVOICE_100K;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          // Reserve already happened (budget held the lock only for the
+          // decision); now hold it for the release window.
+          token = budget.acquireLogLock();
+          return respond({ lnInvoicePaymentSend: { status: 'ALREADY_PAID', errors: [] } });
+        }
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${INVOICE}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
     const originalStderr = console.error;
     let errOut = '';
-    budget.releaseReservation = () => {
-      throw new Error('lock timeout');
-    };
     console.error = (s) => {
       errOut += String(s) + '\n';
     };
+    // l402_pay may be cached from file load (a describe-level require in the
+    // runFeeProbe describe) with a real-home-bound budget — bust it so this
+    // run binds this test's tmpDir-bound budget instance.
+    delete require.cache[payPath];
     try {
       await runPay(['https://paywall.example.com/resource', '--no-store']);
     } finally {
-      budget.releaseReservation = savedRelease;
+      if (token) budget.releaseLogLock(token);
+      budget.setLockTiming({ acquireTimeoutMs: 2000 });
       console.error = originalStderr;
     }
-    assert.match(errOut, /could not release the budget reservation: lock timeout/);
+    assert.match(errOut, /could not release the budget reservation.*Timed out/s);
   });
 
   it('a missing API key orphans no reservation (credentials resolve before reserving)', async () => {
@@ -1796,17 +1838,23 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     rejectWith,
     withPreimage = true,
     rejectOnDisconnect = false,
+    resetDuringSend = false,
+    prepareRejectWith,
+    connectRejectWith,
   } = {}) {
     const fakeSdk = {
       async parse() {
         return { type: 'bolt11Invoice' };
       },
       async prepareSendPayment() {
+        if (prepareRejectWith !== undefined) return Promise.reject(prepareRejectWith);
         return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 1 } };
       },
       async sendPayment() {
         if (throwOnSend) throw new Error('network timeout after dispatch');
         if (rejectWith !== undefined) return Promise.reject(rejectWith);
+        // Simulates an operator clearing the budget log mid-flight.
+        if (resetDuringSend) require(budgetPath).resetLog({ force: true });
         const settled = String(status).toLowerCase() === 'completed' && withPreimage;
         const details = settled
           ? {
@@ -1824,6 +1872,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       loaded: true,
       exports: {
         async connect() {
+          if (connectRejectWith !== undefined) return Promise.reject(connectRejectWith);
           return {
             sdk: fakeSdk,
             disconnect: async () => {
@@ -1833,8 +1882,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
         },
         normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
         normalizeSdkValue: (v) => v,
-        // l402_pay_spark imports this from _spark_sdk (which this fake replaces).
+        // l402_pay_spark imports these from _spark_sdk (which this fake replaces).
         feeFromPrepare: require('../blink/scripts/_spark_sdk').feeFromPrepare,
+        safeErrorDetail: require('../blink/scripts/_spark_sdk').safeErrorDetail,
         async waitForStableBalance() {
           return { balanceSats: 0, stable: true };
         },
@@ -1915,7 +1965,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.deepEqual(readSpendLog(), [], 'nothing settled — the budget is freed');
   });
 
-  it('an unrecognized SDK status releases the reservation and surfaces raw', async () => {
+  it('an unrecognized SDK status KEEPS the reservation (fail-closed) and surfaces raw', async () => {
+    // Only a normalized FAILURE proves nothing settled; an unknown future
+    // status may mean "still in flight", so the reservation stays.
     configureAutoPay();
     process.env.SPARK_MNEMONIC = 'test seed words for the stub';
     process.env.BREEZ_API_KEY = 'breez-test-key';
@@ -1923,7 +1975,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     installSparkBackend({ status: 'zzzUnknown' });
     const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
     assert.notEqual(code, 0);
-    assert.deepEqual(readSpendLog(), []);
+    const log = readSpendLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'unknown status — fail-closed, not freed');
   });
 
   // ── disconnect rejection must never mask the payment outcome (HIGH fix) ───
@@ -2051,6 +2105,113 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     );
   });
 
+  // ── pre-dispatch rejection shapes must never strand the reservation ───────
+
+  it('a prepareSendPayment rejection with null releases the reservation', async () => {
+    // The reviewer's reproduction: a third-party Promise boundary rejecting
+    // with a non-object value used to throw a replacement TypeError at the
+    // caller's e.stage access BEFORE releaseSpend ran, stranding the budget.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ prepareRejectWith: null });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), [], 'pre-dispatch — the reservation must be released, not stranded');
+  });
+
+  it('a prepareSendPayment rejection with a throwing Proxy releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({
+      prepareRejectWith: new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('proxy trap');
+          },
+        },
+      ),
+    });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a connect rejection with a non-Error value releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ connectRejectWith: 42 });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a resolved payment with a throwing status getter is outcome-unknown (kept, fail-closed)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    // Poisoned resolved value: the status getter throws after dispatch.
+    installSparkBackend({ status: 'completed' });
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    const held = require.cache[sdkPath].exports;
+    const origConnect = held.connect;
+    held.connect = async (opts) => {
+      const r = await origConnect(opts);
+      const sdk = r.sdk;
+      const origSend = sdk.sendPayment.bind(sdk);
+      sdk.sendPayment = async (req) => {
+        const res = await origSend(req);
+        // Poison the INNER payment object — the module reads payment.status.
+        return {
+          ...res,
+          payment: new Proxy(res.payment, {
+            get(target, prop) {
+              if (prop === 'status') throw new Error('poisoned getter');
+              return target[prop];
+            },
+          }),
+        };
+      };
+      return { sdk, disconnect: r.disconnect };
+    };
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    try {
+      assert.notEqual(code, 0);
+      const log = readSpendLog();
+      assert.equal(log.length, 1);
+      assert.equal(log[0].state, 'reserved', 'decode failure after dispatch — outcome unknown, fail-closed');
+    } finally {
+      held.connect = origConnect;
+    }
+  });
+
+  it('an unrecognized SDK status keeps the reservation AND warns the operator', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'zzzUnknown' });
+    const originalStderr = console.error;
+    let errOut = '';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    } finally {
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /unrecognized payment status 'zzzUnknown'.*stays in place/s);
+    assert.equal(readSpendLog()[0].state, 'reserved');
+  });
+
   it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {
     configureAutoPay();
     const savedKey = process.env.BREEZ_API_KEY;
@@ -2175,26 +2336,59 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   });
 
   it('PENDING finalization failures warn on stderr instead of being swallowed', async () => {
+    // Real path: the lock is grabbed inside the mocked mutation handler, so
+    // the command's in-flight finalize times out and settleSpend must warn.
     configureAutoPay();
-    mockPayment({ status: 'PENDING' });
-    // Make the accounting write fail, and capture stderr to prove the warning.
     const budget = require(budgetPath);
-    const savedFinalize = budget.finalizeOrRecord;
+    budget.setLockTiming({ acquireTimeoutMs: 60 });
+    let token = null;
+    const INVOICE = INVOICE_100K;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        const respond = (data) => ({
+          ok: true,
+          status: 200,
+          url: u,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        });
+        if (q.includes('lnInvoicePaymentSend')) {
+          token = budget.acquireLogLock();
+          return respond({ lnInvoicePaymentSend: { status: 'PENDING', errors: [] } });
+        }
+        return respond({
+          me: { defaultAccount: { wallets: [{ id: 'wallet-1', walletCurrency: 'BTC', balance: 999999 }] } },
+        });
+      }
+      if (u === 'https://paywall.example.com/resource') {
+        return {
+          status: 402,
+          url: u,
+          headers: {
+            get: (n) =>
+              n.toLowerCase() === 'www-authenticate' ? `L402 macaroon="TESTMAC==", invoice="${INVOICE}"` : null,
+          },
+          text: async () => '',
+        };
+      }
+      return { status: 404, url: u, headers: { get: () => null }, text: async () => '' };
+    };
     const originalStderr = console.error;
     let errOut = '';
-    budget.finalizeOrRecord = () => {
-      throw new Error('disk full');
-    };
     console.error = (s) => {
       errOut += String(s) + '\n';
     };
     try {
       await runPay(['https://paywall.example.com/resource', '--no-store']);
     } finally {
-      budget.finalizeOrRecord = savedFinalize;
+      if (token) budget.releaseLogLock(token);
+      budget.setLockTiming({ acquireTimeoutMs: 2000 });
       console.error = originalStderr;
     }
-    assert.match(errOut, /could not record the in-flight payment in the budget log.*disk full/s);
+    assert.match(errOut, /could not record the in-flight payment in the budget log.*Timed out/s);
   });
 
   it('dry-run refuses an undecodable amount exactly like execution (preview/execution parity)', async () => {

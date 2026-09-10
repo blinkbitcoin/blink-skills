@@ -35,7 +35,7 @@ const {
   MUTATION_TIMEOUT_MS,
 } = require('./_blink_client');
 
-const { reserveBudget, finalizeOrRecord, releaseReservation, recordSpend } = require('./_budget');
+const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
 
 const PAY_LNURL_MUTATION = `
   mutation LnurlPaymentSend($input: LnurlPaymentSendInput!) {
@@ -117,34 +117,6 @@ async function main() {
     reservationId = reservation.id;
   }
 
-  const releaseReservationSafely = () => {
-    if (reservationId) {
-      try {
-        releaseReservation(reservationId);
-      } catch (e) {
-        // Not silent: a failed release strands the allowance — fail-closed is
-        // correct for the budget, but the operator must be told.
-        console.error(`Warning: could not release the budget reservation: ${e.message}`);
-      }
-    }
-  };
-  const recordOrFinalize = () => {
-    try {
-      if (reservationId) {
-        const outcome = finalizeOrRecord(reservationId, { sats: amountSats, command: 'pay-lnurl', domain: null });
-        if (outcome === 'restored') {
-          console.error(
-            'Warning: budget reservation was missing (e.g. after `blink budget reset`); the spend was recorded anyway.',
-          );
-        }
-      } else {
-        recordSpend({ sats: amountSats, command: 'pay-lnurl', domain: null });
-      }
-    } catch (e) {
-      console.error(`Warning: could not record the spend in the budget log: ${e.message}`);
-    }
-  };
-
   // ── Dry-run: resolve everything, show details, exit without sending ──
   if (dryRun) {
     console.error('[DRY RUN] Would send payment — no funds will be transferred.');
@@ -194,7 +166,7 @@ async function main() {
   if (result.errors && result.errors.length > 0) {
     // Explicit server-side rejection — nothing moved; the budget is freed.
     const errMsg = result.errors.map((e) => `${e.message}${e.code ? ` [${e.code}]` : ''}`).join(', ');
-    releaseReservationSafely();
+    releaseSpend(reservationId);
     throw new Error(`Payment failed: ${errMsg}`);
   }
 
@@ -212,13 +184,13 @@ async function main() {
 
   if (result.status === 'SUCCESS') {
     console.error('Payment successful!');
-    recordOrFinalize();
+    settleSpend({ reservationId, sats: amountSats, command: 'pay-lnurl', domain: null });
   } else if (result.status === 'PENDING') {
     console.error('Payment is pending...');
-    recordOrFinalize();
+    settleSpend({ reservationId, sats: amountSats, command: 'pay-lnurl', domain: null });
   } else {
     console.error(`Payment status: ${result.status}`);
-    releaseReservationSafely();
+    releaseSpend(reservationId);
   }
 
   console.log(JSON.stringify(output, null, 2));
