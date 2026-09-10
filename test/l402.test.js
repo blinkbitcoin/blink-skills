@@ -1800,9 +1800,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     console.error = (s) => {
       errOut += String(s) + '\n';
     };
-    // l402_pay was loaded at file load (a describe-level require in the
-    // runFeeProbe describe) with the unpatched exports — bust it so this run
-    // binds the instance we patched.
+    // l402_pay may be cached from file load (a describe-level require in the
+    // runFeeProbe describe) with a real-home-bound budget — bust it so this
+    // run binds this test's tmpDir-bound budget instance.
     delete require.cache[payPath];
     try {
       await runPay(['https://paywall.example.com/resource', '--no-store']);
@@ -1839,12 +1839,15 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     withPreimage = true,
     rejectOnDisconnect = false,
     resetDuringSend = false,
+    prepareRejectWith,
+    connectRejectWith,
   } = {}) {
     const fakeSdk = {
       async parse() {
         return { type: 'bolt11Invoice' };
       },
       async prepareSendPayment() {
+        if (prepareRejectWith !== undefined) return Promise.reject(prepareRejectWith);
         return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 1 } };
       },
       async sendPayment() {
@@ -1869,6 +1872,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       loaded: true,
       exports: {
         async connect() {
+          if (connectRejectWith !== undefined) return Promise.reject(connectRejectWith);
           return {
             sdk: fakeSdk,
             disconnect: async () => {
@@ -2099,6 +2103,113 @@ describe('l402_pay enforcement (non-dry-run)', () => {
         return true;
       },
     );
+  });
+
+  // ── pre-dispatch rejection shapes must never strand the reservation ───────
+
+  it('a prepareSendPayment rejection with null releases the reservation', async () => {
+    // The reviewer's reproduction: a third-party Promise boundary rejecting
+    // with a non-object value used to throw a replacement TypeError at the
+    // caller's e.stage access BEFORE releaseSpend ran, stranding the budget.
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ prepareRejectWith: null });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), [], 'pre-dispatch — the reservation must be released, not stranded');
+  });
+
+  it('a prepareSendPayment rejection with a throwing Proxy releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({
+      prepareRejectWith: new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('proxy trap');
+          },
+        },
+      ),
+    });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a connect rejection with a non-Error value releases the reservation', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ connectRejectWith: 42 });
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    assert.notEqual(code, 0);
+    assert.deepEqual(readSpendLog(), []);
+  });
+
+  it('a resolved payment with a throwing status getter is outcome-unknown (kept, fail-closed)', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    // Poisoned resolved value: the status getter throws after dispatch.
+    installSparkBackend({ status: 'completed' });
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    const held = require.cache[sdkPath].exports;
+    const origConnect = held.connect;
+    held.connect = async (opts) => {
+      const r = await origConnect(opts);
+      const sdk = r.sdk;
+      const origSend = sdk.sendPayment.bind(sdk);
+      sdk.sendPayment = async (req) => {
+        const res = await origSend(req);
+        // Poison the INNER payment object — the module reads payment.status.
+        return {
+          ...res,
+          payment: new Proxy(res.payment, {
+            get(target, prop) {
+              if (prop === 'status') throw new Error('poisoned getter');
+              return target[prop];
+            },
+          }),
+        };
+      };
+      return { sdk, disconnect: r.disconnect };
+    };
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    try {
+      assert.notEqual(code, 0);
+      const log = readSpendLog();
+      assert.equal(log.length, 1);
+      assert.equal(log[0].state, 'reserved', 'decode failure after dispatch — outcome unknown, fail-closed');
+    } finally {
+      held.connect = origConnect;
+    }
+  });
+
+  it('an unrecognized SDK status keeps the reservation AND warns the operator', async () => {
+    configureAutoPay();
+    process.env.SPARK_MNEMONIC = 'test seed words for the stub';
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    mock402(INVOICE_100K);
+    installSparkBackend({ status: 'zzzUnknown' });
+    const originalStderr = console.error;
+    let errOut = '';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      await runPay(['https://paywall.example.com/resource', '--no-store', '--spark']);
+    } finally {
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /unrecognized payment status 'zzzUnknown'.*stays in place/s);
+    assert.equal(readSpendLog()[0].state, 'reserved');
   });
 
   it('missing BREEZ_API_KEY fails before reserving (spark backend, non-dry-run)', async () => {

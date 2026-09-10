@@ -1342,3 +1342,103 @@ describe('budget.js CLI — option validation', () => {
     assert.match(output.message, /corrupt/);
   });
 });
+
+// ── settleSpend / releaseSpend contract matrix ───────────────────────────────
+
+describe('settleSpend / releaseSpend', () => {
+  let mod;
+  before(() => {
+    setupTempDir();
+    saveEnv();
+    patchHomedir();
+    delete require.cache[require.resolve(path.join(scriptsDir, '_budget.js'))];
+    mod = require(path.join(scriptsDir, '_budget.js'));
+  });
+  after(() => {
+    restoreHomedir();
+    restoreEnv();
+    cleanupTempDir();
+  });
+  afterEach(() => {
+    try {
+      fs.unlinkSync(mod.LOG_FILE);
+    } catch {
+      /* ok */
+    }
+    try {
+      fs.unlinkSync(mod.CONFIG_FILE);
+    } catch {
+      /* ok */
+    }
+  });
+
+  it('unconfigured (null reservationId) records the spend directly', () => {
+    mod.settleSpend({ reservationId: null, sats: 100, command: 'x' });
+    const log = mod.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 100);
+    assert.equal(log[0].state, undefined);
+  });
+
+  it('configured (real reservation) finalizes into a normal spend entry', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    assert.ok(r.id);
+    mod.settleSpend({ reservationId: r.id, sats: 100, command: 'x' });
+    const log = mod.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, undefined, 'finalized, not still reserved');
+    assert.equal(log[0].id, r.id, 'the id is preserved for idempotency');
+  });
+
+  it('restored (reservation erased externally) records and warns', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    mod.resetLog({ force: true });
+    const originalStderr = console.error;
+    let errOut = '';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      mod.settleSpend({ reservationId: r.id, sats: 100, command: 'x' });
+    } finally {
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /budget reservation was missing.*recorded anyway/s);
+    const log = mod.readLog();
+    assert.equal(log.length, 1, 'the settled payment is recorded even after a reset');
+    assert.equal(log[0].state, undefined);
+  });
+
+  it('releaseSpend removes the reservation and is a no-op for null', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    assert.doesNotThrow(() => mod.releaseSpend(null));
+    mod.releaseSpend(r.id);
+    assert.deepEqual(mod.readLog(), []);
+  });
+
+  it('settleSpend warns — never throws — when the accounting write fails (lock held)', () => {
+    mod.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 500, allowlist: [] });
+    const r = mod.reserveBudget({ sats: 100, command: 'x' }, { requireConfigured: false });
+    mod.setLockTiming({ acquireTimeoutMs: 60 });
+    const token = mod.acquireLogLock();
+    const originalStderr = console.error;
+    let errOut = '';
+    console.error = (s) => {
+      errOut += String(s) + '\n';
+    };
+    try {
+      mod.settleSpend({ reservationId: r.id, sats: 100, command: 'x' });
+    } finally {
+      mod.releaseLogLock(token);
+      mod.setLockTiming({ acquireTimeoutMs: 2000 });
+      console.error = originalStderr;
+    }
+    assert.match(errOut, /could not record the spend in the budget log.*Timed out/s);
+    const log = mod.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].state, 'reserved', 'the failed finalize leaves the reservation fail-closed');
+  });
+});

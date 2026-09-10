@@ -22,6 +22,21 @@
 const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
 
 /**
+ * Wrap a pre-dispatch rejection (connect / prepareSendPayment) in an owned
+ * Error carrying the original value as `cause`. These are third-party Promise
+ * boundaries: a rejection value of null/undefined (or anything non-object)
+ * would otherwise reach the caller's `e.stage` property access and throw a
+ * replacement TypeError before the reservation could be released — stranding
+ * the allowance. The owned error always reads undefined for stage, so the
+ * caller releases correctly for every rejection shape.
+ */
+function preDispatchError(stage, value) {
+  const err = new Error(`Spark ${stage} failed (no payment dispatched): ${safeErrorDetail(value)}`, { cause: value });
+  err.code = 'SPARK_PREPARE_FAILED';
+  return err;
+}
+
+/**
  * Pay a BOLT-11 invoice from a Spark account.
  *
  * @param {string} invoice  BOLT-11 payment request (the L402 challenge invoice).
@@ -34,14 +49,25 @@ const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
  *   through raw. Callers must branch on these values only.
  */
 async function payInvoiceViaSpark(invoice, { network } = {}) {
-  const { sdk, disconnect } = await connect({ network: network || process.env.SPARK_NETWORK || 'mainnet' });
+  let sdk;
+  let disconnect;
+  try {
+    ({ sdk, disconnect } = await connect({ network: network || process.env.SPARK_NETWORK || 'mainnet' }));
+  } catch (e) {
+    throw preDispatchError('connect', e);
+  }
   try {
     // Prepare: fee resolution and validation. The invoice carries its own
     // amount — no `amount` is passed (a ceil-rounded value would not match
     // the invoice's millisats).
-    const prepareResponse = await sdk.prepareSendPayment({
-      paymentRequest: { type: 'input', input: invoice },
-    });
+    let prepareResponse;
+    try {
+      prepareResponse = await sdk.prepareSendPayment({
+        paymentRequest: { type: 'input', input: invoice },
+      });
+    } catch (e) {
+      throw preDispatchError('prepareSendPayment', e);
+    }
     const feeSats = feeFromPrepare(prepareResponse);
 
     let result;
