@@ -524,6 +524,19 @@ describe('spark_send.feeFromPrepare', () => {
     assert.equal(feeFromPrepare(null), null);
     assert.equal(feeFromPrepare({ paymentMethod: {} }), null);
   });
+
+  it('returns null (never NaN/Infinity) for non-finite SDK fee values', () => {
+    assert.equal(feeFromPrepare({ feeSats: 'not-a-number' }), null, 'a garbage top-level fee reads as unknown');
+    assert.equal(feeFromPrepare({ feeSats: Infinity }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: NaN } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { feeSats: 'garbage' } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { sparkTransferFeeSats: 'garbage' } }), null);
+    // A composite with one non-finite PRESENT component is an unknowable
+    // total — null, never a deceptively valid partial sum.
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 3, sparkTransferFeeSats: 'garbage' } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 'garbage', sparkTransferFeeSats: 2 } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { fee: '∞' } }), null);
+  });
 });
 
 // ── spark_send.classifyDestination ───────────────────────────────────────────
@@ -1014,6 +1027,49 @@ describe('spark_send token/conversion budget integration', () => {
     installTokenMock({ estimate: null });
     const out = await runMain(['sprt1x', '10.5', '--token', 'usdb']);
     assert.equal(JSON.parse(out).status, 'completed');
+    assert.deepEqual(budget.readLog(), []);
+  });
+
+  it('a TAGGED-OBJECT failed status on the token path exits non-zero and releases (isFailedStatus unification)', async () => {
+    // The token branches used inline String(status) checks; a tagged-variant
+    // status ({type:'failed'}) would have settled + exited 0. The shared seam
+    // runs every branch through the hardened isFailedStatus.
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ status: { type: 'failed' }, estimate: { amountIn: 50000n, amountOut: 1n } });
+    await runMain(['sprt1x', '10.5', '--token', 'usdb', '--from-btc']);
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'terminal failure — budget freed');
+    // The diagnostic must render the tagged shape usefully, never
+    // '[object Object]'.
+    assert.match(lastErr, /Payment reported status 'failed'/);
+    assert.equal(lastErr.includes('[object Object]'), false);
+  });
+
+  // ── seam caller wiring: each path's settle/reservation/exit combination ────
+
+  it('--from-token with a terminal failed status exits non-zero and records nothing', async () => {
+    installTokenMock({ parseType: 'bolt11Invoice', status: 'failed' });
+    const out = await runMain(FROM_TOKEN(45000));
+    assert.equal(JSON.parse(out).status, 'failed');
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'token-source payment — nothing sats-side to record');
+  });
+
+  it('forced --from-btc with a terminal failed status exits non-zero and stays unrecorded', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    installTokenMock({ status: 'failed' });
+    const out = await runMain([...FROM_BTC, '--force']);
+    assert.ok(calls.includes('sendPayment'), 'forced path dispatched');
+    assert.equal(JSON.parse(out).status, 'failed');
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'failed + forced — no reservation to release, nothing recorded');
+  });
+
+  it('a PENDING plain-token send exits zero and records nothing (in flight, no sats)', async () => {
+    installTokenMock({ status: 'pending', estimate: null });
+    const out = await runMain(['sprt1x', '10.5', '--token', 'usdb']);
+    assert.equal(JSON.parse(out).status, 'pending');
+    assert.ok(!process.exitCode, 'pending is not a failure');
     assert.deepEqual(budget.readLog(), []);
   });
 });

@@ -241,19 +241,28 @@ const stub = {
   // from _spark_sdk, which this stub replaces.
   feeFromPrepare(prepareResponse) {
     const has = (v) => v !== null && v !== undefined;
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
     if (!has(prepareResponse)) return null;
-    if (has(prepareResponse.feeSats)) return Number(prepareResponse.feeSats);
+    if (has(prepareResponse.feeSats)) return num(prepareResponse.feeSats);
     const pm = prepareResponse.paymentMethod;
     if (!pm) return null;
-    if (has(pm.feeSats)) return Number(pm.feeSats);
+    if (has(pm.feeSats)) return num(pm.feeSats);
     if (has(pm.lightningFeeSats)) {
-      return Number(pm.lightningFeeSats) + (has(pm.sparkTransferFeeSats) ? Number(pm.sparkTransferFeeSats) : 0);
+      // A composite with one non-finite PRESENT component is an unknowable total.
+      const fee = num(pm.lightningFeeSats);
+      if (fee === null) return null;
+      if (has(pm.sparkTransferFeeSats)) {
+        const transfer = num(pm.sparkTransferFeeSats);
+        if (transfer === null) return null;
+        return fee + transfer;
+      }
+      return fee;
     }
-    if (has(pm.sparkTransferFeeSats)) return Number(pm.sparkTransferFeeSats);
-    if (has(pm.fee)) {
-      const n = Number(pm.fee);
-      return Number.isNaN(n) ? null : n;
-    }
+    if (has(pm.sparkTransferFeeSats)) return num(pm.sparkTransferFeeSats);
+    if (has(pm.fee)) return num(pm.fee);
     return null;
   },
   safeErrorDetail(value) {

@@ -200,6 +200,25 @@ per-_wallet_, so any valid key works with any seed.
 
 Set it as `BREEZ_API_KEY` alongside `SPARK_MNEMONIC`.
 
+## Status & budget policy (cross-path)
+
+The pinned SDK's status union is exactly `completed | pending | failed`. Every
+path applies the fail-closed rule to an **outcome-unknown rejection** (the
+payment may still settle, so the reservation stays). For an unknown
+**status**, only the autonomous l402 path stays reserved — `spark-send`
+settles unrecognized statuses (safe under the pinned union) and the custodial
+commands release:
+
+| Path                                                                                 | Outcome-unknown rejection            | Explicit terminal failure | Unknown STATUS                                                                   |
+| ------------------------------------------------------------------------------------ | ------------------------------------ | ------------------------- | -------------------------------------------------------------------------------- |
+| `spark-send` (BTC, token, conversions — all via the shared `dispatchAndSettle` seam) | keep reservation (25h prune)         | release + exit 1          | reads via `isFailedStatus`; anything unrecognized settles/exits 0 (pinned union) |
+| `l402-pay --spark`                                                                   | keep reservation                     | release                   | keep reservation fail-closed (autonomous path)                                   |
+| Custodial pay commands                                                               | keep reservation (GraphQL transport) | release                   | PENDING settles; ALREADY_PAID and all other/unrecognized statuses release        |
+
+One shared seam (`dispatchAndSettle` in `spark_send.js`) now carries the
+spark-send row — the token/conversion branches previously inlined the policy
+and drifted from it (PR #10 review).
+
 ## Tokens (USDB / BTKN)
 
 The pinned SDK 0.23.1 already supports the full token surface (no upgrade
@@ -263,7 +282,7 @@ blink spark-send <destination> 1 --dry-run
 This is the contract the test stubs emulate; if a real run disagrees with the
 stubs, the stubs (not the assertions) are what must change.
 
-**Verified live on Spark regtest (2026-09):** `spark-info`, `spark-balance`,
+**Verified live on Spark regtest (2026-09-11, release 2.2.0 pass):** `spark-info`, `spark-balance`,
 `spark-transactions` (including `--offset` and the native `typeFilter`, which
 the real SDK accepts), `spark-fee-probe`, `spark-send --dry-run`, and a real
 1-sat send settling `completed` with the budget reservation finalizing

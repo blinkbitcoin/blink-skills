@@ -227,6 +227,94 @@ function conversionEstimateFrom(prepareResponse) {
 }
 
 /**
+ * THE shared dispatch-and-settle seam — the single place for the payment
+ * policy every spark-send branch must carry (BTC, token, and both conversion
+ * directions). This exists because the branches used to inline this policy and
+ * drifted: PR #10's review found the token branch releasing reservations on
+ * outcome-unknown errors and ignoring terminal-failure semantics that the BTC
+ * path had already hardened.
+ *
+ * Policy (test-pinned — see the budget-integration describes in spark.test.js):
+ *   - the dispatch closure rejects with ANY value after dispatch → outcome is
+ *     UNKNOWN: keep the reservation (fail-closed, 25h prune) and warn, rethrow.
+ *     Only an explicit terminal failure releases it — never a rejection.
+ *   - terminal failed status (via the hardened isFailedStatus) → release the
+ *     reservation, process.exitCode = 1, warn.
+ *   - otherwise → settle the sats spend when one applies (settle.sats), via
+ *     settleSpend (warns on accounting failure, never throws; a null
+ *     reservationId records directly — the forced-send path).
+ *
+ * @param {() => Promise} dispatch  closure performing the SDK call
+ *   (sdk.sendPayment / sdk.lnurlPay).
+ * @param {object} [opts]
+ * @param {string|null} [opts.reservationId]
+ * @param {{sats: number}|null} [opts.settle]  the applicable sats spend, or null
+ *   when no sats move (plain token sends, --from-token conversions).
+ * @param {string} [opts.command]
+ * @param {string|null} [opts.domain]
+ * @returns {Promise<{ payment: object, status: string|object, paymentId: string|null }>}
+ *   `status` is the SDK's payment status VERBATIM — a string per the pinned
+ *   SDK union ('completed'|'pending'|'failed'); the hardened isFailedStatus
+ *   additionally tolerates tagged-object statuses ({type:'failed'}), so the
+ *   returned union includes those when the SDK emits them. Branch via
+ *   isFailedStatus, never on a string assumption.
+ */
+/**
+ * Render a payment status for diagnostics: a tagged-object status
+ * ({type:'failed'} — the shape isFailedStatus tolerates) renders as its
+ * type, other objects as JSON, so stderr never shows '[object Object]'.
+ *
+ * @param {string|object} status
+ * @returns {string}
+ */
+function displayStatus(status) {
+  if (status !== null && typeof status === 'object') {
+    return status.type !== undefined ? String(status.type) : JSON.stringify(status);
+  }
+  return String(status);
+}
+
+async function dispatchAndSettle(
+  dispatch,
+  { reservationId = null, settle = null, command = 'spark-send', domain = null } = {},
+) {
+  let result;
+  try {
+    result = await dispatch();
+  } catch (e) {
+    if (reservationId) {
+      console.error(
+        'Warning: payment outcome is unknown after this error, so the budget reservation stays in place ' +
+          '(fail-closed, auto-cleared by the 25h prune). Inspect `spark-transactions` before retrying.',
+      );
+    }
+    throw e;
+  }
+  const payment = result && result.payment ? result.payment : result;
+  const status = (payment && payment.status) || 'SUBMITTED';
+
+  if (!isFailedStatus(status)) {
+    // Only successful/pending payments are logged — same rule as the custodial
+    // pay commands. settleSpend warns — never throws — on accounting failure.
+    if (settle !== null) {
+      settleSpend({ reservationId, sats: settle.sats, command, domain });
+    }
+  } else if (reservationId) {
+    // Explicit terminal failure — the payment did not happen, free the budget.
+    releaseSpend(reservationId);
+  }
+
+  // The SDK resolves rather than throws for a payment that FAILED, so exiting
+  // 0 would tell every caller — shell, CI, agent — that a payment which did
+  // not happen succeeded. `pending` is not a failure: it keeps a zero exit.
+  if (isFailedStatus(status)) {
+    process.exitCode = 1;
+    console.error(`Payment reported status '${displayStatus(status)}'. Exiting non-zero.`);
+  }
+  return { payment, status, paymentId: (payment && (payment.id || payment.paymentHash)) || null };
+}
+
+/**
  * Does this SDK payment status mean the payment did not go through?
  *
  * Compared case-insensitively because the SDK's casing has moved between
@@ -396,37 +484,16 @@ async function main() {
           reservationId = r.id;
         }
 
-        let result;
-        try {
-          result = await sdk.sendPayment({ prepareResponse });
-        } catch (e) {
-          // Outcome-unknown after dispatch — the same policy as the BTC path:
-          // the conversion may still settle, so the reservation STAYS
-          // (fail-closed, auto-cleared by the 25h prune). Only an explicit
-          // terminal 'failed' status releases it below.
-          if (reservationId) {
-            console.error(
-              'Warning: payment outcome is unknown after this error, so the budget reservation stays in place ' +
-                '(fail-closed, auto-cleared by the 25h prune). Inspect spark-transactions before retrying.',
-            );
-          }
-          throw e;
-        }
-        const payment = result && result.payment ? result.payment : result;
-        const status = (payment && payment.status) || 'SUBMITTED';
-        if (String(status).toLowerCase() !== 'failed') {
-          if (args.fromBtc) {
-            if (recordableSats !== null) {
-              settleSpend({ reservationId, sats: recordableSats, command: 'spark-send', domain: null });
-            } else {
-              console.error(
-                'Warning: forced conversion dispatched with no usable estimate — the sats spend is unrecorded.',
-              );
-            }
-          }
-          // Plain token send: no sats moved, nothing to record in the sats log.
-        } else if (reservationId) {
-          releaseSpend(reservationId);
+        const { status, paymentId } = await dispatchAndSettle(() => sdk.sendPayment({ prepareResponse }), {
+          reservationId,
+          // Only a --from-btc conversion moves sats (the estimate's sats
+          // side); plain token sends move none.
+          settle: args.fromBtc && recordableSats !== null ? { sats: recordableSats } : null,
+        });
+        if (args.fromBtc && recordableSats === null && !isFailedStatus(status)) {
+          console.error(
+            'Warning: forced conversion dispatched with no usable estimate — the sats spend is unrecorded.',
+          );
         }
         console.log(
           JSON.stringify(
@@ -439,17 +506,13 @@ async function main() {
               amountBaseUnits: String(amountBaseUnits),
               feeBaseUnits: feeSats,
               conversionEstimate: conversion,
-              paymentId: (payment && (payment.id || payment.paymentHash)) || null,
+              paymentId,
               network: args.network,
             },
             null,
             2,
           ),
         );
-        if (String(status).toLowerCase() === 'failed') {
-          process.exitCode = 1;
-          console.error(`Payment reported status '${status}'. Exiting non-zero.`);
-        }
         return;
       }
 
@@ -516,10 +579,11 @@ async function main() {
       }
 
       // No sats leave the wallet (tokens are the source asset) — the sats
-      // budget does not apply; documented in SKILL.md.
-      const result = await sdk.sendPayment({ prepareResponse });
-      const payment = result && result.payment ? result.payment : result;
-      const status = (payment && payment.status) || 'SUBMITTED';
+      // budget does not apply; documented in SKILL.md. The seam still guards
+      // the outcome-unknown warn (a no-op here: nothing is reserved).
+      const { status, paymentId } = await dispatchAndSettle(() => sdk.sendPayment({ prepareResponse }), {
+        settle: null,
+      });
       console.log(
         JSON.stringify(
           {
@@ -531,17 +595,13 @@ async function main() {
             feeSats,
             fromTokenIdentifier,
             conversionEstimate: conversion,
-            paymentId: (payment && (payment.id || payment.paymentHash)) || null,
+            paymentId,
             network: args.network,
           },
           null,
           2,
         ),
       );
-      if (String(status).toLowerCase() === 'failed') {
-        process.exitCode = 1;
-        console.error(`Payment reported status '${status}'. Exiting non-zero.`);
-      }
       return;
     }
 
@@ -595,36 +655,14 @@ async function main() {
       reservationId = reservation.id; // null when no budget is configured
     }
 
-    // 3. Send (signs locally) via the matching path. A throw after the send
-    // was dispatched (timeout, lost response, SDK error) does NOT prove the
-    // payment failed — the payment may still settle. Keep the reservation
-    // reserved (fail-closed) rather than freeing the budget for a retry.
-    let result;
-    try {
-      result =
-        dest.type === 'lnurl' ? await sdk.lnurlPay({ prepareResponse }) : await sdk.sendPayment({ prepareResponse });
-    } catch (e) {
-      if (reservationId) {
-        console.error(
-          `Warning: payment outcome is unknown after this error, so the budget reservation stays in place ` +
-            `(fail-closed, auto-cleared by the 25h prune). Inspect \`spark-transactions\` before retrying.`,
-        );
-      }
-      throw e;
-    }
-    const payment = result && result.payment ? result.payment : result;
-    const status = (payment && payment.status) || 'SUBMITTED';
-
-    // Record the spend unless the SDK says the payment failed — same rule as
-    // the custodial pay commands ("only successful/pending payments are
-    // logged"). settleSpend warns — never throws — when accounting fails:
-    // a spend that escapes the log would overestimate what is left.
-    if (!isFailedStatus(status)) {
-      settleSpend({ reservationId, sats: args.amountSats, command: 'spark-send', domain: null });
-    } else if (reservationId) {
-      // Explicit terminal failure — the payment did not happen, free the budget.
-      releaseSpend(reservationId);
-    }
+    // 3. Send (signs locally) via the matching path, through the shared
+    // dispatch-and-settle seam: outcome-unknown keeps the reservation
+    // (fail-closed), terminal failure releases it + exits non-zero, and
+    // successful/pending sends settle the sats spend.
+    const { status, paymentId } = await dispatchAndSettle(
+      () => (dest.type === 'lnurl' ? sdk.lnurlPay({ prepareResponse }) : sdk.sendPayment({ prepareResponse })),
+      { reservationId, settle: { sats: args.amountSats } },
+    );
 
     console.log(
       JSON.stringify(
@@ -635,22 +673,13 @@ async function main() {
           destinationType: dest.type,
           amountSats: args.amountSats,
           feeSats,
-          paymentId: (payment && (payment.id || payment.paymentHash)) || null,
+          paymentId,
           network: args.network,
         },
         null,
         2,
       ),
     );
-
-    // The SDK resolves rather than throws for a payment that FAILED, so exiting
-    // 0 here would tell every caller — shell, CI, agent — that a payment which
-    // did not happen succeeded. `pending` is not a failure: it is in flight and
-    // may yet complete, so it keeps a zero exit.
-    if (isFailedStatus(status)) {
-      process.exitCode = 1;
-      console.error(`Payment reported status '${status}'. Exiting non-zero.`);
-    }
   } finally {
     // Cleanup must never mask the payment outcome: a disconnect rejection
     // after dispatch would otherwise REPLACE the result (and its exit code)

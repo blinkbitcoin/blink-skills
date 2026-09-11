@@ -558,27 +558,39 @@ function feeFromPrepare(prepareResponse) {
   //  - sparkAddress send method:        `fee` (string)
   //  - older builds:                    `feeSats` on paymentMethod
   const has = (v) => v !== null && v !== undefined;
+  // Non-finite results (NaN/Infinity from a malformed SDK value) read as
+  // "unknown" (null), never as a fee an agent might quote or budget with.
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
   if (!has(prepareResponse)) return null;
 
   // LNURL: top-level feeSats.
-  if (has(prepareResponse.feeSats)) return Number(prepareResponse.feeSats);
+  if (has(prepareResponse.feeSats)) return num(prepareResponse.feeSats);
 
   const pm = prepareResponse.paymentMethod;
   if (!pm) return null;
 
-  if (has(pm.feeSats)) return Number(pm.feeSats);
+  if (has(pm.feeSats)) return num(pm.feeSats);
 
   // bolt11Invoice: lightning fee (+ spark transfer fee if the route uses Spark).
+  // A composite with one non-finite PRESENT component is an unknowable total —
+  // return null (unknown) rather than a deceptively valid partial sum.
   if (has(pm.lightningFeeSats)) {
-    return Number(pm.lightningFeeSats) + (has(pm.sparkTransferFeeSats) ? Number(pm.sparkTransferFeeSats) : 0);
+    const fee = num(pm.lightningFeeSats);
+    if (fee === null) return null;
+    if (has(pm.sparkTransferFeeSats)) {
+      const transfer = num(pm.sparkTransferFeeSats);
+      if (transfer === null) return null;
+      return fee + transfer;
+    }
+    return fee;
   }
-  if (has(pm.sparkTransferFeeSats)) return Number(pm.sparkTransferFeeSats);
+  if (has(pm.sparkTransferFeeSats)) return num(pm.sparkTransferFeeSats);
 
   // sparkAddress: `fee` (may be a string).
-  if (has(pm.fee)) {
-    const n = Number(pm.fee);
-    return Number.isNaN(n) ? null : n;
-  }
+  if (has(pm.fee)) return num(pm.fee);
   return null;
 }
 
