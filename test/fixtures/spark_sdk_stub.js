@@ -87,7 +87,10 @@ const fakeSdk = {
       description: 'stub',
       lightningAddress: addr,
       username,
-      lnurl: { url: `https://${lnurlDomainFor('mainnet')}/.well-known/lnurlp/${username}`, bech32: 'lnurl1stub' },
+      lnurl: {
+        url: `https://${lnurlDomainFor(process.env.SPARK_NETWORK || 'mainnet')}/.well-known/lnurlp/${username}`,
+        bech32: 'lnurl1stub',
+      },
     };
   },
   async checkLightningAddressAvailable(req) {
@@ -99,9 +102,12 @@ const fakeSdk = {
     const username = req && req.username;
     return {
       description: (req && req.description) || '',
-      lightningAddress: `${username}@${lnurlDomainFor('mainnet')}`,
+      lightningAddress: `${username}@${lnurlDomainFor(process.env.SPARK_NETWORK || 'mainnet')}`,
       username,
-      lnurl: { url: `https://${lnurlDomainFor('mainnet')}/.well-known/lnurlp/${username}`, bech32: 'lnurl1stub' },
+      lnurl: {
+        url: `https://${lnurlDomainFor(process.env.SPARK_NETWORK || 'mainnet')}/.well-known/lnurlp/${username}`,
+        bech32: 'lnurl1stub',
+      },
     };
   },
   async deleteLightningAddress() {
@@ -213,6 +219,10 @@ function normalizeSdkValue(value) {
 // _spark_sdk, so every command-imported export must exist here. Standalone
 // (not methods): commands destructure these, losing `this`.
 // Mirror of _spark_sdk.lnurlDomainFor — Blink domains only, never breez.tips.
+// The interception design forces a mirror (requiring the production module
+// from here would recurse into this stub). The PRODUCTION wiring is gated by
+// the '_spark_sdk.connect() lnurlDomain wiring' test in spark.test.js, which
+// intercepts the SDK package and asserts the config the connector receives.
 function lnurlDomainFor(network) {
   const fromEnv = process.env.SPARK_LNURL_DOMAIN;
   if (fromEnv) {

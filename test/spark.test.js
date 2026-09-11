@@ -1554,19 +1554,177 @@ describe('_spark_sdk.lnurlDomainFor', () => {
     }
   });
 
-  it("'breez.tips' is refused — blink-skills never registers on the Breez default", () => {
+  it("'breez.tips' is refused in EVERY equivalent spelling (canonicalization)", () => {
     const saved = process.env.SPARK_LNURL_DOMAIN;
-    process.env.SPARK_LNURL_DOMAIN = 'breez.tips';
     try {
-      assert.throws(
-        () => spark.lnurlDomainFor('mainnet'),
-        (e) => e.message.includes('breez.tips') && e.message.includes('blink.sv'),
-      );
+      // DNS hostnames are case-insensitive; a trailing root dot and an
+      // explicit port are the same target. Byte-equality would let these
+      // through — the canonical form must not.
+      for (const variant of [
+        'breez.tips',
+        'BREEZ.TIPS',
+        'Breez.Tips',
+        'breez.tips.',
+        'breez.tips:443',
+        'Breez.Tips:8443',
+        '  BREEZ.TIPS.  ',
+      ]) {
+        process.env.SPARK_LNURL_DOMAIN = variant;
+        assert.throws(
+          () => spark.lnurlDomainFor('mainnet'),
+          (e) => e.message.includes('breez.tips') && e.message.includes('blink.sv'),
+          `must refuse the equivalent spelling: ${JSON.stringify(variant)}`,
+        );
+      }
     } finally {
       if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
       else process.env.SPARK_LNURL_DOMAIN = saved;
     }
   });
+
+  it('non-hostname values are rejected as invalid, not silently accepted', () => {
+    const saved = process.env.SPARK_LNURL_DOMAIN;
+    try {
+      for (const bad of [
+        'https://breez.tips',
+        'custom.example/path',
+        'custom.example?q=1',
+        'bad host',
+        'under_score',
+        ':8080',
+        'a:b:c',
+      ]) {
+        process.env.SPARK_LNURL_DOMAIN = bad;
+        assert.throws(
+          () => spark.lnurlDomainFor('mainnet'),
+          (e) => e.code === 'SPARK_LNURL_DOMAIN_INVALID',
+          `must reject as invalid: ${JSON.stringify(bad)}`,
+        );
+      }
+    } finally {
+      if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
+      else process.env.SPARK_LNURL_DOMAIN = saved;
+    }
+  });
+
+  it('valid custom domains are canonicalized (lowercase, root dot stripped, port kept)', () => {
+    const saved = process.env.SPARK_LNURL_DOMAIN;
+    try {
+      process.env.SPARK_LNURL_DOMAIN = 'Custom.Blink.Example.';
+      assert.equal(spark.lnurlDomainFor('mainnet'), 'custom.blink.example');
+      process.env.SPARK_LNURL_DOMAIN = '  spark.regtest.local:8080  ';
+      assert.equal(spark.lnurlDomainFor('regtest'), 'spark.regtest.local:8080');
+    } finally {
+      if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
+      else process.env.SPARK_LNURL_DOMAIN = saved;
+    }
+  });
+});
+
+// ── _spark_sdk.connect() passes the pinned lnurlDomain to the SDK ───────────
+//
+// The CLI stub mirrors lnurlDomainFor (the interception design forces a
+// mirror), so CLI tests cannot by themselves prove the production connector
+// hands the SDK the right domain. This intercepts the SDK PACKAGE (the
+// storage-preflight pattern), calls the REAL _spark_sdk.connect(), and
+// asserts the config the SDK actually receives.
+
+describe('_spark_sdk.connect() lnurlDomain wiring', () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const pathMod = require('node:path');
+  const Module = require('node:module');
+  const VALID_MNEMONIC =
+    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+  function installFakeSdkPackage() {
+    const captured = [];
+    const realResolve = Module._resolveFilename;
+    const realLoad = Module._load;
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === '@breeztech/breez-sdk-spark') return 'FAKE_SPARK_PACKAGE';
+      if (request === 'better-sqlite3') return 'FAKE_SQLITE';
+      return realResolve.call(this, request, ...rest);
+    };
+    Module._load = function (request, parent, isMain) {
+      if (request === '@breeztech/breez-sdk-spark') {
+        return {
+          defaultConfig: () => ({ apiKey: '', lnurlDomain: 'breez.tips' }),
+          connect: async ({ config }) => {
+            captured.push(config);
+            return { disconnect: async () => {} };
+          },
+        };
+      }
+      if (request === 'better-sqlite3' || request === 'FAKE_SQLITE') {
+        // The storage preflight resolves better-sqlite3 THEN requires it by
+        // the resolved (marker) path — intercept both spellings.
+        return function FakeDatabase() {
+          return { prepare: () => ({ get: () => ({ ok: 1 }) }), close: () => {} };
+        };
+      }
+      return realLoad.call(this, request, parent, isMain);
+    };
+    return {
+      captured,
+      restore() {
+        Module._resolveFilename = realResolve;
+        Module._load = realLoad;
+      },
+    };
+  }
+
+  // Production wiring runs only on Node 22+ (requireNode22); the
+  // canonicalization unit tests above run everywhere.
+  it(
+    'the SDK receives lnurlDomain blink.sv (mainnet) / staging.blink.sv (regtest)',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const saved = {
+        home: os.homedir,
+        mnemonic: process.env.SPARK_MNEMONIC,
+        key: process.env.BREEZ_API_KEY,
+        domain: process.env.SPARK_LNURL_DOMAIN,
+      };
+      const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-domain-test-'));
+      os.homedir = () => tmpHome;
+      process.env.SPARK_MNEMONIC = VALID_MNEMONIC;
+      process.env.BREEZ_API_KEY = 'breez-test-key';
+      delete process.env.SPARK_LNURL_DOMAIN;
+      const harness = installFakeSdkPackage();
+      try {
+        // Fresh _spark_sdk so loadSdkModule() binds to the fake package.
+        const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+        delete require.cache[sdkPath];
+        const fresh = require(sdkPath);
+        const { disconnect } = await fresh.connect({ network: 'mainnet' });
+        await disconnect();
+        const { disconnect: d2 } = await fresh.connect({ network: 'regtest' });
+        await d2();
+        assert.equal(harness.captured.length, 2, 'the fake SDK was connected twice');
+        assert.equal(harness.captured[0].lnurlDomain, 'blink.sv', 'mainnet connectors receive the Blink domain');
+        assert.equal(
+          harness.captured[1].lnurlDomain,
+          'staging.blink.sv',
+          'regtest connectors receive the staging domain',
+        );
+        // The SDK's own breez.tips default must never survive our wiring.
+        for (const cfg of harness.captured) {
+          assert.notEqual(cfg.lnurlDomain, 'breez.tips');
+        }
+      } finally {
+        harness.restore();
+        os.homedir = saved.home;
+        if (saved.mnemonic === undefined) delete process.env.SPARK_MNEMONIC;
+        else process.env.SPARK_MNEMONIC = saved.mnemonic;
+        if (saved.key === undefined) delete process.env.BREEZ_API_KEY;
+        else process.env.BREEZ_API_KEY = saved.key;
+        if (saved.domain === undefined) delete process.env.SPARK_LNURL_DOMAIN;
+        else process.env.SPARK_LNURL_DOMAIN = saved.domain;
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 // ── spark_lnaddress.validateUsername ─────────────────────────────────────────
