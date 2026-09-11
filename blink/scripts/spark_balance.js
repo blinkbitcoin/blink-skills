@@ -20,7 +20,7 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
-const { connect, waitForStableBalance } = require('./_spark_sdk');
+const { connect, waitForStableBalance, normalizeTokenBalances } = require('./_spark_sdk');
 
 function parseArgs(argv) {
   let network = process.env.SPARK_NETWORK || 'mainnet';
@@ -40,6 +40,9 @@ async function main() {
     // Wait for a stable balance to avoid reporting a mid-sync transient right
     // after an incoming payment.
     const { balanceSats, stable } = await waitForStableBalance(sdk);
+    // Token balances (USDB and any other BTKN tokens held) come from the same
+    // getInfo read; balances are STRINGS (BigInt precision preserved).
+    const info = await sdk.getInfo({ ensureSynced: false });
     console.log(
       JSON.stringify(
         {
@@ -47,6 +50,7 @@ async function main() {
           network,
           balanceSats,
           stable,
+          tokenBalances: normalizeTokenBalances(info.tokenBalances),
         },
         null,
         2,

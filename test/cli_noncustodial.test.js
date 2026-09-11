@@ -34,6 +34,8 @@ const SPARK_COMMANDS = [
   'spark-transactions',
   'spark-subscribe',
   'spark-info',
+  'spark-token-info',
+  'spark-receive-token',
 ];
 const CREDENTIAL_FREE_COMMANDS = ['resolve-receiver', 'create-invoice-lnaddress'];
 
@@ -121,11 +123,9 @@ describe('CLI: spark commands return instead of hanging', () => {
     });
     assert.equal(code, 0);
     const j = JSON.parse(stdout);
-    assert.deepEqual(
-      j.tokenBalances,
-      { 'token-1': { balance: 5000 } },
-      'a wallet holding tokens must not report an empty object',
-    );
+    assert.ok(j.tokenBalances['token-1'], 'a wallet holding tokens must not report an empty object');
+    assert.equal(j.tokenBalances['token-1'].balance, 5000);
+    assert.equal(j.tokenBalances['token-1'].tokenMetadata.decimals, 6, 'metadata rides along');
   });
 
   it('spark-info emits unsafe bigints as decimal strings, never rounded', async () => {
@@ -138,6 +138,107 @@ describe('CLI: spark commands return instead of hanging', () => {
     const j = JSON.parse(stdout);
     assert.equal(j.tokenBalances['token-1'].balance, huge);
     assert.equal(typeof j.tokenBalances['token-1'].balance, 'string');
+  });
+
+  // ── token (BTKN / USDB) surface ──────────────────────────────────────────────
+
+  it('spark-balance includes normalized tokenBalances with metadata', async () => {
+    const { code, stdout } = await runCli(['spark-balance'], {
+      env: {
+        SPARK_STUB_BALANCE: '2551',
+        SPARK_STUB_TOKEN_BALANCES: JSON.stringify({ 'token-1': { balance: 10500000 } }),
+      },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.balanceSats, 2551);
+    assert.equal(j.tokenBalances['token-1'].balance, '10500000', 'balance is a precision-preserving string');
+    assert.equal(j.tokenBalances['token-1'].balanceFormatted, '10.500000', 'formatted at the token decimals');
+    assert.equal(j.tokenBalances['token-1'].ticker, 'TKN', 'metadata is flattened onto the entry');
+  });
+
+  it('spark-token-info resolves the usdb alias on mainnet and fetches metadata', async () => {
+    const { code, stdout } = await runCli(['spark-token-info', 'usdb'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.found, true);
+    assert.equal(j.ticker, 'USDB');
+    assert.equal(j.decimals, 6);
+    // The alias must resolve to the documented mainnet constant.
+    assert.equal(j.identifier, 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87');
+  });
+
+  it('the usdb alias on regtest fails with the SPARK_USDB_TOKEN hint unless the env var is set', async () => {
+    const { code, stderr } = await runCli(['spark-token-info', 'usdb', '--network', 'regtest']);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /SPARK_USDB_TOKEN/);
+  });
+
+  it('spark-receive-token mints a Spark invoice with the resolved token and base units', async () => {
+    const { code, stdout, stderr } = await runCli(['spark-receive-token', '25', '--description', 'Invoice #42']);
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.event, 'token_invoice_created');
+    assert.equal(j.tokenIdentifier, 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87');
+    assert.equal(j.amountBaseUnits, '25000000', '25 USDB at 6 decimals');
+    assert.ok(j.paymentRequest.startsWith('sprtstub1'));
+    assert.match(stderr, /Stub Dollar \(USDB\), 6 decimals/);
+  });
+
+  it('spark-receive-token --base-units skips the metadata lookup', async () => {
+    const { code, stdout } = await runCli(['spark-receive-token', '10500000', '--base-units']);
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.amountBaseUnits, '10500000');
+    assert.equal(j.baseUnits, true);
+  });
+
+  it('spark-send --token routes prepare with tokenIdentifier + base units (dry-run)', async () => {
+    const { code, stdout, stderr } = await runCli(['spark-send', 'sprt1stub', '10.5', '--token', 'usdb', '--dry-run'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.equal(code, 0);
+    assert.match(stderr, /STUB_TOKEN=btkn1/);
+    const j = JSON.parse(stdout);
+    assert.equal(j.event, 'send_prepared');
+    assert.equal(j.destinationType, 'spark');
+    assert.equal(j.tokenIdentifier, 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87');
+    assert.equal(j.amountBaseUnits, '10500000');
+  });
+
+  it('spark-send --token --from-btc attaches conversionOptions and reserves the sats side', async () => {
+    // The stub's conversionEstimate for fromBitcoin is amountIn=50000 (sats).
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-token-'));
+    try {
+      const { code, stdout, stderr } = await runCli(
+        ['spark-send', 'sprt1stub', '10.5', '--token', 'usdb', '--from-btc', '--dry-run'],
+        { env: { SPARK_STUB_ECHO: '1', HOME: home, BLINK_BUDGET_DAILY_SATS: '100000' } },
+      );
+      assert.equal(code, 0);
+      assert.match(stderr, /STUB_CONV=fromBitcoin/);
+      const j = JSON.parse(stdout);
+      assert.equal(j.conversionEstimate.conversionType, 'fromBitcoin');
+      assert.equal(j.conversionEstimate.amountIn, '50000');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('spark-fee-probe quotes a token conversion (prepare only)', async () => {
+    const { code, stdout } = await runCli(['spark-fee-probe', 'lnbc1000u1p0x', '1000', '--from-token', 'usdb'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.event, 'fee_probe');
+    assert.equal(j.conversionEstimate.conversionType, 'toBitcoin');
+    assert.equal(j.conversionEstimate.amountOut, '45000', 'the sats side of the quote');
+  });
+
+  it('spark-send --token with a BOLT-11 destination is rejected', async () => {
+    const { code, stderr } = await runCli(['spark-send', 'lnbc1000u1p0x', '10', '--token', 'usdb', '--dry-run']);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /Token sends require a Spark address or Spark invoice/);
   });
 
   it('the standalone wrapper (direct script invocation) drains stdout and exits cleanly', async () => {

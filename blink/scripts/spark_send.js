@@ -47,7 +47,7 @@
  * CAUTION: This signs and sends real bitcoin from a self-custodial wallet.
  */
 
-const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
+const { connect, feeFromPrepare, safeErrorDetail, resolveTokenIdentifier, parseTokenAmount } = require('./_spark_sdk');
 const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
 
 function parseArgs(argv) {
@@ -56,6 +56,17 @@ function parseArgs(argv) {
   let dryRun = false;
   let force = false;
   let network = process.env.SPARK_NETWORK || 'mainnet';
+  let token = null;
+  let baseUnits = false;
+  let fromBtc = false;
+  let fromToken = null;
+  let slippageBps = 50;
+
+  // Pre-scan: the amount semantics depend on whether --token appears
+  // ANYWHERE in argv — '10.5' is a decimal token amount in token mode but
+  // must be integer sats otherwise. Deciding positionally would corrupt an
+  // amount that precedes the flag ('spark-send <dest> 10.5 --token usdb').
+  const tokenModePre = argv.includes('--token');
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -66,14 +77,29 @@ function parseArgs(argv) {
     } else if (arg === '--network' && i + 1 < argv.length) {
       network = argv[i + 1];
       i++;
+    } else if (arg === '--token' && i + 1 < argv.length) {
+      token = argv[++i];
+    } else if (arg === '--base-units') {
+      baseUnits = true;
+    } else if (arg === '--from-btc') {
+      fromBtc = true;
+    } else if (arg === '--from-token' && i + 1 < argv.length) {
+      fromToken = argv[++i];
+    } else if (arg === '--slippage-bps' && i + 1 < argv.length) {
+      slippageBps = parseInt(argv[++i], 10);
+      if (isNaN(slippageBps) || slippageBps < 0) throw new Error('--slippage-bps must be a non-negative integer');
     } else if (destination === null) {
       destination = arg.trim();
     } else if (amountSats === null) {
-      amountSats = parseInt(arg, 10);
-      if (isNaN(amountSats) || amountSats <= 0) throw new Error('amount_sats must be a positive integer');
+      if (tokenModePre) {
+        amountSats = arg; // token mode: keep the RAW string (decimal or base units)
+      } else {
+        amountSats = parseInt(arg, 10);
+        if (isNaN(amountSats) || amountSats <= 0) throw new Error('amount_sats must be a positive integer');
+      }
     }
   }
-  return { destination, amountSats, dryRun, force, network };
+  return { destination, amountSats, dryRun, force, network, token, baseUnits, fromBtc, fromToken, slippageBps };
 }
 
 /**
@@ -93,7 +119,7 @@ function classifyDestination(parsed) {
   const t = parsed && typeof parsed.type === 'string' ? parsed.type.toLowerCase() : '';
   if (t === 'lnurlpay' || t === 'lightningaddress') return { type: 'lnurl', parsed };
   if (t === 'bolt11invoice') return { type: 'bolt11', parsed };
-  if (t === 'sparkaddress') return { type: 'spark', parsed };
+  if (t === 'sparkaddress' || t === 'sparkinvoice') return { type: 'spark', parsed };
   const e = new Error(
     `Unsupported destination type '${t || 'unknown'}'. Supported: BOLT-11 invoice, Spark address, Lightning Address, LNURL-pay URL.`,
   );
@@ -165,6 +191,42 @@ async function prepareBolt(sdk, destination, amountSats) {
 }
 
 /**
+ * Prepare a TOKEN send (BTKN, e.g. USDB) to a Spark address or Spark invoice.
+ * amountBaseUnits is a bigint in the token's base units (USDB: 6 decimals).
+ * conversionOptions (optional) pays the token amount by converting from BTC
+ * on the fly (fromBitcoin) — or, with convertToBitcoin, pays a BTC payment
+ * from token funds (amount/tokenIdentifier are then omitted per the SDK).
+ *
+ * @returns {{ prepareResponse: object, feeSats: number|null }}
+ */
+async function prepareToken(sdk, destination, amountBaseUnits, tokenIdentifier, conversionOptions) {
+  const request = {
+    paymentRequest: { type: 'input', input: destination },
+  };
+  if (amountBaseUnits !== undefined && amountBaseUnits !== null) request.amount = BigInt(amountBaseUnits);
+  if (tokenIdentifier !== undefined && tokenIdentifier !== null) request.tokenIdentifier = tokenIdentifier;
+  if (conversionOptions !== undefined && conversionOptions !== null) request.conversionOptions = conversionOptions;
+  const prepareResponse = await sdk.prepareSendPayment(request);
+  return { prepareResponse, feeSats: feeFromPrepare(prepareResponse) };
+}
+
+/**
+ * Extract the conversion estimate (if any) from a prepare response into a
+ * JSON-safe shape. amountIn is in the SOURCE asset (sats for fromBitcoin,
+ * token base units for toBitcoin); amountOut in the TARGET asset.
+ */
+function conversionEstimateFrom(prepareResponse) {
+  const est = prepareResponse && prepareResponse.conversionEstimate;
+  if (!est) return null;
+  return {
+    amountIn: String(est.amountIn),
+    amountOut: String(est.amountOut),
+    fee: String(est.fee),
+    conversionType: est.options && est.options.conversionType ? est.options.conversionType.type : undefined,
+  };
+}
+
+/**
  * Does this SDK payment status mean the payment did not go through?
  *
  * Compared case-insensitively because the SDK's casing has moved between
@@ -187,15 +249,38 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.destination || args.amountSats === null) {
     console.error(
-      'Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]',
+      'Usage: node spark_send.js <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]\n' +
+        '       node spark_send.js <spark-address-or-invoice> <amount> --token usdb|<identifier> [--base-units]\n' +
+        '                                        [--from-btc] [--from-token usdb|<identifier>] [--slippage-bps <n>]',
     );
     process.exit(1);
   }
 
-  console.error('⚠️  NON-CUSTODIAL SEND: this signs a transaction with your account seed and spends real bitcoin.');
+  const tokenMode = args.token !== null || args.fromBtc || args.fromToken !== null;
+  console.error(
+    tokenMode
+      ? '⚠️  NON-CUSTODIAL TOKEN SEND: this signs a transaction with your account seed and moves real funds (token and/or BTC).'
+      : '⚠️  NON-CUSTODIAL SEND: this signs a transaction with your account seed and spends real bitcoin.',
+  );
 
   const { sdk, disconnect } = await connect({ network: args.network });
   try {
+    // Resolve token identifiers once (usdb alias → per-network identifier).
+    const tokenIdentifier = args.token !== null ? resolveTokenIdentifier(args.token, args.network) : null;
+    const fromTokenIdentifier = args.fromToken !== null ? resolveTokenIdentifier(args.fromToken, args.network) : null;
+    if (args.token !== null && args.fromToken !== null) {
+      throw new Error('--token and --from-token are mutually exclusive (a payment converts in ONE direction).');
+    }
+    if (args.fromBtc && args.fromToken !== null) {
+      throw new Error('--from-btc and --from-token are mutually exclusive.');
+    }
+    if (args.fromBtc && args.token === null) {
+      throw new Error('--from-btc requires --token (the token the payment is denominated in).');
+    }
+    if (args.fromToken !== null && args.token !== null) {
+      throw new Error('--from-token pays a BTC payment — do not also pass --token.');
+    }
+
     // 1. Classify the destination.
     const parsed = await sdk.parse(args.destination);
     // Exhaustive classification: anything the SDK recognizes but this skill
@@ -203,8 +288,212 @@ async function main() {
     // before any prepare or budget interaction.
     const dest = classifyDestination(parsed);
     console.error(
-      `Destination classified as ${dest.type === 'lnurl' ? 'Lightning Address / LNURL-pay' : dest.type === 'spark' ? 'Spark address' : 'BOLT-11 invoice'}.`,
+      `Destination classified as ${
+        dest.type === 'lnurl'
+          ? 'Lightning Address / LNURL-pay'
+          : dest.type === 'spark'
+            ? 'Spark address / Spark invoice'
+            : 'BOLT-11 invoice'
+      }.`,
     );
+
+    // ── Token / conversion branch ──
+    if (tokenMode) {
+      if (args.token !== null) {
+        // Sending tokens (optionally paid via --from-btc conversion).
+        if (dest.type !== 'spark') {
+          throw new Error(
+            'Token sends require a Spark address or Spark invoice destination (on-chain, BOLT-11 and LNURL are BTC-only).',
+          );
+        }
+        // If the destination is a Spark INVOICE with its own token/amount,
+        // passing ours must match; the SDK validates that.
+        let amountBaseUnits;
+        if (args.baseUnits) {
+          if (!/^\d+$/.test(String(args.amountSats))) {
+            throw new Error('--base-units amount must be a non-negative integer');
+          }
+          amountBaseUnits = BigInt(args.amountSats);
+        } else {
+          const meta = await sdk.getTokensMetadata({ tokenIdentifiers: [tokenIdentifier] });
+          const m = meta && meta.tokensMetadata && meta.tokensMetadata[0];
+          if (!m) {
+            throw new Error(`No metadata found for token ${tokenIdentifier} — use --base-units to skip the lookup.`);
+          }
+          console.error(`Token: ${m.name} (${m.ticker}), ${m.decimals} decimals.`);
+          amountBaseUnits = parseTokenAmount(args.amountSats, m.decimals);
+        }
+
+        const conversionOptions = args.fromBtc
+          ? { conversionType: { type: 'fromBitcoin' }, maxSlippageBps: args.slippageBps }
+          : null;
+        const { prepareResponse, feeSats } = await prepareToken(
+          sdk,
+          args.destination,
+          amountBaseUnits,
+          tokenIdentifier,
+          conversionOptions,
+        );
+        const conversion = conversionEstimateFrom(prepareResponse);
+        if (conversion) {
+          console.error(
+            `Conversion estimate: ${conversion.amountIn} source units → ${conversion.amountOut} target units (fee ${conversion.fee}).`,
+          );
+        }
+        console.error(
+          `Prepared token payment. Estimated fee: ${feeSats === null ? 'unknown' : `${feeSats} (token base units)`}.`,
+        );
+
+        if (args.dryRun) {
+          console.log(
+            JSON.stringify(
+              {
+                event: 'send_prepared',
+                dryRun: true,
+                destination: args.destination,
+                destinationType: 'spark',
+                tokenIdentifier,
+                amountBaseUnits: String(amountBaseUnits),
+                feeBaseUnits: feeSats,
+                conversionEstimate: conversion,
+                network: args.network,
+              },
+              null,
+              2,
+            ),
+          );
+          return;
+        }
+
+        // Budget: the sats budget is a SATS instrument. A plain token send
+        // moves no sats (no reservation). A --from-btc send converts SATS
+        // into the token to pay — the sats side is conversionEstimate.amountIn,
+        // and THAT is what the budget must reserve.
+        let reservationId = null;
+        if (args.fromBtc && conversion) {
+          const satsSide = Number(conversion.amountIn);
+          if (Number.isSafeInteger(satsSide) && satsSide > 0) {
+            const r = reserveBudget(
+              { sats: satsSide, command: 'spark-send', domain: null },
+              { requireConfigured: false },
+            );
+            if (!r.allowed) {
+              throw new Error(`Budget exceeded: ${r.reason} Use --force to override.`);
+            }
+            reservationId = r.id;
+          }
+        }
+
+        let result;
+        try {
+          result = await sdk.sendPayment({ prepareResponse });
+        } catch (e) {
+          if (reservationId) releaseSpend(reservationId);
+          throw e;
+        }
+        const payment = result && result.payment ? result.payment : result;
+        const status = (payment && payment.status) || 'SUBMITTED';
+        if (String(status).toLowerCase() !== 'failed' && reservationId) {
+          settleSpend({ reservationId, sats: Number(conversion.amountIn), command: 'spark-send', domain: null });
+        } else if (reservationId) {
+          releaseSpend(reservationId);
+        }
+        console.log(
+          JSON.stringify(
+            {
+              event: 'send_result',
+              status,
+              destination: args.destination,
+              destinationType: 'spark',
+              tokenIdentifier,
+              amountBaseUnits: String(amountBaseUnits),
+              feeBaseUnits: feeSats,
+              conversionEstimate: conversion,
+              paymentId: (payment && (payment.id || payment.paymentHash)) || null,
+              network: args.network,
+            },
+            null,
+            2,
+          ),
+        );
+        if (String(status).toLowerCase() === 'failed') {
+          process.exitCode = 1;
+          console.error(`Payment reported status '${status}'. Exiting non-zero.`);
+        }
+        return;
+      }
+
+      // --from-token: pay a BTC payment (BOLT-11) using token funds.
+      if (dest.type !== 'bolt11') {
+        throw new Error(
+          '--from-token pays a BOLT-11 invoice from token funds — the destination must be a BTC invoice.',
+        );
+      }
+      const conversionOptions = {
+        conversionType: { type: 'toBitcoin', fromTokenIdentifier: fromTokenIdentifier },
+        maxSlippageBps: args.slippageBps,
+      };
+      const { prepareResponse, feeSats } = await prepareToken(sdk, args.destination, null, null, conversionOptions);
+      const conversion = conversionEstimateFrom(prepareResponse);
+      if (conversion) {
+        console.error(
+          `Conversion estimate: ${conversion.amountIn} token base units → ${conversion.amountOut} sats (fee ${conversion.fee}).`,
+        );
+      }
+      console.error(`Prepared payment. Estimated routing fee: ${feeSats === null ? 'unknown' : `${feeSats} sats`}.`);
+
+      if (args.dryRun) {
+        console.log(
+          JSON.stringify(
+            {
+              event: 'send_prepared',
+              dryRun: true,
+              destination: args.destination,
+              destinationType: 'bolt11',
+              amountSats: args.amountSats,
+              feeSats,
+              fromTokenIdentifier,
+              conversionEstimate: conversion,
+              network: args.network,
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+
+      // No sats leave the wallet (tokens are the source asset) — the sats
+      // budget does not apply; documented in SKILL.md.
+      const result = await sdk.sendPayment({ prepareResponse });
+      const payment = result && result.payment ? result.payment : result;
+      const status = (payment && payment.status) || 'SUBMITTED';
+      console.log(
+        JSON.stringify(
+          {
+            event: 'send_result',
+            status,
+            destination: args.destination,
+            destinationType: 'bolt11',
+            amountSats: args.amountSats,
+            feeSats,
+            fromTokenIdentifier,
+            conversionEstimate: conversion,
+            paymentId: (payment && (payment.id || payment.paymentHash)) || null,
+            network: args.network,
+          },
+          null,
+          2,
+        ),
+      );
+      if (String(status).toLowerCase() === 'failed') {
+        process.exitCode = 1;
+        console.error(`Payment reported status '${status}'. Exiting non-zero.`);
+      }
+      return;
+    }
+
+    // ── BTC path (unchanged) ──
 
     // 2. Prepare (resolves fees) via the matching path.
     const { prepareResponse, feeSats } =
@@ -354,4 +643,6 @@ module.exports = {
   classifyDestination,
   prepareLnurl,
   prepareBolt,
+  prepareToken,
+  conversionEstimateFrom,
 };

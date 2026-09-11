@@ -601,6 +601,101 @@ function safeErrorDetail(value) {
   }
 }
 
+// ── Token (BTKN) helpers ─────────────────────────────────────────────────────
+
+/**
+ * USDB token identifier on Spark MAINNET (issued by Brale; 6 decimals).
+ * Override for other networks (regtest has its own identifier) or testing
+ * with the SPARK_USDB_TOKEN env var.
+ */
+const USDB_TOKEN_MAINNET = 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87';
+
+/**
+ * Resolve a --token argument to a concrete token identifier.
+ * 'usdb' resolves per-network: SPARK_USDB_TOKEN env var wins, then the
+ * mainnet constant (only valid on mainnet — regtest must set the env var
+ * or pass the identifier explicitly). Anything else passes through as-is.
+ *
+ * @param {string} token  'usdb' or a concrete token identifier
+ * @param {string} network
+ * @returns {string}
+ */
+function resolveTokenIdentifier(token, network) {
+  if (token !== 'usdb') return token;
+  const fromEnv = process.env.SPARK_USDB_TOKEN;
+  if (fromEnv) return fromEnv;
+  if (network !== 'mainnet') {
+    throw new Error(
+      "The 'usdb' alias has no known identifier on this network — set SPARK_USDB_TOKEN or pass the token identifier explicitly with --token.",
+    );
+  }
+  return USDB_TOKEN_MAINNET;
+}
+
+/**
+ * Convert a human-readable decimal amount to base units.
+ * '10.5' with 6 decimals -> 10500000n. Rejects negative/garbage input and
+ * more fractional digits than the token supports.
+ *
+ * @param {string} input
+ * @param {number} decimals
+ * @returns {bigint}
+ */
+function parseTokenAmount(input, decimals) {
+  const m = String(input)
+    .trim()
+    .match(/^(\d+)(?:\.(\d+))?$/);
+  if (!m) throw new Error(`Invalid token amount '${input}' — expected a non-negative decimal like 10.5`);
+  const frac = m[2] || '';
+  if (frac.length > decimals) {
+    throw new Error(`Amount '${input}' has more than ${decimals} decimal places for this token`);
+  }
+  const padded = (frac + '0'.repeat(decimals)).slice(0, decimals);
+  return BigInt(m[1] + padded);
+}
+
+/**
+ * Format base units for display: 10500000n with 6 decimals -> '10.500000'.
+ * @param {bigint|number} units
+ * @param {number} decimals
+ * @returns {string}
+ */
+function formatTokenAmount(units, decimals) {
+  const n = BigInt(units);
+  const negative = n < 0n;
+  const abs = negative ? -n : n;
+  const base = 10n ** BigInt(decimals);
+  const whole = abs / base;
+  const frac = (abs % base).toString().padStart(decimals, '0');
+  return `${negative ? '-' : ''}${whole}${decimals > 0 ? '.' + frac : ''}`;
+}
+
+/**
+ * Normalize a tokenBalances Map (SDK shape) into a plain JSON-safe object:
+ *   { [identifier]: { balance: string, decimals, name, ticker, issuerPublicKey } }
+ * The balance is a STRING (BigInt) — token supplies can exceed the safe
+ * integer range and precision must never be silently lost.
+ *
+ * @param {Map<string, {balance: bigint, tokenMetadata: object}>|undefined} tokenBalances
+ * @returns {object}
+ */
+function normalizeTokenBalances(tokenBalances) {
+  if (!tokenBalances || typeof tokenBalances[Symbol.iterator] !== 'function') return {};
+  const out = {};
+  for (const [id, tb] of tokenBalances) {
+    const meta = tb && tb.tokenMetadata ? tb.tokenMetadata : {};
+    out[String(id)] = {
+      balance: String(tb.balance),
+      decimals: meta.decimals,
+      name: meta.name,
+      ticker: meta.ticker,
+      issuerPublicKey: meta.issuerPublicKey,
+      balanceFormatted: formatTokenAmount(tb.balance, meta.decimals || 0),
+    };
+  }
+  return out;
+}
+
 module.exports = {
   SPARK_PACKAGE,
   DEFAULT_NETWORK,
@@ -619,4 +714,9 @@ module.exports = {
   safeErrorDetail,
   waitForStableBalance,
   normalizePayment,
+  USDB_TOKEN_MAINNET,
+  resolveTokenIdentifier,
+  parseTokenAmount,
+  formatTokenAmount,
+  normalizeTokenBalances,
 };

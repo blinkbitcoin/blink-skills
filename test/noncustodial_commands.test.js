@@ -131,6 +131,8 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
       normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
       // spark_info imports this for its output payload.
       normalizeSdkValue: (value) => value,
+      // spark_balance flattens token balances through this.
+      normalizeTokenBalances: () => ({}),
       async waitForStableBalance(sdk) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };

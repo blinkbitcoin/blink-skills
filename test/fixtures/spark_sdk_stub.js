@@ -33,7 +33,21 @@ const echo = process.env.SPARK_STUB_ECHO === '1';
 let stubTokenBalances = null;
 if (process.env.SPARK_STUB_TOKEN_BALANCES) {
   const parsed = JSON.parse(process.env.SPARK_STUB_TOKEN_BALANCES);
-  stubTokenBalances = new Map(Object.entries(parsed).map(([k, v]) => [k, { ...v, balance: BigInt(v.balance) }]));
+  stubTokenBalances = new Map(
+    Object.entries(parsed).map(([k, v]) => [
+      k,
+      {
+        balance: BigInt(v.balance),
+        tokenMetadata: {
+          identifier: k,
+          name: v.name || 'Token',
+          ticker: v.ticker || 'TKN',
+          decimals: v.decimals === undefined ? 6 : v.decimals,
+          issuerPublicKey: '02ffff',
+        },
+      },
+    ]),
+  );
 }
 
 const fakeSdk = {
@@ -41,6 +55,25 @@ const fakeSdk = {
     const info = { balanceSats: balance };
     if (stubTokenBalances) info.tokenBalances = stubTokenBalances;
     return info;
+  },
+  async getTokensMetadata(req) {
+    const ids = (req && req.tokenIdentifiers) || [];
+    return {
+      tokensMetadata: ids.map((id) => ({
+        identifier: id,
+        issuerPublicKey: '02ffff',
+        name: 'Stub Dollar',
+        ticker: 'USDB',
+        decimals: 6,
+        maxSupply: '1000000000000',
+        isFreezable: false,
+      })),
+    };
+  },
+  async receivePayment(req) {
+    const method = req && req.paymentMethod;
+    if (!method || method.type !== 'sparkInvoice') throw new Error('stub: only sparkInvoice receive is supported');
+    return { paymentRequest: `sprtstub1${method.amount || 0}${method.tokenIdentifier || ''}`, fee: 0n };
   },
   async listPayments(req) {
     if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);
@@ -53,6 +86,14 @@ const fakeSdk = {
     // unsupported destinations (e.g. bitcoinAddress) and the sparkAddress path.
     const forced = process.env.SPARK_STUB_PARSE_TYPE;
     if (forced) return { type: forced };
+    if (String(input).startsWith('sprt'))
+      return {
+        type: 'sparkAddress',
+        address: String(input),
+        identityPublicKey: '02ffff',
+        network: 'MAINNET',
+        source: {},
+      };
     return input.includes('@') ? { type: 'lnUrlPay', callback: 'https://blink.sv/cb' } : { type: 'bolt11Invoice' };
   },
   async prepareLnurlPay(req) {
@@ -64,6 +105,30 @@ const fakeSdk = {
   },
   async prepareSendPayment(req) {
     if (echo) console.error(`STUB_AMOUNT=${req.amount}`);
+    if (echo && req.tokenIdentifier) console.error(`STUB_TOKEN=${req.tokenIdentifier}`);
+    if (echo && req.conversionOptions) {
+      console.error(`STUB_CONV=${req.conversionOptions.conversionType.type}`);
+    }
+    // Token-mode prepare: mirror the SDK's token send methods. When
+    // conversionOptions are present, include a deterministic estimate
+    // (amountIn = source asset, amountOut = target asset, fee = 0).
+    if (req.tokenIdentifier || req.conversionOptions) {
+      const response = {
+        paymentMethod: { type: 'sparkAddress', address: 'sprt1stub', fee: '0', tokenIdentifier: req.tokenIdentifier },
+        amount: req.amount || 0n,
+        feePolicy: { type: 'simple' },
+      };
+      if (req.tokenIdentifier) response.tokenIdentifier = req.tokenIdentifier;
+      if (req.conversionOptions) {
+        response.conversionEstimate = {
+          options: req.conversionOptions,
+          amountIn: req.conversionOptions.conversionType.type === 'fromBitcoin' ? 50000n : 1000000n,
+          amountOut: req.conversionOptions.conversionType.type === 'fromBitcoin' ? 1000000n : 45000n,
+          fee: 0n,
+        };
+      }
+      return response;
+    }
     return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
   },
   async sendPayment() {
@@ -109,6 +174,59 @@ function normalizeSdkValue(value) {
   return value;
 }
 
+// Mirrors of the production _spark_sdk token helpers — the stub replaces
+// _spark_sdk, so every command-imported export must exist here. Standalone
+// (not methods): commands destructure these, losing `this`.
+const USDB_TOKEN_MAINNET = 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87';
+function resolveTokenIdentifier(token, network) {
+  if (token !== 'usdb') return token;
+  const fromEnv = process.env.SPARK_USDB_TOKEN;
+  if (fromEnv) return fromEnv;
+  if (network !== 'mainnet') {
+    throw new Error(
+      "The 'usdb' alias has no known identifier on this network — set SPARK_USDB_TOKEN or pass the token identifier explicitly with --token.",
+    );
+  }
+  return USDB_TOKEN_MAINNET;
+}
+function parseTokenAmount(input, decimals) {
+  const m = String(input)
+    .trim()
+    .match(/^(\d+)(?:\.(\d+))?$/);
+  if (!m) throw new Error(`Invalid token amount '${input}' — expected a non-negative decimal like 10.5`);
+  const frac = m[2] || '';
+  if (frac.length > decimals) {
+    throw new Error(`Amount '${input}' has more than ${decimals} decimal places for this token`);
+  }
+  const padded = (frac + '0'.repeat(decimals)).slice(0, decimals);
+  return BigInt(m[1] + padded);
+}
+function formatTokenAmount(units, decimals) {
+  const n = BigInt(units);
+  const negative = n < 0n;
+  const abs = negative ? -n : n;
+  const base = 10n ** BigInt(decimals);
+  const whole = abs / base;
+  const frac = (abs % base).toString().padStart(decimals, '0');
+  return `${negative ? '-' : ''}${whole}${decimals > 0 ? '.' + frac : ''}`;
+}
+function normalizeTokenBalances(tokenBalances) {
+  if (!tokenBalances || typeof tokenBalances[Symbol.iterator] !== 'function') return {};
+  const out = {};
+  for (const [id, tb] of tokenBalances) {
+    const meta = tb && tb.tokenMetadata ? tb.tokenMetadata : {};
+    out[String(id)] = {
+      balance: String(tb.balance),
+      decimals: meta.decimals,
+      name: meta.name,
+      ticker: meta.ticker,
+      issuerPublicKey: meta.issuerPublicKey,
+      balanceFormatted: formatTokenAmount(tb.balance, meta.decimals || 0),
+    };
+  }
+  return out;
+}
+
 const stub = {
   SPARK_PACKAGE: '@breeztech/breez-sdk-spark',
   DEFAULT_NETWORK: 'mainnet',
@@ -142,6 +260,13 @@ const stub = {
       return '(non-coercible error value)';
     }
   },
+  // Mirrors of the production token helpers (standalone functions — see the
+  // normalizeSdkValue note about destructuring and `this`).
+  USDB_TOKEN_MAINNET,
+  resolveTokenIdentifier,
+  parseTokenAmount,
+  formatTokenAmount,
+  normalizeTokenBalances,
   normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
   normalizeSdkValue,
   async waitForStableBalance(sdk) {

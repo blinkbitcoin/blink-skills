@@ -1132,6 +1132,149 @@ describe('_spark_sdk.normalizeSdkValue', () => {
   });
 });
 
+// ── _spark_sdk token helpers ──────────────────────────────────────────────────
+
+describe('_spark_sdk token helpers', () => {
+  const sdk = require('../blink/scripts/_spark_sdk');
+  const USDB = 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87';
+
+  describe('resolveTokenIdentifier', () => {
+    it("'usdb' resolves to the documented mainnet constant", () => {
+      assert.equal(sdk.resolveTokenIdentifier('usdb', 'mainnet'), USDB);
+    });
+    it('SPARK_USDB_TOKEN env var wins over the constant', () => {
+      const saved = process.env.SPARK_USDB_TOKEN;
+      process.env.SPARK_USDB_TOKEN = 'btkn1test';
+      try {
+        assert.equal(sdk.resolveTokenIdentifier('usdb', 'regtest'), 'btkn1test');
+      } finally {
+        if (saved === undefined) delete process.env.SPARK_USDB_TOKEN;
+        else process.env.SPARK_USDB_TOKEN = saved;
+      }
+    });
+    it('non-usdb passes through unchanged', () => {
+      assert.equal(sdk.resolveTokenIdentifier('btkn1other', 'regtest'), 'btkn1other');
+    });
+    it("'usdb' off-mainnet without the env var fails with the hint", () => {
+      const saved = process.env.SPARK_USDB_TOKEN;
+      delete process.env.SPARK_USDB_TOKEN;
+      try {
+        assert.throws(() => sdk.resolveTokenIdentifier('usdb', 'regtest'), /SPARK_USDB_TOKEN/);
+      } finally {
+        if (saved !== undefined) process.env.SPARK_USDB_TOKEN = saved;
+      }
+    });
+  });
+
+  describe('parseTokenAmount', () => {
+    it('converts a decimal amount at the token decimals (10.5 @ 6 -> 10500000)', () => {
+      assert.equal(sdk.parseTokenAmount('10.5', 6), 10500000n);
+    });
+    it('zero decimals keeps whole units', () => {
+      assert.equal(sdk.parseTokenAmount('7', 0), 7n);
+    });
+    it('pads short fractions to full precision', () => {
+      assert.equal(sdk.parseTokenAmount('0.5', 6), 500000n);
+      assert.equal(sdk.parseTokenAmount('1.000001', 6), 1000001n);
+    });
+    it('rejects more decimals than the token supports', () => {
+      assert.throws(() => sdk.parseTokenAmount('1.1234567', 6), /decimal places/);
+    });
+    it('rejects garbage and negatives', () => {
+      assert.throws(() => sdk.parseTokenAmount('abc', 6), /Invalid token amount/);
+      assert.throws(() => sdk.parseTokenAmount('-5', 6), /Invalid token amount/);
+    });
+  });
+
+  describe('formatTokenAmount', () => {
+    it('renders base units with the token decimals', () => {
+      assert.equal(sdk.formatTokenAmount(10500000n, 6), '10.500000');
+    });
+    it('handles zero-decimal tokens', () => {
+      assert.equal(sdk.formatTokenAmount(7n, 0), '7');
+    });
+  });
+
+  describe('normalizeTokenBalances', () => {
+    it('flattens a Map into precision-preserving JSON entries', () => {
+      const balances = new Map([
+        [
+          USDB,
+          {
+            balance: 10500000n,
+            tokenMetadata: {
+              identifier: USDB,
+              name: 'Bitcoin USD',
+              ticker: 'USDB',
+              decimals: 6,
+              issuerPublicKey: '02ff',
+            },
+          },
+        ],
+      ]);
+      const out = sdk.normalizeTokenBalances(balances);
+      assert.equal(out[USDB].balance, '10500000', 'balance stays a string (BigInt precision)');
+      assert.equal(out[USDB].balanceFormatted, '10.500000');
+      assert.equal(out[USDB].ticker, 'USDB');
+      assert.equal(out[USDB].decimals, 6);
+    });
+    it('empty/absent maps normalize to {}', () => {
+      assert.deepEqual(sdk.normalizeTokenBalances(undefined), {});
+      assert.deepEqual(sdk.normalizeTokenBalances(new Map()), {});
+    });
+  });
+});
+
+// ── spark_send conversionEstimateFrom ────────────────────────────────────────
+
+describe('spark_send.conversionEstimateFrom / prepareToken', () => {
+  const { conversionEstimateFrom, parseArgs } = require('../blink/scripts/spark_send');
+
+  it('extracts a JSON-safe conversion estimate', () => {
+    const est = conversionEstimateFrom({
+      conversionEstimate: {
+        options: { conversionType: { type: 'fromBitcoin' } },
+        amountIn: 50000n,
+        amountOut: 1000000n,
+        fee: 0n,
+      },
+    });
+    assert.deepEqual(est, {
+      amountIn: '50000',
+      amountOut: '1000000',
+      fee: '0',
+      conversionType: 'fromBitcoin',
+    });
+  });
+
+  it('returns null when there is no estimate', () => {
+    assert.equal(conversionEstimateFrom({}), null);
+    assert.equal(conversionEstimateFrom(null), null);
+  });
+
+  it('parseArgs keeps the RAW amount string whenever --token appears (any position)', () => {
+    const a = parseArgs(['sprt1xyz', '10.5', '--token', 'usdb']); // flag AFTER amount
+    assert.equal(a.amountSats, '10.5', 'must not parseInt a decimal token amount');
+    assert.equal(a.token, 'usdb');
+  });
+
+  it('parseArgs still integer-validates BTC amounts without --token', () => {
+    assert.throws(() => parseArgs(['dest', 'abc']), /positive integer/);
+    assert.throws(() => parseArgs(['dest', '0']), /positive integer/);
+    const ok = parseArgs(['dest', '100']);
+    assert.equal(ok.amountSats, 100);
+  });
+
+  it('parseArgs parses the conversion flags', () => {
+    const a = parseArgs(['dest', '100', '--from-btc', '--slippage-bps', '75']);
+    assert.equal(a.fromBtc, true);
+    assert.equal(a.slippageBps, 75);
+    const b = parseArgs(['dest', '100', '--from-token', 'usdb', '--base-units']);
+    assert.equal(b.fromToken, 'usdb');
+    assert.equal(b.baseUnits, true);
+  });
+});
+
 // ── storage preflight (review finding #1) ────────────────────────────────────
 //
 // The probe must require better-sqlite3 DIRECTLY and open a database, because
