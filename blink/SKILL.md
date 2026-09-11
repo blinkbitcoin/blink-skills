@@ -71,7 +71,7 @@ commands). Key concepts:
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`, and `l402-pay --spark`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`, `spark-token-info`, `spark-receive-token`, and `l402-pay --spark`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
 - **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and `l402-pay --spark`, and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
@@ -465,14 +465,6 @@ Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay �
 
 - `--qr` — render a terminal QR (stderr) and a PNG in /tmp for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
 
-### Spark Balance
-
-```bash
-blink spark-balance [--network mainnet|regtest]
-```
-
-Reads the BTC balance of a self-custodial (Spark) account directly from the wallet via the Breez Spark SDK. Non-custodial balances are **not visible through the Blink API**. Waits briefly for a stable balance after incoming payments (`stable` field in the output).
-
 ### Spark Info
 
 ```bash
@@ -481,15 +473,46 @@ blink spark-info [--network mainnet|regtest]
 
 Shows a Spark account's info from the SDK's `getInfo()` — balance plus any other fields the SDK version returns. SDK values are normalized for JSON: safe-integer BigInts become **numbers**, BigInts outside the safe range become **decimal strings**, and SDK Maps (e.g. `tokenBalances`) become **plain objects**. Non-custodial counterpart of `account-info`. Requires `SPARK_MNEMONIC` + `BREEZ_API_KEY`.
 
+### Spark Balance
+
+```bash
+blink spark-balance [--network mainnet|regtest]
+```
+
+Reads the BTC balance of a self-custodial (Spark) account directly from the wallet via the Breez Spark SDK — non-custodial balances are **not visible through the Blink API** — waiting briefly for a stable read after incoming payments (`stable` field), **plus `tokenBalances`** for every BTKN token held (USDB etc.): each entry carries the precision-preserving `balance` (string), `balanceFormatted`, and the token metadata (`ticker`, `decimals`, `name`).
+
+### Spark Token Info
+
+```bash
+blink spark-token-info <usdb|identifier> [--network mainnet|regtest]
+```
+
+Fetches BTKN token metadata (name, ticker, **decimals**, max supply, issuer) — resolves the decimal precision before sending token amounts, and verifies identifiers. The `usdb` alias resolves per-network: `SPARK_USDB_TOKEN` env var, then the documented mainnet constant (Brale-issued USDB, 6 decimals); on regtest the alias fails with the `SPARK_USDB_TOKEN` hint unless set.
+
+### Spark Receive Token
+
+```bash
+blink spark-receive-token <amount> [--token usdb|<identifier>] [--base-units] [--description "..."] [--network mainnet|regtest]
+```
+
+Mints a **Spark invoice** for receiving a BTKN token (e.g. USDB) into the self-custodial wallet — the `paymentRequest` string can be paid by any Spark wallet. The amount is decimal token units (`25` = 25 USDB, resolved via metadata decimals) or raw base units with `--base-units`. This is a Spark invoice, **not** a BOLT-11 Lightning invoice — the non-custodial counterpart of `create-invoice-usd` over Lightning does not exist (LNURL-pay receive is BTC-only); this is the token-native receive path.
+
 ### Spark Send
 
 ```bash
 blink spark-send <destination> <amount_sats> [--dry-run] [--force] [--network mainnet|regtest]
+
+# Token mode (BTKN, e.g. USDB):
+blink spark-send <spark-address-or-invoice> <amount> --token usdb|<identifier> [--base-units]
+blink spark-send <spark-address-or-invoice> <amount> --token <id> --from-btc [--slippage-bps <n>]
+blink spark-send <bolt11-invoice> <amount_sats> --from-token usdb|<identifier> [--slippage-bps <n>]
 ```
 
-Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destinations are classified **exhaustively**: only BOLT-11 invoices, Spark addresses, Lightning Addresses, and LNURL-pay URLs are accepted (a Lightning Address uses the LNURL-pay path). Anything else the SDK recognizes — on-chain Bitcoin addresses, BOLT-12 offers, cross-chain destinations — is rejected with `UNSUPPORTED_DESTINATION` before any prepare or budget interaction, and `destinationType` in the output is `bolt11`, `spark`, or `lnurl` accordingly. The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
+Signs and sends BTC from a Spark account **locally with the seed** — no Blink API involvement. Destinations are classified **exhaustively**: only BOLT-11 invoices, Spark addresses/invoices, Lightning Addresses, and LNURL-pay URLs are accepted (a Lightning Address uses the LNURL-pay path). Anything else the SDK recognizes — on-chain Bitcoin addresses, BOLT-12 offers, cross-chain destinations — is rejected with `UNSUPPORTED_DESTINATION` before any prepare or budget interaction, and `destinationType` in the output is `bolt11`, `spark`, or `lnurl` accordingly. The prepare step **attempts** to resolve fees and reports them as `feeSats` before sending; `feeSats` may be `null` (printed as `unknown`) when the SDK response shape is unrecognized — treat the fee as unknown and say so to the user before executing. `--dry-run` stops after the prepare step and moves nothing. Exits non-zero if the SDK reports a `failed` payment status.
 
 Subject to the same budget controls as the custodial pay commands: configured limits (`BLINK_BUDGET_HOURLY_SATS` / `BLINK_BUDGET_DAILY_SATS`) are enforced after fee resolution and before signing; an unconfigured budget does not block this explicit one-shot payment. Successful/pending sends are recorded in the spending log (a failed recording warns on stderr but never masks the payment result). `--force` bypasses the budget check for an over-limit send. **Budgets count the payment principal (the amount), not the routing fee** — the same convention as the custodial pay commands.
+
+**Token mode** (USDB and other BTKN tokens): `--token` sends tokens to a Spark address or Spark invoice; the amount is decimal token units (`10.5` USDB) resolved via the token's decimals, or raw base units with `--base-units` (`10500000` = 10.5 USDB at 6 decimals). `--from-btc` pays a token send by converting BTC on the fly — the **sats side of the conversion estimate is budget-enforced**, an absent/zero/unusable estimate refuses to dispatch unless `--force` is passed, and outcome-unknown post-dispatch errors keep the reservation fail-closed (only an explicit terminal `failed` releases it). `--from-token` pays a BOLT-11 invoice by converting tokens: the **invoice's BTC amount is authoritative** — a supplied amount that mismatches the invoice is rejected before dispatch (dry-runs included), and outputs emit the authoritative amount. No sats leave the wallet on `--from-token`, so the sats budget does not apply (tokens are spent). `--slippage-bps` caps conversion slippage (default 50 bps; failed conversions auto-refund per the SDK). Plain token sends are outside the sats budget by design. The `conversionEstimate` in the prepare output (`amountIn` source asset → `amountOut` target asset, `fee`) is the quote — dry-run or `spark-fee-probe` to see it without sending.
 
 > **AGENT:** This command spends self-custodial funds irreversibly. Probe the fee (`spark-fee-probe` or `--dry-run`) first, then confirm the amount and destination with the user before executing.
 
@@ -497,9 +520,11 @@ Subject to the same budget controls as the custodial pay commands: configured li
 
 ```bash
 blink spark-fee-probe <destination> <amount_sats> [--network mainnet|regtest]
+blink spark-fee-probe <spark-address> <amount> --token usdb|<identifier> [--from-btc]
+blink spark-fee-probe <bolt11-invoice> <amount_sats> --from-token usdb|<identifier>
 ```
 
-Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Same exhaustive destination allowlist as `spark-send`. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded.
+Estimates the fee for sending from a Spark account **without sending** — it runs the same prepare step as `spark-send` and stops there. Same exhaustive destination allowlist as `spark-send`. Non-custodial counterpart of `fee-probe`; use it before `spark-send` to check costs. Nothing is signed, nothing moves, nothing is recorded. Token/conversion flags are supported — the probe returns the `conversionEstimate` (the quote) alongside the fee.
 
 ### Spark Transactions
 
@@ -1570,6 +1595,8 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/spark_balance.js` — Non-custodial (Spark) BTC balance via the SDK
 - `{baseDir}/scripts/spark_info.js` — Non-custodial (Spark) account info via the SDK (getInfo dump)
 - `{baseDir}/scripts/spark_send.js` — Sign & send from a Spark account (BOLT-11 / LNURL / Spark address)
-- `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee to send from a Spark account (prepare only, nothing sent)
+- `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee / conversion quote to send from a Spark account (prepare only, nothing sent)
+- `{baseDir}/scripts/spark_token_info.js` — Fetch BTKN token metadata (name, ticker, decimals)
+- `{baseDir}/scripts/spark_receive_token.js` — Mint a Spark invoice to receive a BTKN token (e.g. USDB)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)
 - `{baseDir}/scripts/spark_subscribe.js` — Stream live Spark wallet events

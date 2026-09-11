@@ -369,29 +369,47 @@ commands['spark-balance'] = {
 
 commands['spark-send'] = {
   forceExit: true,
-  description: '[non-custodial] Sign & send BTC from a Spark account via the Breez SDK (requires SPARK_MNEMONIC)',
+  description:
+    '[non-custodial] Sign & send BTC or tokens from a Spark account via the Breez SDK (requires SPARK_MNEMONIC)',
   args: [
     {
       name: 'destination',
       required: true,
-      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, or Spark address',
+      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, Spark address, or Spark invoice',
     },
-    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+    {
+      name: 'amount',
+      required: true,
+      description: 'Amount in sats (or decimal token units with --token / raw base units with --base-units)',
+    },
   ],
   options: {
     'dry-run': { type: 'boolean', default: false },
     force: { type: 'boolean', default: false },
     network: { type: 'string' },
+    token: { type: 'string' },
+    'base-units': { type: 'boolean', default: false },
+    'from-btc': { type: 'boolean', default: false },
+    'from-token': { type: 'string' },
+    'slippage-bps': { type: 'string' },
   },
   optMeta: {
-    'dry-run': { description: 'Prepare & show fees without sending' },
+    'dry-run': { description: 'Prepare & show fees/conversion estimate without sending' },
     force: { description: 'Bypass the budget check for an over-limit send' },
     network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+    token: { description: 'Send a BTKN token (usdb alias or identifier); amount in token units', valueName: 'id|usdb' },
+    'base-units': { description: 'Amount is raw token base units (skip the decimal lookup)' },
+    'from-btc': { description: 'Pay a token send by converting BTC on the fly' },
+    'from-token': { description: 'Pay a BTC (BOLT-11) send by converting tokens on the fly', valueName: 'id|usdb' },
+    'slippage-bps': { description: 'Max conversion slippage in basis points (default 50)', valueName: 'n' },
   },
   examples: [
     'blink spark-send lnbc10u1p... 1000',
     'blink spark-send alice@blink.sv 1000',
     'blink spark-send alice@blink.sv 1000 --dry-run',
+    'blink spark-send sprt1... 10.5 --token usdb',
+    'blink spark-send sprt1... 10.5 --token usdb --from-btc',
+    'blink spark-send lnbc10u1p... 1000 --from-token usdb',
   ],
   action: async (pos, opts) => {
     const argv = [String(pos[0]), String(pos[1])];
@@ -400,6 +418,11 @@ commands['spark-send'] = {
     if (opts.network !== undefined) argv.push('--network', opts.network);
     if (opts['dry-run']) argv.push('--dry-run');
     if (opts.force) argv.push('--force');
+    if (opts.token !== undefined) argv.push('--token', opts.token);
+    if (opts['base-units']) argv.push('--base-units');
+    if (opts['from-btc']) argv.push('--from-btc');
+    if (opts['from-token'] !== undefined) argv.push('--from-token', opts['from-token']);
+    if (opts['slippage-bps'] !== undefined) argv.push('--slippage-bps', opts['slippage-bps']);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_send.js'));
     await main();
@@ -409,25 +432,48 @@ commands['spark-send'] = {
 commands['spark-fee-probe'] = {
   forceExit: true,
   description:
-    '[non-custodial] Estimate the fee to send from a Spark account — prepare only, nothing is sent (requires SPARK_MNEMONIC)',
+    '[non-custodial] Estimate the fee (and conversion quote) to send from a Spark account — prepare only, nothing is sent (requires SPARK_MNEMONIC)',
   args: [
     {
       name: 'destination',
       required: true,
-      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, or Spark address',
+      description: 'BOLT-11 invoice, Lightning Address (user@domain), LNURL, Spark address, or Spark invoice',
     },
-    { name: 'amount', required: true, description: 'Amount in satoshis', coerce: parseSats },
+    {
+      name: 'amount',
+      required: true,
+      description: 'Amount in sats (or decimal token units with --token / raw base units with --base-units)',
+    },
   ],
   options: {
     network: { type: 'string' },
+    token: { type: 'string' },
+    'base-units': { type: 'boolean', default: false },
+    'from-btc': { type: 'boolean', default: false },
+    'from-token': { type: 'string' },
+    'slippage-bps': { type: 'string' },
   },
   optMeta: {
     network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+    token: { description: 'Quote a BTKN token send (usdb alias or identifier)', valueName: 'id|usdb' },
+    'base-units': { description: 'Amount is raw token base units' },
+    'from-btc': { description: 'Quote paying the token send by converting BTC' },
+    'from-token': { description: 'Quote paying a BTC send by converting tokens', valueName: 'id|usdb' },
+    'slippage-bps': { description: 'Max conversion slippage in basis points (default 50)', valueName: 'n' },
   },
-  examples: ['blink spark-fee-probe lnbc10u1p... 1000', 'blink spark-fee-probe alice@blink.sv 1000'],
+  examples: [
+    'blink spark-fee-probe lnbc10u1p... 1000',
+    'blink spark-fee-probe alice@blink.sv 1000',
+    'blink spark-fee-probe sprt1... 10.5 --token usdb --from-btc',
+  ],
   action: async (pos, opts) => {
     const argv = [String(pos[0]), String(pos[1])];
     if (opts.network !== undefined) argv.push('--network', opts.network);
+    if (opts.token !== undefined) argv.push('--token', opts.token);
+    if (opts['base-units']) argv.push('--base-units');
+    if (opts['from-btc']) argv.push('--from-btc');
+    if (opts['from-token'] !== undefined) argv.push('--from-token', opts['from-token']);
+    if (opts['slippage-bps'] !== undefined) argv.push('--slippage-bps', opts['slippage-bps']);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_fee_probe.js'));
     await main();
@@ -479,6 +525,66 @@ commands['spark-info'] = {
     if (opts.network !== undefined) process.env.SPARK_NETWORK = opts.network;
     setProcessArgv([]);
     const { main } = require(path.join(scriptsDir, 'spark_info.js'));
+    await main();
+  },
+};
+
+commands['spark-token-info'] = {
+  forceExit: true,
+  description:
+    '[non-custodial] Show BTKN token metadata (name, ticker, decimals) via the Breez SDK (requires SPARK_MNEMONIC)',
+  args: [{ name: 'token', required: true, description: "'usdb' or a token identifier" }],
+  options: { network: { type: 'string' } },
+  optMeta: { network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' } },
+  examples: ['blink spark-token-info usdb', 'blink spark-token-info btkn1...'],
+  action: async (pos, opts) => {
+    const argv = [String(pos[0])];
+    if (opts.network !== undefined) argv.push('--network', opts.network);
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'spark_token_info.js'));
+    await main();
+  },
+};
+
+commands['spark-receive-token'] = {
+  forceExit: true,
+  description:
+    '[non-custodial] Mint a Spark invoice to receive a BTKN token (e.g. USDB) into the Spark wallet (requires SPARK_MNEMONIC)',
+  args: [
+    { name: 'amount', required: true, description: 'Decimal token units (or raw base units with --base-units)' },
+    {
+      name: 'description',
+      required: false,
+      variadic: true,
+      description: 'Optional invoice description (positional words or --description)',
+    },
+  ],
+  options: {
+    token: { type: 'string', default: 'usdb' },
+    'base-units': { type: 'boolean', default: false },
+    description: { type: 'string' },
+    network: { type: 'string' },
+  },
+  optMeta: {
+    token: { description: "'usdb' or a token identifier", valueName: 'id|usdb' },
+    'base-units': { description: 'Amount is raw base units (skip the decimal lookup)' },
+    description: { description: 'Invoice description', valueName: 'text' },
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: [
+    'blink spark-receive-token 25 --description "Invoice #42"',
+    'blink spark-receive-token 10500000 --base-units',
+  ],
+  action: async (pos, opts) => {
+    const argv = [String(pos[0])];
+    const description = pos.slice(1);
+    if (description.length > 0) argv.push(...description);
+    argv.push('--token', opts.token);
+    if (opts['base-units']) argv.push('--base-units');
+    if (opts.description !== undefined) argv.push('--description', opts.description);
+    if (opts.network !== undefined) argv.push('--network', opts.network);
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'spark_receive_token.js'));
     await main();
   },
 };

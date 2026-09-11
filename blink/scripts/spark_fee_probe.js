@@ -25,21 +25,120 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
-const { connect } = require('./_spark_sdk');
-const { parseArgs, classifyDestination, prepareLnurl, prepareBolt } = require('./spark_send');
+const { connect, resolveTokenIdentifier, parseTokenAmount } = require('./_spark_sdk');
+const {
+  parseArgs,
+  classifyDestination,
+  prepareLnurl,
+  prepareBolt,
+  prepareToken,
+  conversionEstimateFrom,
+} = require('./spark_send');
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.destination || args.amountSats === null || args.dryRun || args.force) {
-    console.error('Usage: node spark_fee_probe.js <destination> <amount_sats> [--network mainnet|regtest]');
+    console.error(
+      'Usage: node spark_fee_probe.js <destination> <amount_sats> [--network mainnet|regtest]\n' +
+        '       node spark_fee_probe.js <spark-address-or-invoice> <amount> --token usdb|<identifier> [--base-units] [--from-btc]\n' +
+        '       node spark_fee_probe.js <bolt11-invoice> <amount_sats> --from-token usdb|<identifier>',
+    );
     process.exit(1);
   }
 
+  const tokenMode = args.token !== null || args.fromBtc || args.fromToken !== null;
   const { sdk, disconnect } = await connect({ network: args.network });
   try {
     // 1. Classify the destination (same exhaustive rule as spark-send).
     const parsed = await sdk.parse(args.destination);
     const dest = classifyDestination(parsed);
+
+    if (tokenMode) {
+      // Token / conversion quote: the prepare response's conversionEstimate
+      // IS the quote (source units in, target units out, fee) — nothing sent.
+      let tokenIdentifier = null;
+      let amountBaseUnits = null;
+      let conversionOptions = null;
+
+      if (args.token !== null) {
+        if (dest.type !== 'spark') {
+          throw new Error('Token probes require a Spark address or Spark invoice destination.');
+        }
+        tokenIdentifier = resolveTokenIdentifier(args.token, args.network);
+        if (args.baseUnits) {
+          amountBaseUnits = BigInt(args.amountSats);
+        } else {
+          const meta = await sdk.getTokensMetadata({ tokenIdentifiers: [tokenIdentifier] });
+          const m = meta && meta.tokensMetadata && meta.tokensMetadata[0];
+          if (!m) throw new Error(`No metadata found for token ${tokenIdentifier} — use --base-units.`);
+          amountBaseUnits = parseTokenAmount(args.amountSats, m.decimals);
+        }
+        if (args.fromBtc) {
+          conversionOptions = { conversionType: { type: 'fromBitcoin' }, maxSlippageBps: args.slippageBps };
+        }
+      } else {
+        // --from-token: quote a BTC payment paid from token funds.
+        if (dest.type !== 'bolt11') {
+          throw new Error('--from-token probes a BOLT-11 invoice paid from token funds.');
+        }
+        const fromTokenIdentifier = resolveTokenIdentifier(args.fromToken, args.network);
+        conversionOptions = {
+          conversionType: { type: 'toBitcoin', fromTokenIdentifier },
+          maxSlippageBps: args.slippageBps,
+        };
+      }
+
+      const { prepareResponse, feeSats } = await prepareToken(
+        sdk,
+        args.destination,
+        amountBaseUnits,
+        tokenIdentifier,
+        conversionOptions,
+      );
+      const conversion = conversionEstimateFrom(prepareResponse);
+
+      // Amount binding for --from-token quotes: no amount is passed for a
+      // toBitcoin conversion, so the INVOICE's BTC amount is authoritative —
+      // the same check spark-send enforces before dispatch. A mismatching
+      // quote fails loudly so the agent never confirms the wrong number.
+      let authoritativeSats;
+      if (args.fromToken !== null) {
+        authoritativeSats = Number(prepareResponse && prepareResponse.amount);
+        if (!Number.isSafeInteger(authoritativeSats) || authoritativeSats <= 0) {
+          throw new Error(
+            `Could not determine the invoice's BTC amount for the --from-token quote (prepared amount: ${String(
+              prepareResponse && prepareResponse.amount,
+            )}).`,
+          );
+        }
+        if (authoritativeSats !== Number(args.amountSats)) {
+          throw new Error(
+            `Amount mismatch: the invoice is for ${authoritativeSats} sats but ${args.amountSats} was supplied. ` +
+              'Re-run with the invoice amount.',
+          );
+        }
+      }
+
+      console.log(
+        JSON.stringify(
+          {
+            event: 'fee_probe',
+            destination: args.destination,
+            destinationType: dest.type,
+            amountSats: args.token !== null ? undefined : args.amountSats,
+            tokenIdentifier,
+            amountBaseUnits: amountBaseUnits !== null ? String(amountBaseUnits) : undefined,
+            feeBaseUnits: args.token !== null ? feeSats : undefined,
+            feeSats: args.token !== null ? undefined : feeSats,
+            conversionEstimate: conversion,
+            network: args.network,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
 
     // 2. Prepare only — resolves fees, moves nothing, signs nothing.
     const { feeSats } =

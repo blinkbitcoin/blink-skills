@@ -770,6 +770,254 @@ describe('spark_send main() destination routing', () => {
 // the spending log unless the payment failed. The _budget instance here is the
 // isolated one seeded at the top of the file, so these tests never touch ~/.blink.
 
+// ── spark_send token/conversion budget integration (PR #10 review) ──────────
+//
+// The conversion branches must carry the SAME fail-closed budget lifecycle
+// as the hardened BTC path: outcome-unknown keeps the reservation, only an
+// explicit terminal failure releases it, --force actually overrides, and a
+// missing/unusable estimate never silently disables enforcement.
+
+describe('spark_send token/conversion budget integration', () => {
+  const { beforeEach } = require('node:test');
+  const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
+  const sparkSendPath = require.resolve('../blink/scripts/spark_send');
+  const budget = require(budgetModulePath); // the isolated instance
+
+  let calls;
+  let lastErr;
+  let savedArgv;
+  let savedLog;
+  let savedErr;
+
+  /**
+   * Fake SDK for the token/conversion paths. Options:
+   *   parseType: parse() result type ('sparkAddress' | 'bolt11Invoice')
+   *   estimate:  { amountIn, amountOut } bigints, or null to OMIT the estimate
+   *   prepareAmount: bigint for prepareResponse.amount (toBitcoin binding)
+   *   throwOnSend / status: sendPayment behavior
+   */
+  function installTokenMock({
+    parseType = 'sparkAddress',
+    estimate = { amountIn: 50000n, amountOut: 1000000n },
+    prepareAmount = 45000n,
+    throwOnSend = false,
+    status = 'completed',
+  } = {}) {
+    calls = [];
+    const fakeSdk = {
+      async parse() {
+        calls.push('parse');
+        return { type: parseType };
+      },
+      async getTokensMetadata() {
+        calls.push('getTokensMetadata');
+        return { tokensMetadata: [{ identifier: 'btkn1test', name: 'T', ticker: 'T', decimals: 6 }] };
+      },
+      async prepareSendPayment(req) {
+        calls.push('prepareSendPayment');
+        const isToBitcoin = req.conversionOptions && req.conversionOptions.conversionType.type === 'toBitcoin';
+        const resp = {
+          paymentMethod: { type: 'sparkAddress', address: 'sprt1x', fee: '0', tokenIdentifier: req.tokenIdentifier },
+          amount: isToBitcoin ? prepareAmount : req.amount || 0n,
+          feePolicy: { type: 'simple' },
+        };
+        if (req.conversionOptions && estimate) {
+          resp.conversionEstimate = {
+            options: req.conversionOptions,
+            amountIn: estimate.amountIn,
+            amountOut: estimate.amountOut,
+            fee: 0n,
+          };
+        }
+        return resp;
+      },
+      async sendPayment() {
+        calls.push('sendPayment');
+        if (throwOnSend) throw new Error('transport reset after dispatch');
+        return { payment: { id: 'tok-1', status } };
+      },
+    };
+    require.cache[sparkSdkPath] = {
+      id: sparkSdkPath,
+      filename: sparkSdkPath,
+      loaded: true,
+      exports: {
+        async connect() {
+          return { sdk: fakeSdk, disconnect: async () => {} };
+        },
+        feeFromPrepare: spark.feeFromPrepare,
+        safeErrorDetail: spark.safeErrorDetail,
+        resolveTokenIdentifier: (t) => (t === 'usdb' ? 'btkn1test' : t),
+        parseTokenAmount: spark.parseTokenAmount,
+        normalizeInfo: (info) => ({ balanceSats: Number(info && info.balanceSats) || 0 }),
+        normalizeSdkValue: (v) => v,
+        normalizeTokenBalances: () => ({}),
+        async waitForStableBalance() {
+          return { balanceSats: 0, stable: true };
+        },
+      },
+    };
+    delete require.cache[sparkSendPath];
+  }
+
+  beforeEach(() => {
+    budget.resetLog({ force: true });
+    try {
+      fs.unlinkSync(budget.CONFIG_FILE);
+    } catch {
+      /* no config */
+    }
+  });
+
+  afterEach(() => {
+    delete require.cache[sparkSendPath];
+    delete require.cache[sparkSdkPath];
+    if (savedArgv) process.argv = savedArgv;
+    if (savedLog) console.log = savedLog;
+    if (savedErr) console.error = savedErr;
+    savedArgv = savedLog = savedErr = null;
+    process.exitCode = undefined;
+  });
+
+  async function runMain(argv) {
+    savedArgv = process.argv;
+    savedLog = console.log;
+    savedErr = console.error;
+    let out = '';
+    lastErr = '';
+    console.log = (s) => {
+      out += s;
+    };
+    console.error = (s) => {
+      lastErr += s + '\n';
+    };
+    process.argv = [process.execPath, path.basename(sparkSendPath), ...argv];
+    const { main } = require(sparkSendPath);
+    await main();
+    return out;
+  }
+
+  const FROM_BTC = ['sprt1x', '10.5', '--token', 'usdb', '--from-btc'];
+  const FROM_TOKEN = (sats) => ['lnbc1invoice', String(sats), '--from-token', 'usdb'];
+
+  it('--from-btc: a post-dispatch outcome-unknown error KEEPS the reservation (HIGH 1)', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ throwOnSend: true });
+    await assert.rejects(() => runMain(FROM_BTC), /transport reset/);
+    assert.ok(calls.includes('sendPayment'), 'dispatch happened');
+    const log = budget.readLog();
+    assert.equal(log.length, 1, 'the reservation must survive the outcome-unknown throw');
+    assert.equal(log[0].state, 'reserved');
+    assert.match(lastErr, /outcome is unknown.*stays in place/s);
+  });
+
+  it('--from-btc: an explicit terminal failed status RELEASES the reservation', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ status: 'failed' });
+    const out = await runMain(FROM_BTC);
+    assert.equal(JSON.parse(out).status, 'failed');
+    assert.deepEqual(budget.readLog(), [], 'explicit failure — budget freed');
+    assert.equal(process.exitCode, 1);
+  });
+
+  it('--from-btc: a successful conversion SETTLES the reserved sats side', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({});
+    const out = await runMain(FROM_BTC);
+    assert.equal(JSON.parse(out).status, 'completed');
+    const log = budget.readLog();
+    assert.equal(log.length, 1);
+    assert.equal(log[0].sats, 50000, 'the estimate sats side (amountIn)');
+    assert.equal(log[0].state, undefined, 'finalized');
+  });
+
+  it('--from-token: a mismatching supplied amount is REJECTED before dispatch (HIGH 2)', async () => {
+    installTokenMock({ parseType: 'bolt11Invoice' }); // invoice is 45000 sats
+    await assert.rejects(() => runMain(FROM_TOKEN(1)), /invoice is for 45000 sats but 1 was supplied/);
+    assert.deepEqual(
+      calls.filter((x) => x === 'sendPayment'),
+      [],
+      'must not dispatch on a mismatch',
+    );
+  });
+
+  it('--from-token: a matching amount dispatches and emits the AUTHORITATIVE amount', async () => {
+    installTokenMock({ parseType: 'bolt11Invoice' });
+    const out = await runMain(FROM_TOKEN(45000));
+    assert.ok(calls.includes('sendPayment'));
+    assert.equal(JSON.parse(out).amountSats, 45000);
+  });
+
+  it('--from-token: a prepared amount of zero is refused (unknown spend)', async () => {
+    installTokenMock({ parseType: 'bolt11Invoice', prepareAmount: 0n });
+    await assert.rejects(() => runMain(FROM_TOKEN(45000)), /Could not determine the invoice's BTC amount/);
+  });
+
+  it('--from-btc --force overrides an over-limit quote and records the spend (MEDIUM 1)', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    installTokenMock({});
+    const out = await runMain([...FROM_BTC, '--force']);
+    assert.ok(calls.includes('sendPayment'), 'forced over-limit conversion must reach dispatch');
+    assert.equal(JSON.parse(out).status, 'completed');
+    const log = budget.readLog();
+    assert.equal(log.length, 1, 'the forced spend is recorded (no reservation — direct record)');
+    assert.equal(log[0].state, undefined);
+    assert.equal(log[0].sats, 50000);
+  });
+
+  it('--from-btc without --force respects the budget denial', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    installTokenMock({});
+    await assert.rejects(() => runMain(FROM_BTC), /Budget exceeded.*--force/);
+    assert.deepEqual(
+      calls.filter((x) => x === 'sendPayment'),
+      [],
+      'must not dispatch',
+    );
+  });
+
+  it('--from-btc: an ABSENT estimate is refused pre-dispatch unless forced (MEDIUM 2)', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ estimate: null });
+    await assert.rejects(() => runMain(FROM_BTC), /No usable conversion estimate.*--force/s);
+    assert.deepEqual(
+      calls.filter((x) => x === 'sendPayment'),
+      [],
+      'must not dispatch unreserved',
+    );
+  });
+
+  it('--from-btc: zero, negative, and unsafe-integer estimates are refused', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    for (const amountIn of [0n, -5n, 2n ** 70n]) {
+      installTokenMock({ estimate: { amountIn, amountOut: 1n } });
+      await assert.rejects(() => runMain(FROM_BTC), /No usable conversion estimate/, `amountIn=${amountIn}`);
+      assert.deepEqual(
+        calls.filter((x) => x === 'sendPayment'),
+        [],
+        `must not dispatch for amountIn=${amountIn}`,
+      );
+    }
+  });
+
+  it('--from-btc --force with an absent estimate dispatches and warns the spend is unrecorded', async () => {
+    installTokenMock({ estimate: null });
+    const out = await runMain([...FROM_BTC, '--force']);
+    assert.ok(calls.includes('sendPayment'));
+    assert.equal(JSON.parse(out).status, 'completed');
+    assert.deepEqual(budget.readLog(), [], 'no fabricated number is recorded');
+    assert.match(lastErr, /unrecorded/);
+  });
+
+  it('a plain token send (--token, no conversion) moves no sats and records nothing', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ estimate: null });
+    const out = await runMain(['sprt1x', '10.5', '--token', 'usdb']);
+    assert.equal(JSON.parse(out).status, 'completed');
+    assert.deepEqual(budget.readLog(), []);
+  });
+});
+
 describe('spark_send budget integration', () => {
   const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
   const sparkSendPath = require.resolve('../blink/scripts/spark_send');
@@ -1129,6 +1377,149 @@ describe('_spark_sdk.normalizeSdkValue', () => {
     // JSON.stringify(new Map(...)) is "{}", hiding real holdings.
     const out = normalizeSdkValue({ tokenBalances: new Map([['tok-1', { balance: 7n }]]) });
     assert.deepEqual(out.tokenBalances, { 'tok-1': { balance: 7 } });
+  });
+});
+
+// ── _spark_sdk token helpers ──────────────────────────────────────────────────
+
+describe('_spark_sdk token helpers', () => {
+  const sdk = require('../blink/scripts/_spark_sdk');
+  const USDB = 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87';
+
+  describe('resolveTokenIdentifier', () => {
+    it("'usdb' resolves to the documented mainnet constant", () => {
+      assert.equal(sdk.resolveTokenIdentifier('usdb', 'mainnet'), USDB);
+    });
+    it('SPARK_USDB_TOKEN env var wins over the constant', () => {
+      const saved = process.env.SPARK_USDB_TOKEN;
+      process.env.SPARK_USDB_TOKEN = 'btkn1test';
+      try {
+        assert.equal(sdk.resolveTokenIdentifier('usdb', 'regtest'), 'btkn1test');
+      } finally {
+        if (saved === undefined) delete process.env.SPARK_USDB_TOKEN;
+        else process.env.SPARK_USDB_TOKEN = saved;
+      }
+    });
+    it('non-usdb passes through unchanged', () => {
+      assert.equal(sdk.resolveTokenIdentifier('btkn1other', 'regtest'), 'btkn1other');
+    });
+    it("'usdb' off-mainnet without the env var fails with the hint", () => {
+      const saved = process.env.SPARK_USDB_TOKEN;
+      delete process.env.SPARK_USDB_TOKEN;
+      try {
+        assert.throws(() => sdk.resolveTokenIdentifier('usdb', 'regtest'), /SPARK_USDB_TOKEN/);
+      } finally {
+        if (saved !== undefined) process.env.SPARK_USDB_TOKEN = saved;
+      }
+    });
+  });
+
+  describe('parseTokenAmount', () => {
+    it('converts a decimal amount at the token decimals (10.5 @ 6 -> 10500000)', () => {
+      assert.equal(sdk.parseTokenAmount('10.5', 6), 10500000n);
+    });
+    it('zero decimals keeps whole units', () => {
+      assert.equal(sdk.parseTokenAmount('7', 0), 7n);
+    });
+    it('pads short fractions to full precision', () => {
+      assert.equal(sdk.parseTokenAmount('0.5', 6), 500000n);
+      assert.equal(sdk.parseTokenAmount('1.000001', 6), 1000001n);
+    });
+    it('rejects more decimals than the token supports', () => {
+      assert.throws(() => sdk.parseTokenAmount('1.1234567', 6), /decimal places/);
+    });
+    it('rejects garbage and negatives', () => {
+      assert.throws(() => sdk.parseTokenAmount('abc', 6), /Invalid token amount/);
+      assert.throws(() => sdk.parseTokenAmount('-5', 6), /Invalid token amount/);
+    });
+  });
+
+  describe('formatTokenAmount', () => {
+    it('renders base units with the token decimals', () => {
+      assert.equal(sdk.formatTokenAmount(10500000n, 6), '10.500000');
+    });
+    it('handles zero-decimal tokens', () => {
+      assert.equal(sdk.formatTokenAmount(7n, 0), '7');
+    });
+  });
+
+  describe('normalizeTokenBalances', () => {
+    it('flattens a Map into precision-preserving JSON entries', () => {
+      const balances = new Map([
+        [
+          USDB,
+          {
+            balance: 10500000n,
+            tokenMetadata: {
+              identifier: USDB,
+              name: 'Bitcoin USD',
+              ticker: 'USDB',
+              decimals: 6,
+              issuerPublicKey: '02ff',
+            },
+          },
+        ],
+      ]);
+      const out = sdk.normalizeTokenBalances(balances);
+      assert.equal(out[USDB].balance, '10500000', 'balance stays a string (BigInt precision)');
+      assert.equal(out[USDB].balanceFormatted, '10.500000');
+      assert.equal(out[USDB].ticker, 'USDB');
+      assert.equal(out[USDB].decimals, 6);
+    });
+    it('empty/absent maps normalize to {}', () => {
+      assert.deepEqual(sdk.normalizeTokenBalances(undefined), {});
+      assert.deepEqual(sdk.normalizeTokenBalances(new Map()), {});
+    });
+  });
+});
+
+// ── spark_send conversionEstimateFrom ────────────────────────────────────────
+
+describe('spark_send.conversionEstimateFrom / prepareToken', () => {
+  const { conversionEstimateFrom, parseArgs } = require('../blink/scripts/spark_send');
+
+  it('extracts a JSON-safe conversion estimate', () => {
+    const est = conversionEstimateFrom({
+      conversionEstimate: {
+        options: { conversionType: { type: 'fromBitcoin' } },
+        amountIn: 50000n,
+        amountOut: 1000000n,
+        fee: 0n,
+      },
+    });
+    assert.deepEqual(est, {
+      amountIn: '50000',
+      amountOut: '1000000',
+      fee: '0',
+      conversionType: 'fromBitcoin',
+    });
+  });
+
+  it('returns null when there is no estimate', () => {
+    assert.equal(conversionEstimateFrom({}), null);
+    assert.equal(conversionEstimateFrom(null), null);
+  });
+
+  it('parseArgs keeps the RAW amount string whenever --token appears (any position)', () => {
+    const a = parseArgs(['sprt1xyz', '10.5', '--token', 'usdb']); // flag AFTER amount
+    assert.equal(a.amountSats, '10.5', 'must not parseInt a decimal token amount');
+    assert.equal(a.token, 'usdb');
+  });
+
+  it('parseArgs still integer-validates BTC amounts without --token', () => {
+    assert.throws(() => parseArgs(['dest', 'abc']), /positive integer/);
+    assert.throws(() => parseArgs(['dest', '0']), /positive integer/);
+    const ok = parseArgs(['dest', '100']);
+    assert.equal(ok.amountSats, 100);
+  });
+
+  it('parseArgs parses the conversion flags', () => {
+    const a = parseArgs(['dest', '100', '--from-btc', '--slippage-bps', '75']);
+    assert.equal(a.fromBtc, true);
+    assert.equal(a.slippageBps, 75);
+    const b = parseArgs(['dest', '100', '--from-token', 'usdb', '--base-units']);
+    assert.equal(b.fromToken, 'usdb');
+    assert.equal(b.baseUnits, true);
   });
 });
 

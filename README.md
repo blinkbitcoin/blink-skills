@@ -2,15 +2,15 @@
 
 Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
 
-32 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
+34 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
 
 ## Highlights
 
 - **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
-- **32 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
+- **34 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **632 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **683 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
 
@@ -252,7 +252,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 632 tests, node:test framework, zero test dependencies
+npm test    # 683 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation

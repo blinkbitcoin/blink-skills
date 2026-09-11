@@ -167,8 +167,7 @@ Two scope notes, both inherited from the shared budget module and identical to
 the custodial commands:
 
 - **Principal only.** Budgets count the payment amount, not the routing fee —
-  a 100-sat send with a 3-sat fee passes with 100 sats remaining and records
-  100. The fee is known at check time; counting it would diverge from the
+  a 100-sat send with a 3-sat fee passes with 100 sats remaining and records 100. The fee is known at check time; counting it would diverge from the
   custodial pay commands' convention.
 - **Enforcement is reservation-based.** `reserveBudget` decides AND reserves
   under one lock before the send executes, so concurrent sends can never
@@ -201,9 +200,44 @@ per-_wallet_, so any valid key works with any seed.
 
 Set it as `BREEZ_API_KEY` alongside `SPARK_MNEMONIC`.
 
+## Tokens (USDB / BTKN)
+
+The pinned SDK 0.23.1 already supports the full token surface (no upgrade
+needed — 0.24.x adds only deposit/proxy infra, no token APIs):
+
+- `spark-balance` / `spark-info` surface `tokenBalances` (balances are
+  precision-preserving strings; metadata flattened per entry).
+- `spark-token-info <usdb|id>` — metadata incl. decimals (`usdb` resolves to
+  the Brale mainnet constant; `SPARK_USDB_TOKEN` overrides, required on
+  regtest).
+- `spark-receive-token <amount>` — mints a Spark invoice for the token
+  (decimal units via metadata decimals, or `--base-units`). Spark invoices
+  are NOT BOLT-11: they can only be paid by Spark wallets.
+- `spark-send --token <id> <amount>` — token sends to Spark addresses/
+  invoices; `--from-btc` / `--from-token` attach Flashnet conversions
+  (`conversionEstimate` in the prepare output is the quote; `--slippage-bps`
+  caps slippage, default 50 bps; failed conversions auto-refund).
+- Budget: plain token sends are outside the sats budget (it is a sats
+  instrument). `--from-btc` conversions reserve the SATS side of the
+  estimate (`amountIn`); `--from-token` spends tokens (no sats reservation).
+
+**Verified live on Spark regtest (2026-09):** `spark-balance` emits
+`tokenBalances: {}` for an empty `Map(0)`; `spark-token-info usdb` off
+mainnet fails with the `SPARK_USDB_TOKEN` hint; `spark-receive-token
+25000000 --base-units --token <id>` mints a real `sparkrt1...` Spark
+invoice (fee 0); the SDK **network-checks token identifiers** (a mainnet
+`btkn1...` id on regtest is rejected by `getTokensMetadata` and
+`fetchConversionLimits` with `Invalid token id` / `Invalid network`), so
+regtest conversions need a regtest-native token id. The Lightspark regtest
+faucet (app.lightspark.com/regtest-faucet) is browser-only (recaptcha), so
+funded token sends/conversions on regtest remain manually verified. A
+wallet holding tokens reports per-entry `balance` (string),
+`balanceFormatted`, and flattened metadata.
+
 ## Scope of this spike
 
-- **BTC only.** No USD / Spark Stable Balance (USDB), no swaps.
+- BTC + BTKN tokens (USDB). No custodial-parity Lightning USD receive
+  (LNURL-pay is BTC-only); the token-native path is `spark-receive-token`.
 - **Production `blink.sv` only.** Staging (signet vs Spark regtest) is deferred.
 - Send is a proof-of-concept demonstrating that agent-side signing works with
   no Blink API change and no server signer/VPS.
