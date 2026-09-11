@@ -252,7 +252,12 @@ function conversionEstimateFrom(prepareResponse) {
  *   when no sats move (plain token sends, --from-token conversions).
  * @param {string} [opts.command]
  * @param {string|null} [opts.domain]
- * @returns {Promise<{ payment: object, status: string, paymentId: string|null }>}
+ * @returns {Promise<{ payment: object, status: string|*, paymentId: string|null }>}
+ *   `status` is the SDK's payment status VERBATIM — a string per the pinned
+ *   SDK union ('completed'|'pending'|'failed'); the hardened isFailedStatus
+ *   additionally tolerates tagged-object statuses ({type:'failed'}), so the
+ *   returned union includes those when the SDK emits them. Branch via
+ *   isFailedStatus, never on a string assumption.
  */
 async function dispatchAndSettle(
   dispatch,

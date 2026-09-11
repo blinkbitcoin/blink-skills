@@ -529,9 +529,12 @@ describe('spark_send.feeFromPrepare', () => {
     assert.equal(feeFromPrepare({ feeSats: 'not-a-number' }), null, 'a garbage top-level fee reads as unknown');
     assert.equal(feeFromPrepare({ feeSats: Infinity }), null);
     assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: NaN } }), null);
-    // One finite + one non-finite component: the finite part survives.
-    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 3, sparkTransferFeeSats: 'garbage' } }), 3);
-    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 'garbage', sparkTransferFeeSats: 2 } }), 2);
+    assert.equal(feeFromPrepare({ paymentMethod: { feeSats: 'garbage' } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { sparkTransferFeeSats: 'garbage' } }), null);
+    // A composite with one non-finite PRESENT component is an unknowable
+    // total — null, never a deceptively valid partial sum.
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 3, sparkTransferFeeSats: 'garbage' } }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 'garbage', sparkTransferFeeSats: 2 } }), null);
     assert.equal(feeFromPrepare({ paymentMethod: { fee: '∞' } }), null);
   });
 });
@@ -1036,6 +1039,34 @@ describe('spark_send token/conversion budget integration', () => {
     await runMain(['sprt1x', '10.5', '--token', 'usdb', '--from-btc']);
     assert.equal(process.exitCode, 1);
     assert.deepEqual(budget.readLog(), [], 'terminal failure — budget freed');
+  });
+
+  // ── seam caller wiring: each path's settle/reservation/exit combination ────
+
+  it('--from-token with a terminal failed status exits non-zero and records nothing', async () => {
+    installTokenMock({ parseType: 'bolt11Invoice', status: 'failed' });
+    const out = await runMain(FROM_TOKEN(45000));
+    assert.equal(JSON.parse(out).status, 'failed');
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'token-source payment — nothing sats-side to record');
+  });
+
+  it('forced --from-btc with a terminal failed status exits non-zero and stays unrecorded', async () => {
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100, allowlist: [] });
+    installTokenMock({ status: 'failed' });
+    const out = await runMain([...FROM_BTC, '--force']);
+    assert.ok(calls.includes('sendPayment'), 'forced path dispatched');
+    assert.equal(JSON.parse(out).status, 'failed');
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'failed + forced — no reservation to release, nothing recorded');
+  });
+
+  it('a PENDING plain-token send exits zero and records nothing (in flight, no sats)', async () => {
+    installTokenMock({ status: 'pending', estimate: null });
+    const out = await runMain(['sprt1x', '10.5', '--token', 'usdb']);
+    assert.equal(JSON.parse(out).status, 'pending');
+    assert.ok(!process.exitCode, 'pending is not a failure');
+    assert.deepEqual(budget.readLog(), []);
   });
 });
 

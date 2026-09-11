@@ -575,11 +575,17 @@ function feeFromPrepare(prepareResponse) {
   if (has(pm.feeSats)) return num(pm.feeSats);
 
   // bolt11Invoice: lightning fee (+ spark transfer fee if the route uses Spark).
+  // A composite with one non-finite PRESENT component is an unknowable total —
+  // return null (unknown) rather than a deceptively valid partial sum.
   if (has(pm.lightningFeeSats)) {
     const fee = num(pm.lightningFeeSats);
-    const transfer = has(pm.sparkTransferFeeSats) ? num(pm.sparkTransferFeeSats) : null;
-    if (fee === null && transfer === null) return null;
-    return (fee === null ? 0 : fee) + (transfer === null ? 0 : transfer);
+    if (fee === null) return null;
+    if (has(pm.sparkTransferFeeSats)) {
+      const transfer = num(pm.sparkTransferFeeSats);
+      if (transfer === null) return null;
+      return fee + transfer;
+    }
+    return fee;
   }
   if (has(pm.sparkTransferFeeSats)) return num(pm.sparkTransferFeeSats);
 

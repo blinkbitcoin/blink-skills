@@ -10,7 +10,7 @@ Bitcoin Lightning wallet for the command line — zero required runtime npm depe
 - **34 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **685 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **688 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
 
@@ -252,7 +252,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 685 tests, node:test framework, zero test dependencies
+npm test    # 688 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation
