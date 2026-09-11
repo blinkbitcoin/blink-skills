@@ -22,7 +22,7 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
-const { connect, normalizeInfo, normalizeSdkValue } = require('./_spark_sdk');
+const { connect, normalizeInfo, normalizeSdkValue, lnurlDomainFor } = require('./_spark_sdk');
 
 function parseArgs(argv) {
   let network = process.env.SPARK_NETWORK || 'mainnet';
@@ -40,11 +40,23 @@ async function main() {
   const { sdk, disconnect } = await connect({ network });
   try {
     const info = await sdk.getInfo({ ensureSynced: true });
+    // The wallet's registered @blink.sv Lightning address (recovered into the
+    // SDK cache on connect). null when none is registered.
+    let lightningAddress = null;
+    try {
+      const lnAddress = await sdk.getLightningAddress();
+      lightningAddress = lnAddress ? lnAddress.lightningAddress : null;
+    } catch {
+      // Recovery/lookup failures are non-fatal: info without the address is
+      // strictly better than no info at all.
+    }
     console.log(
       JSON.stringify(
         {
           accountType: 'lnaddress',
           network,
+          lightningAddress,
+          lnurlDomain: lnurlDomainFor(network),
           ...normalizeSdkValue(info),
           // balanceSats re-normalized for a stable contract across SDK versions.
           balanceSats: normalizeInfo(info).balanceSats,

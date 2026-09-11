@@ -75,6 +75,38 @@ const fakeSdk = {
     if (!method || method.type !== 'sparkInvoice') throw new Error('stub: only sparkInvoice receive is supported');
     return { paymentRequest: `sprtstub1${method.amount || 0}${method.tokenIdentifier || ''}`, fee: 0n };
   },
+  // LN-address lifecycle, env-driven for CLI tests:
+  //   SPARK_STUB_LN_ADDRESS  'user@blink.sv' returned by getLightningAddress
+  //                         (unset => undefined => registered:false)
+  //   SPARK_STUB_LN_AVAILABLE '0'/'1' for check/register (default '1')
+  async getLightningAddress() {
+    const addr = process.env.SPARK_STUB_LN_ADDRESS;
+    if (!addr) return undefined;
+    const username = addr.split('@')[0];
+    return {
+      description: 'stub',
+      lightningAddress: addr,
+      username,
+      lnurl: { url: `https://${lnurlDomainFor('mainnet')}/.well-known/lnurlp/${username}`, bech32: 'lnurl1stub' },
+    };
+  },
+  async checkLightningAddressAvailable(req) {
+    if (echo) console.error(`STUB_LN_CHECK=${req && req.username}`);
+    return process.env.SPARK_STUB_LN_AVAILABLE !== '0';
+  },
+  async registerLightningAddress(req) {
+    if (echo) console.error(`STUB_LN_REGISTER=${req && req.username}`);
+    const username = req && req.username;
+    return {
+      description: (req && req.description) || '',
+      lightningAddress: `${username}@${lnurlDomainFor('mainnet')}`,
+      username,
+      lnurl: { url: `https://${lnurlDomainFor('mainnet')}/.well-known/lnurlp/${username}`, bech32: 'lnurl1stub' },
+    };
+  },
+  async deleteLightningAddress() {
+    if (echo) console.error('STUB_LN_DELETE=1');
+  },
   async listPayments(req) {
     if (echo) console.error(`STUB_LIMIT=${req && req.limit} STUB_OFFSET=${req && req.offset}`);
     if (echo && req && req.typeFilter) console.error(`STUB_TYPEFILTER=${req.typeFilter.join(',')}`);
@@ -180,6 +212,20 @@ function normalizeSdkValue(value) {
 // Mirrors of the production _spark_sdk token helpers — the stub replaces
 // _spark_sdk, so every command-imported export must exist here. Standalone
 // (not methods): commands destructure these, losing `this`.
+// Mirror of _spark_sdk.lnurlDomainFor — Blink domains only, never breez.tips.
+function lnurlDomainFor(network) {
+  const fromEnv = process.env.SPARK_LNURL_DOMAIN;
+  if (fromEnv) {
+    if (fromEnv === 'breez.tips') {
+      throw new Error(
+        "SPARK_LNURL_DOMAIN='breez.tips' is not permitted: blink-skills registers Lightning addresses on Blink domains only (blink.sv / staging.blink.sv), never on the Breez default domain.",
+      );
+    }
+    return fromEnv;
+  }
+  return network === 'mainnet' ? 'blink.sv' : 'staging.blink.sv';
+}
+
 const USDB_TOKEN_MAINNET = 'btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87';
 function resolveTokenIdentifier(token, network) {
   if (token !== 'usdb') return token;
@@ -275,6 +321,7 @@ const stub = {
   // Mirrors of the production token helpers (standalone functions — see the
   // normalizeSdkValue note about destructuring and `this`).
   USDB_TOKEN_MAINNET,
+  lnurlDomainFor,
   resolveTokenIdentifier,
   parseTokenAmount,
   formatTokenAmount,

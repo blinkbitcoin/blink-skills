@@ -1529,6 +1529,62 @@ describe('_spark_sdk token helpers', () => {
   });
 });
 
+// ── _spark_sdk.lnurlDomainFor ────────────────────────────────────────────────
+
+describe('_spark_sdk.lnurlDomainFor', () => {
+  it('defaults to blink.sv on mainnet and staging.blink.sv on regtest', () => {
+    const saved = process.env.SPARK_LNURL_DOMAIN;
+    delete process.env.SPARK_LNURL_DOMAIN;
+    try {
+      assert.equal(spark.lnurlDomainFor('mainnet'), 'blink.sv');
+      assert.equal(spark.lnurlDomainFor('regtest'), 'staging.blink.sv');
+    } finally {
+      if (saved !== undefined) process.env.SPARK_LNURL_DOMAIN = saved;
+    }
+  });
+
+  it('SPARK_LNURL_DOMAIN overrides for other Blink domains / deployments', () => {
+    const saved = process.env.SPARK_LNURL_DOMAIN;
+    process.env.SPARK_LNURL_DOMAIN = 'custom.blink.example';
+    try {
+      assert.equal(spark.lnurlDomainFor('mainnet'), 'custom.blink.example');
+    } finally {
+      if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
+      else process.env.SPARK_LNURL_DOMAIN = saved;
+    }
+  });
+
+  it("'breez.tips' is refused — blink-skills never registers on the Breez default", () => {
+    const saved = process.env.SPARK_LNURL_DOMAIN;
+    process.env.SPARK_LNURL_DOMAIN = 'breez.tips';
+    try {
+      assert.throws(
+        () => spark.lnurlDomainFor('mainnet'),
+        (e) => e.message.includes('breez.tips') && e.message.includes('blink.sv'),
+      );
+    } finally {
+      if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
+      else process.env.SPARK_LNURL_DOMAIN = saved;
+    }
+  });
+});
+
+// ── spark_lnaddress.validateUsername ─────────────────────────────────────────
+
+describe('spark_lnaddress.validateUsername', () => {
+  const { validateUsername } = require('../blink/scripts/spark_lnaddress');
+
+  it('accepts and lowercases a valid username', () => {
+    assert.equal(validateUsername('Satoshi'), 'satoshi');
+    assert.equal(validateUsername('ab_12'), 'ab_12');
+  });
+  it('rejects short, long, non-[a-z0-9_], letterless, and reserved-prefix names', () => {
+    for (const bad of ['ab', 'a'.repeat(51), 'has space', 'ABC!', '123', '1abc', '3abc', '_x', 'bc1x', 'lnbc1x']) {
+      assert.throws(() => validateUsername(bad), bad);
+    }
+  });
+});
+
 // ── spark_send conversionEstimateFrom ────────────────────────────────────────
 
 describe('spark_send.conversionEstimateFrom / prepareToken', () => {

@@ -200,6 +200,47 @@ per-_wallet_, so any valid key works with any seed.
 
 Set it as `BREEZ_API_KEY` alongside `SPARK_MNEMONIC`.
 
+## Lightning address (@blink.sv)
+
+The wallet's `user@blink.sv` Lightning address is a **server-side record**
+(blink-lnurl-server) keyed to the seed-derived identity pubkey — not wallet
+state. blink-skills manages it via the SDK's LN-address lifecycle
+(`spark-lnaddress get | check | register | delete`).
+
+**Domain pinning.** The Breez SDK's `defaultConfig('mainnet').lnurlDomain` is
+`breez.tips` — Breez's own domain, invisible to blink.sv LNURL routing.
+`_spark_sdk.connect()` therefore always sets `lnurlDomain`
+(`blink.sv` mainnet / `staging.blink.sv` regtest; `SPARK_LNURL_DOMAIN`
+override for other Blink deployments), and `breez.tips` is refused with an
+explanatory error. Every LN-address operation and output carries the domain.
+
+**Seed ⇒ address recovery.** On connect the SDK automatically runs
+`recover_lightning_address` against the configured domain, keyed by the
+identity pubkey and authorized by a signature from the seed. A seed exported
+from blink-mobile with a registered address is therefore **discoverable from
+the seed alone** — `getLightningAddress()` (and `spark-info`'s
+`lightningAddress` field) reports it. This is by design: the address is
+public information and the seed holder is its owner.
+
+**Server rules mirrored client-side:** one username per pubkey per domain (a
+new registration REPLACES the wallet's previous one); usernames are 3–50
+chars `[a-z0-9_]` with ≥1 letter, lowercased, with payment-like prefixes
+('1', '3', '\_', 'bc1', 'lnbc1') reserved; phone identifiers are not
+supported for Spark; availability is a uniqueness lookup across BOTH account
+providers (an available name is claimable by anyone); `anon`-mode accounts
+are refused registration and inbound minting.
+
+**On `accountType: 'lnaddress'`:** the label in spark outputs is the
+account-kind discriminator (non-custodial, reachable at `user@blink.sv`) —
+NOT a claim that a per-wallet Lightning address is registered. The
+per-wallet truth is the `lightningAddress` field (`spark-info`,
+`spark-lnaddress get`).
+
+**Out of scope:** transferring an existing custodial blink.sv address to
+the Spark wallet (blink-mobile does this via the Galoy
+`migrationLnAddressTransfer` mutation with a proof signed by the Spark key —
+needs BLINK_API_KEY + seed together; a future command).
+
 ## Status & budget policy (cross-path)
 
 The pinned SDK's status union is exactly `completed | pending | failed`. Every

@@ -393,7 +393,43 @@ function ensureOwnerOnlyDir(dir) {
 }
 
 /**
+ * The Lightning-address domain for a Spark wallet connection. blink-skills is
+ * a BLINK skill: Lightning addresses are always registered on Blink domains —
+ * 'breez.tips' (the Breez SDK's own default) is deliberately refused, because
+ * a registration landing there would create an address this skill's ecosystem
+ * (blink.sv LNURL routing, resolve-receiver) can never see.
+ *
+ * The SDK's defaultConfig('mainnet').lnurlDomain is 'breez.tips' and regtest
+ * has none — which is why every connect() MUST set this explicitly, exactly
+ * as blink-mobile does (config.lnurlDomain = 'blink.sv').
+ *
+ * Precedence: SPARK_LNURL_DOMAIN env (other Blink domains / private
+ * deployments) > per-network default.
+ *
+ * @param {string} network  'mainnet' | 'regtest'
+ * @returns {string}
+ */
+function lnurlDomainFor(network) {
+  const fromEnv = process.env.SPARK_LNURL_DOMAIN;
+  if (fromEnv) {
+    if (fromEnv === 'breez.tips') {
+      throw new Error(
+        "SPARK_LNURL_DOMAIN='breez.tips' is not permitted: blink-skills registers Lightning addresses on Blink domains only (blink.sv / staging.blink.sv), never on the Breez default domain.",
+      );
+    }
+    return fromEnv;
+  }
+  return network === 'mainnet' ? 'blink.sv' : 'staging.blink.sv';
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
+ *
+ * Setting lnurlDomain makes the SDK's automatic recover_lightning_address
+ * (run on connect against config.lnurlDomain, keyed by the seed-derived
+ * identity pubkey) query the Blink server — so a seed imported from
+ * blink-mobile with a registered user@blink.sv address has that address
+ * recovered into the local cache, where getLightningAddress() returns it.
  *
  * @param {object} [opts]
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
@@ -407,6 +443,7 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
 
   const config = mod.defaultConfig(network);
   config.apiKey = apiKey;
+  config.lnurlDomain = lnurlDomainFor(network);
 
   const storageDir = storageDirFor(mnemonic, network);
   ensureOwnerOnlyDir(storageDir);
@@ -731,4 +768,5 @@ module.exports = {
   parseTokenAmount,
   formatTokenAmount,
   normalizeTokenBalances,
+  lnurlDomainFor,
 };

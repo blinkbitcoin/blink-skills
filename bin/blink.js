@@ -589,6 +589,43 @@ commands['spark-receive-token'] = {
   },
 };
 
+commands['spark-lnaddress'] = {
+  forceExit: true,
+  description:
+    "[non-custodial] Manage the Spark wallet's @blink.sv Lightning address: get | check | register | delete (requires SPARK_MNEMONIC)",
+  args: [
+    {
+      name: 'subcommand',
+      required: true,
+      description: 'get | check <username> | register <username> | delete',
+    },
+    { name: 'username', required: false, description: 'Username (check/register only)' },
+  ],
+  options: {
+    description: { type: 'string' },
+    network: { type: 'string' },
+  },
+  optMeta: {
+    description: { description: 'Description for the registered address (with register)', valueName: 'text' },
+    network: { description: 'Spark network: mainnet (default) or regtest', valueName: 'network' },
+  },
+  examples: [
+    'blink spark-lnaddress get',
+    'blink spark-lnaddress check satoshi',
+    'blink spark-lnaddress register satoshi --description "Payments"',
+    'blink spark-lnaddress delete',
+  ],
+  action: async (pos, opts) => {
+    const argv = [String(pos[0])];
+    if (pos[1] !== undefined) argv.push(String(pos[1]));
+    if (opts.description !== undefined) argv.push('--description', opts.description);
+    if (opts.network !== undefined) argv.push('--network', opts.network);
+    setProcessArgv(argv);
+    const { main } = require(path.join(scriptsDir, 'spark_lnaddress.js'));
+    await main();
+  },
+};
+
 commands['spark-subscribe'] = {
   forceExit: true,
   description: '[non-custodial] Subscribe to Spark wallet events via the Breez SDK (requires SPARK_MNEMONIC)',
