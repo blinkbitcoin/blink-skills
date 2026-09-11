@@ -524,6 +524,16 @@ describe('spark_send.feeFromPrepare', () => {
     assert.equal(feeFromPrepare(null), null);
     assert.equal(feeFromPrepare({ paymentMethod: {} }), null);
   });
+
+  it('returns null (never NaN/Infinity) for non-finite SDK fee values', () => {
+    assert.equal(feeFromPrepare({ feeSats: 'not-a-number' }), null, 'a garbage top-level fee reads as unknown');
+    assert.equal(feeFromPrepare({ feeSats: Infinity }), null);
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: NaN } }), null);
+    // One finite + one non-finite component: the finite part survives.
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 3, sparkTransferFeeSats: 'garbage' } }), 3);
+    assert.equal(feeFromPrepare({ paymentMethod: { lightningFeeSats: 'garbage', sparkTransferFeeSats: 2 } }), 2);
+    assert.equal(feeFromPrepare({ paymentMethod: { fee: '∞' } }), null);
+  });
 });
 
 // ── spark_send.classifyDestination ───────────────────────────────────────────
@@ -1015,6 +1025,17 @@ describe('spark_send token/conversion budget integration', () => {
     const out = await runMain(['sprt1x', '10.5', '--token', 'usdb']);
     assert.equal(JSON.parse(out).status, 'completed');
     assert.deepEqual(budget.readLog(), []);
+  });
+
+  it('a TAGGED-OBJECT failed status on the token path exits non-zero and releases (isFailedStatus unification)', async () => {
+    // The token branches used inline String(status) checks; a tagged-variant
+    // status ({type:'failed'}) would have settled + exited 0. The shared seam
+    // runs every branch through the hardened isFailedStatus.
+    budget.writeConfig({ hourlyLimitSats: null, dailyLimitSats: 100000, allowlist: [] });
+    installTokenMock({ status: { type: 'failed' }, estimate: { amountIn: 50000n, amountOut: 1n } });
+    await runMain(['sprt1x', '10.5', '--token', 'usdb', '--from-btc']);
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(budget.readLog(), [], 'terminal failure — budget freed');
   });
 });
 
