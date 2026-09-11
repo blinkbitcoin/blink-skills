@@ -393,7 +393,92 @@ function ensureOwnerOnlyDir(dir) {
 }
 
 /**
+ * Canonicalize an operator-supplied LNURL domain to a bare lowercase hostname
+ * with an optional explicit port ("host" or "host:port"). DNS hostnames are
+ * case-insensitive, a trailing root dot is equivalent, and :443 is the HTTPS
+ * default — so byte-equality against a refused name is NOT a real guard:
+ * "BREEZ.TIPS", "breez.tips.", and "breez.tips:443" all target the same
+ * service. This normalizes those spellings and rejects anything that is not
+ * a bare hostname (URLs with scheme/path/query/fragment, embedded whitespace,
+ * malformed labels, empty input).
+ *
+ * @param {string} raw
+ * @returns {{ host: string, port: string|null, canonical: string }}
+ */
+function canonicalizeLnurlDomain(raw) {
+  const domainError = (why) => {
+    const err = new Error(
+      `SPARK_LNURL_DOMAIN is invalid (${why}) — expected a bare hostname like 'blink.sv', optionally with an explicit port.`,
+    );
+    err.code = 'SPARK_LNURL_DOMAIN_INVALID';
+    return err;
+  };
+
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) throw domainError('empty');
+  if (/\s/.test(trimmed)) throw domainError('embedded whitespace');
+  if (/[/?#%]/.test(trimmed)) throw domainError('URL path/query/fragment characters');
+  if (trimmed.includes('://')) throw domainError('a scheme — supply the hostname only');
+
+  let host = trimmed.toLowerCase();
+  let port = null;
+  const portMatch = host.match(/^(.*):(\d{1,5})$/);
+  if (portMatch) {
+    host = portMatch[1];
+    port = portMatch[2];
+    if (!host) throw domainError('missing hostname before the port');
+  }
+  // Exactly one trailing root dot is the canonical FQDN form — strip it.
+  if (host.endsWith('.')) host = host.slice(0, -1);
+  if (!host) throw domainError('hostname only a root dot');
+  if (host.includes(':')) throw domainError('more than one colon');
+  // DNS-label grammar: labels of [a-z0-9]([a-z0-9-]*[a-z0-9])?, joined by dots.
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(host)) {
+    throw domainError('malformed hostname');
+  }
+  return { host, port, canonical: port ? `${host}:${port}` : host };
+}
+
+/**
+ * The Lightning-address domain for a Spark wallet connection. blink-skills is
+ * a BLINK skill: Lightning addresses are always registered on Blink domains —
+ * 'breez.tips' (the Breez SDK's own default) is deliberately refused IN ANY
+ * EQUIVALENT SPELLING (case, root dot, explicit port), because a
+ * registration landing there would create an address this skill's ecosystem
+ * (blink.sv LNURL routing, resolve-receiver) can never see.
+ *
+ * The SDK's defaultConfig('mainnet').lnurlDomain is 'breez.tips' and regtest
+ * has none — which is why every connect() MUST set this explicitly, exactly
+ * as blink-mobile does (config.lnurlDomain = 'blink.sv').
+ *
+ * Precedence: SPARK_LNURL_DOMAIN env (other Blink domains / private
+ * deployments; canonicalized + validated) > per-network default.
+ *
+ * @param {string} network  'mainnet' | 'regtest'
+ * @returns {string}
+ */
+function lnurlDomainFor(network) {
+  const fromEnv = process.env.SPARK_LNURL_DOMAIN;
+  if (fromEnv) {
+    const { host, canonical } = canonicalizeLnurlDomain(fromEnv);
+    if (host === 'breez.tips') {
+      throw new Error(
+        `SPARK_LNURL_DOMAIN='${canonical}' is not permitted: blink-skills registers Lightning addresses on Blink domains only (blink.sv / staging.blink.sv), never on the Breez default domain.`,
+      );
+    }
+    return canonical;
+  }
+  return network === 'mainnet' ? 'blink.sv' : 'staging.blink.sv';
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
+ *
+ * Setting lnurlDomain makes the SDK's automatic recover_lightning_address
+ * (run on connect against config.lnurlDomain, keyed by the seed-derived
+ * identity pubkey) query the Blink server — so a seed imported from
+ * blink-mobile with a registered user@blink.sv address has that address
+ * recovered into the local cache, where getLightningAddress() returns it.
  *
  * @param {object} [opts]
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
@@ -407,6 +492,7 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
 
   const config = mod.defaultConfig(network);
   config.apiKey = apiKey;
+  config.lnurlDomain = lnurlDomainFor(network);
 
   const storageDir = storageDirFor(mnemonic, network);
   ensureOwnerOnlyDir(storageDir);
@@ -731,4 +817,6 @@ module.exports = {
   parseTokenAmount,
   formatTokenAmount,
   normalizeTokenBalances,
+  lnurlDomainFor,
+  canonicalizeLnurlDomain,
 };

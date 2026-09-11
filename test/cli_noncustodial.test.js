@@ -36,6 +36,7 @@ const SPARK_COMMANDS = [
   'spark-info',
   'spark-token-info',
   'spark-receive-token',
+  'spark-lnaddress',
 ];
 const CREDENTIAL_FREE_COMMANDS = ['resolve-receiver', 'create-invoice-lnaddress'];
 
@@ -255,6 +256,99 @@ describe('CLI: spark commands return instead of hanging', () => {
     const { code, stderr } = await runCli(['spark-send', 'lnbc1000u1p0x', '10', '--token', 'usdb', '--dry-run']);
     assert.notEqual(code, 0);
     assert.match(stderr, /Token sends require a Spark address or Spark invoice/);
+  });
+
+  // ── spark-lnaddress lifecycle (Blink-domain-pinned) ────────────────────────
+
+  it('spark-lnaddress get reports registered:false when no address is registered', async () => {
+    const { code, stdout } = await runCli(['spark-lnaddress', 'get']);
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.registered, false);
+    assert.equal(j.lightningAddress, null);
+    assert.equal(j.lnurlDomain, 'blink.sv', 'the Blink domain is always reported');
+  });
+
+  it('spark-lnaddress get reports a registered address with the Blink domain', async () => {
+    const { code, stdout } = await runCli(['spark-lnaddress', 'get'], {
+      env: { SPARK_STUB_LN_ADDRESS: 'satoshi@blink.sv' },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.registered, true);
+    assert.equal(j.lightningAddress, 'satoshi@blink.sv');
+    assert.equal(j.username, 'satoshi');
+    assert.equal(j.lnurlDomain, 'blink.sv');
+  });
+
+  it('spark-lnaddress check reports availability', async () => {
+    const { code, stdout } = await runCli(['spark-lnaddress', 'check', 'satoshi'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.available, true);
+    assert.equal(j.lnurlDomain, 'blink.sv');
+  });
+
+  it('spark-lnaddress register claims the username on the Blink domain', async () => {
+    const { code, stdout, stderr } = await runCli(
+      ['spark-lnaddress', 'register', 'satoshi', '--description', 'Payments'],
+      { env: { SPARK_STUB_ECHO: '1' } },
+    );
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.status, 'REGISTERED');
+    assert.equal(j.lightningAddress, 'satoshi@blink.sv', 'registered on the BLINK domain, never breez.tips');
+    assert.equal(j.description, 'Payments');
+    assert.match(stderr, /STUB_LN_REGISTER=satoshi/);
+  });
+
+  it('spark-lnaddress register refuses an unavailable username', async () => {
+    const { code, stdout } = await runCli(['spark-lnaddress', 'register', 'satoshi'], {
+      env: { SPARK_STUB_LN_AVAILABLE: '0' },
+    });
+    assert.equal(code, 1);
+    assert.equal(JSON.parse(stdout).status, 'UNAVAILABLE');
+  });
+
+  it('spark-lnaddress rejects invalid usernames client-side', async () => {
+    for (const bad of ['ab', 'Has Space', '123', 'lnbc1x']) {
+      const { code, stderr } = await runCli(['spark-lnaddress', 'check', bad]);
+      assert.notEqual(code, 0, bad);
+      assert.ok(stderr.length > 0);
+    }
+  });
+
+  it('spark-lnaddress delete succeeds and reports the domain', async () => {
+    const { code, stdout, stderr } = await runCli(['spark-lnaddress', 'delete'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.status, 'DELETED');
+    assert.equal(j.lnurlDomain, 'blink.sv');
+    assert.match(stderr, /STUB_LN_DELETE=1/);
+  });
+
+  it('the SDK is connected with lnurlDomain pinned to blink.sv (never the breez.tips default)', async () => {
+    const { code, stdout } = await runCli(['spark-lnaddress', 'get'], { env: { SPARK_STUB_ECHO: '1' } });
+    assert.equal(code, 0);
+    // The domain in the output comes from the same lnurlDomainFor the real
+    // connect() uses — this pins the default for the whole command family.
+    assert.equal(JSON.parse(stdout).lnurlDomain, 'blink.sv');
+  });
+
+  it('SPARK_LNURL_DOMAIN=breez.tips is refused hard', async () => {
+    const { code, stderr } = await runCli(['spark-lnaddress', 'get'], { env: { SPARK_LNURL_DOMAIN: 'breez.tips' } });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /breez\.tips.*not permitted/s);
+  });
+
+  it('spark-info includes the recovered lightningAddress when registered', async () => {
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_LN_ADDRESS: 'satoshi@blink.sv' },
+    });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.lightningAddress, 'satoshi@blink.sv');
+    assert.equal(j.lnurlDomain, 'blink.sv');
   });
 
   it('the standalone wrapper (direct script invocation) drains stdout and exits cleanly', async () => {

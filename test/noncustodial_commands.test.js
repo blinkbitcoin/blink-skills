@@ -133,6 +133,11 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
       normalizeSdkValue: (value) => value,
       // spark_balance flattens token balances through this.
       normalizeTokenBalances: () => ({}),
+      // spark_info surfaces the recovered LN address on the pinned domain.
+      lnurlDomainFor: () => 'blink.sv',
+      async getLightningAddress() {
+        return undefined;
+      },
       async waitForStableBalance(sdk) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };

@@ -2,15 +2,15 @@
 
 Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
 
-34 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
+35 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
 
 ## Highlights
 
 - **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
-- **34 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
+- **35 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **688 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **703 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
 
@@ -123,6 +123,9 @@ Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 | --------------------------------------- | ------------------------------------------------------------- |
 | `blink spark-balance`                   | Show a Spark account BTC balance via the SDK                  |
 | `blink spark-info`                      | Show a Spark account info (`getInfo`) via the SDK             |
+| `blink spark-token-info <usdb\|id>`      | Show BTKN token metadata (name, ticker, decimals)             |
+| `blink spark-receive-token <amount>`     | Mint a Spark invoice to receive USDB / BTKN tokens            |
+| `blink spark-lnaddress get\|check\|register\|delete` | Manage the wallet's @blink.sv Lightning address |
 | `blink spark-send <destination> <sats>` | Sign & send BTC from a Spark account (`--dry-run` shows fees) |
 | `blink spark-transactions`              | List Spark account payments (SDK-local history)               |
 | `blink spark-subscribe`                 | Stream live Spark wallet events                               |
@@ -252,7 +255,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 688 tests, node:test framework, zero test dependencies
+npm test    # 703 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation

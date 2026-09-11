@@ -32,6 +32,7 @@ metadata:
         SPARK_MNEMONIC,
         BREEZ_API_KEY,
         SPARK_NETWORK,
+        SPARK_LNURL_DOMAIN,
       ]
     primaryEnv: BLINK_API_KEY
     emoji: '⚡'
@@ -71,7 +72,7 @@ commands). Key concepts:
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
-  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`, `spark-token-info`, `spark-receive-token`, and `l402-pay --spark`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
+  - **Non-custodial (Spark) commands** (`spark-balance`, `spark-send`, `spark-fee-probe`, `spark-transactions`, `spark-subscribe`, `spark-info`, `spark-token-info`, `spark-receive-token`, `spark-lnaddress`, and `l402-pay --spark`) need `SPARK_MNEMONIC` (the account seed — spend authority) plus `BREEZ_API_KEY`.
 - **Zero _required_ runtime npm dependencies.** The custodial and credential-free commands use only Node.js built-ins (`node:util`, `node:fs`, `node:path`, `node:child_process`). Two **optional, lazy-loaded** dependencies exist solely for the `spark-*` commands and `l402-pay --spark`, and are loaded only when one runs: `@breeztech/breez-sdk-spark` and `bip39`.
 
 Use this skill for concrete wallet operations, not generic Lightning theory.
@@ -496,6 +497,26 @@ blink spark-receive-token <amount> [--token usdb|<identifier>] [--base-units] [-
 ```
 
 Mints a **Spark invoice** for receiving a BTKN token (e.g. USDB) into the self-custodial wallet — the `paymentRequest` string can be paid by any Spark wallet. The amount is decimal token units (`25` = 25 USDB, resolved via metadata decimals) or raw base units with `--base-units`. This is a Spark invoice, **not** a BOLT-11 Lightning invoice — the non-custodial counterpart of `create-invoice-usd` over Lightning does not exist (LNURL-pay receive is BTC-only); this is the token-native receive path.
+
+### Spark LN Address
+
+```bash
+blink spark-lnaddress get
+blink spark-lnaddress check <username>
+blink spark-lnaddress register <username> [--description "..."]
+blink spark-lnaddress delete
+```
+
+Manages the self-custodial wallet's registered **`user@blink.sv`** Lightning address via the SDK. All operations run against the **Blink domain** — pinned by `_spark_sdk.connect()` (`lnurlDomainFor`: `blink.sv` on mainnet, `staging.blink.sv` on regtest, `SPARK_LNURL_DOMAIN` override for other Blink deployments; `breez.tips`, the Breez SDK's default, is **refused**).
+
+- `get` — reports the registered address. The SDK recovers it automatically on connect (keyed by the seed-derived identity pubkey), so **a seed imported from blink-mobile with a registered address is discoverable from the seed alone**. `registered: false` when the wallet has none.
+- `check <username>` — server-side availability (a uniqueness lookup across BOTH account providers: an available name is claimable by anyone).
+- `register <username>` — claims the username on the wallet's pubkey. One username per pubkey per domain — **a new registration replaces the wallet's previous one**. Usernames: 3–50 chars `[a-z0-9_]`, ≥1 letter, lowercased. Confirms availability first; exits 1 on `UNAVAILABLE`. No funds move.
+- `delete` — removes the address (reversible by re-registering, subject to availability).
+
+`spark-info` also reports the recovered `lightningAddress` and the pinned `lnurlDomain`. Note: `accountType: 'lnaddress'` across spark outputs is the **account-kind discriminator** (non-custodial, reachable at `user@blink.sv`) — not a claim that a per-wallet address exists; the per-wallet truth is the `lightningAddress` field.
+
+> **AGENT:** Confirm the username with the user before `register` — it is a public identity choice — and warn that registration replaces any previous address.
 
 ### Spark Send
 
@@ -1598,5 +1619,6 @@ Most scripts are stateless. Exceptions:
 - `{baseDir}/scripts/spark_fee_probe.js` — Estimate the fee / conversion quote to send from a Spark account (prepare only, nothing sent)
 - `{baseDir}/scripts/spark_token_info.js` — Fetch BTKN token metadata (name, ticker, decimals)
 - `{baseDir}/scripts/spark_receive_token.js` — Mint a Spark invoice to receive a BTKN token (e.g. USDB)
+- `{baseDir}/scripts/spark_lnaddress.js` — Manage the wallet's @blink.sv Lightning address (get/check/register/delete)
 - `{baseDir}/scripts/spark_transactions.js` — List Spark account payments (SDK-local history)
 - `{baseDir}/scripts/spark_subscribe.js` — Stream live Spark wallet events
