@@ -113,9 +113,12 @@ const fakeSdk = {
     // conversionOptions are present, include a deterministic estimate
     // (amountIn = source asset, amountOut = target asset, fee = 0).
     if (req.tokenIdentifier || req.conversionOptions) {
+      const isToBitcoin = req.conversionOptions && req.conversionOptions.conversionType.type === 'toBitcoin';
       const response = {
         paymentMethod: { type: 'sparkAddress', address: 'sprt1stub', fee: '0', tokenIdentifier: req.tokenIdentifier },
-        amount: req.amount || 0n,
+        // For a toBitcoin conversion no amount is passed, so the invoice's
+        // amount is authoritative — the stub uses a fixed 45000-sat invoice.
+        amount: isToBitcoin ? 45000n : req.amount || 0n,
         feePolicy: { type: 'simple' },
       };
       if (req.tokenIdentifier) response.tokenIdentifier = req.tokenIdentifier;

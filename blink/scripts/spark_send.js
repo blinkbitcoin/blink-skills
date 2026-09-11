@@ -368,33 +368,63 @@ async function main() {
         // Budget: the sats budget is a SATS instrument. A plain token send
         // moves no sats (no reservation). A --from-btc send converts SATS
         // into the token to pay — the sats side is conversionEstimate.amountIn,
-        // and THAT is what the budget must reserve.
+        // and THAT is what the budget must reserve. An absent, zero, or
+        // unrepresentable estimate never silently disables enforcement: a
+        // non-forced conversion REFUSES to dispatch rather than spend
+        // unreserved sats (fail closed). --force skips the reservation,
+        // same as forced BTC sends.
         let reservationId = null;
-        if (args.fromBtc && conversion) {
+        let recordableSats = null;
+        if (conversion) {
           const satsSide = Number(conversion.amountIn);
-          if (Number.isSafeInteger(satsSide) && satsSide > 0) {
-            const r = reserveBudget(
-              { sats: satsSide, command: 'spark-send', domain: null },
-              { requireConfigured: false },
+          if (Number.isSafeInteger(satsSide) && satsSide > 0) recordableSats = satsSide;
+        }
+        if (args.fromBtc && !args.force) {
+          if (recordableSats === null) {
+            throw new Error(
+              'No usable conversion estimate (sats side) for --from-btc — refusing to dispatch a ' +
+                'sats-consuming conversion without a budget reservation. Retry, or use --force to proceed unreserved.',
             );
-            if (!r.allowed) {
-              throw new Error(`Budget exceeded: ${r.reason} Use --force to override.`);
-            }
-            reservationId = r.id;
           }
+          const r = reserveBudget(
+            { sats: recordableSats, command: 'spark-send', domain: null },
+            { requireConfigured: false },
+          );
+          if (!r.allowed) {
+            throw new Error(`Budget exceeded: ${r.reason} Use --force to override.`);
+          }
+          reservationId = r.id;
         }
 
         let result;
         try {
           result = await sdk.sendPayment({ prepareResponse });
         } catch (e) {
-          if (reservationId) releaseSpend(reservationId);
+          // Outcome-unknown after dispatch — the same policy as the BTC path:
+          // the conversion may still settle, so the reservation STAYS
+          // (fail-closed, auto-cleared by the 25h prune). Only an explicit
+          // terminal 'failed' status releases it below.
+          if (reservationId) {
+            console.error(
+              'Warning: payment outcome is unknown after this error, so the budget reservation stays in place ' +
+                '(fail-closed, auto-cleared by the 25h prune). Inspect spark-transactions before retrying.',
+            );
+          }
           throw e;
         }
         const payment = result && result.payment ? result.payment : result;
         const status = (payment && payment.status) || 'SUBMITTED';
-        if (String(status).toLowerCase() !== 'failed' && reservationId) {
-          settleSpend({ reservationId, sats: Number(conversion.amountIn), command: 'spark-send', domain: null });
+        if (String(status).toLowerCase() !== 'failed') {
+          if (args.fromBtc) {
+            if (recordableSats !== null) {
+              settleSpend({ reservationId, sats: recordableSats, command: 'spark-send', domain: null });
+            } else {
+              console.error(
+                'Warning: forced conversion dispatched with no usable estimate — the sats spend is unrecorded.',
+              );
+            }
+          }
+          // Plain token send: no sats moved, nothing to record in the sats log.
         } else if (reservationId) {
           releaseSpend(reservationId);
         }
@@ -435,6 +465,28 @@ async function main() {
       };
       const { prepareResponse, feeSats } = await prepareToken(sdk, args.destination, null, null, conversionOptions);
       const conversion = conversionEstimateFrom(prepareResponse);
+
+      // ── Amount binding ──
+      // No amount is passed for a toBitcoin conversion, so the INVOICE's
+      // BTC amount is what will actually be paid. The caller confirmed
+      // args.amountSats — if the invoice disagrees, the confirmation was for
+      // the wrong number: refuse, for dry-runs too (the next real run would
+      // be based on the same wrong confirmation).
+      const authoritativeSats = Number(prepareResponse && prepareResponse.amount);
+      if (!Number.isSafeInteger(authoritativeSats) || authoritativeSats <= 0) {
+        throw new Error(
+          `Could not determine the invoice's BTC amount for --from-token (prepared amount: ${String(
+            prepareResponse && prepareResponse.amount,
+          )}) — refusing to convert tokens for an unknown spend.`,
+        );
+      }
+      if (authoritativeSats !== Number(args.amountSats)) {
+        throw new Error(
+          `Amount mismatch: the invoice is for ${authoritativeSats} sats but ${args.amountSats} was supplied. ` +
+            'Refusing to convert tokens for a different amount than confirmed — re-run with the invoice amount.',
+        );
+      }
+
       if (conversion) {
         console.error(
           `Conversion estimate: ${conversion.amountIn} token base units → ${conversion.amountOut} sats (fee ${conversion.fee}).`,
@@ -450,7 +502,7 @@ async function main() {
               dryRun: true,
               destination: args.destination,
               destinationType: 'bolt11',
-              amountSats: args.amountSats,
+              amountSats: authoritativeSats,
               feeSats,
               fromTokenIdentifier,
               conversionEstimate: conversion,
@@ -475,7 +527,7 @@ async function main() {
             status,
             destination: args.destination,
             destinationType: 'bolt11',
-            amountSats: args.amountSats,
+            amountSats: authoritativeSats,
             feeSats,
             fromTokenIdentifier,
             conversionEstimate: conversion,

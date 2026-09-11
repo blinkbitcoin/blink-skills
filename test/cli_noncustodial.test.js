@@ -225,7 +225,9 @@ describe('CLI: spark commands return instead of hanging', () => {
   });
 
   it('spark-fee-probe quotes a token conversion (prepare only)', async () => {
-    const { code, stdout } = await runCli(['spark-fee-probe', 'lnbc1000u1p0x', '1000', '--from-token', 'usdb'], {
+    // The stub's toBitcoin prepare binds to a fixed 45000-sat invoice; the
+    // supplied amount must match it (amount binding).
+    const { code, stdout } = await runCli(['spark-fee-probe', 'lnbc1000u1p0x', '45000', '--from-token', 'usdb'], {
       env: { SPARK_STUB_ECHO: '1' },
     });
     assert.equal(code, 0);
@@ -233,6 +235,20 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.equal(j.event, 'fee_probe');
     assert.equal(j.conversionEstimate.conversionType, 'toBitcoin');
     assert.equal(j.conversionEstimate.amountOut, '45000', 'the sats side of the quote');
+  });
+
+  it('spark-fee-probe --from-token REJECTS a mismatching supplied amount', async () => {
+    const { code, stderr } = await runCli(['spark-fee-probe', 'lnbc1000u1p0x', '1000', '--from-token', 'usdb'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /invoice is for 45000 sats but 1000 was supplied/);
+  });
+
+  it('spark-send --from-token dry-run rejects an amount mismatch before any dispatch', async () => {
+    const { code, stderr } = await runCli(['spark-send', 'lnbc1000u1p0x', '1', '--from-token', 'usdb', '--dry-run']);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /invoice is for 45000 sats but 1 was supplied/);
   });
 
   it('spark-send --token with a BOLT-11 destination is rejected', async () => {

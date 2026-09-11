@@ -96,6 +96,29 @@ async function main() {
         conversionOptions,
       );
       const conversion = conversionEstimateFrom(prepareResponse);
+
+      // Amount binding for --from-token quotes: no amount is passed for a
+      // toBitcoin conversion, so the INVOICE's BTC amount is authoritative —
+      // the same check spark-send enforces before dispatch. A mismatching
+      // quote fails loudly so the agent never confirms the wrong number.
+      let authoritativeSats;
+      if (args.fromToken !== null) {
+        authoritativeSats = Number(prepareResponse && prepareResponse.amount);
+        if (!Number.isSafeInteger(authoritativeSats) || authoritativeSats <= 0) {
+          throw new Error(
+            `Could not determine the invoice's BTC amount for the --from-token quote (prepared amount: ${String(
+              prepareResponse && prepareResponse.amount,
+            )}).`,
+          );
+        }
+        if (authoritativeSats !== Number(args.amountSats)) {
+          throw new Error(
+            `Amount mismatch: the invoice is for ${authoritativeSats} sats but ${args.amountSats} was supplied. ` +
+              'Re-run with the invoice amount.',
+          );
+        }
+      }
+
       console.log(
         JSON.stringify(
           {
