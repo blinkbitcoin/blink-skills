@@ -252,13 +252,28 @@ function conversionEstimateFrom(prepareResponse) {
  *   when no sats move (plain token sends, --from-token conversions).
  * @param {string} [opts.command]
  * @param {string|null} [opts.domain]
- * @returns {Promise<{ payment: object, status: string|*, paymentId: string|null }>}
+ * @returns {Promise<{ payment: object, status: string|object, paymentId: string|null }>}
  *   `status` is the SDK's payment status VERBATIM — a string per the pinned
  *   SDK union ('completed'|'pending'|'failed'); the hardened isFailedStatus
  *   additionally tolerates tagged-object statuses ({type:'failed'}), so the
  *   returned union includes those when the SDK emits them. Branch via
  *   isFailedStatus, never on a string assumption.
  */
+/**
+ * Render a payment status for diagnostics: a tagged-object status
+ * ({type:'failed'} — the shape isFailedStatus tolerates) renders as its
+ * type, other objects as JSON, so stderr never shows '[object Object]'.
+ *
+ * @param {string|object} status
+ * @returns {string}
+ */
+function displayStatus(status) {
+  if (status !== null && typeof status === 'object') {
+    return status.type !== undefined ? String(status.type) : JSON.stringify(status);
+  }
+  return String(status);
+}
+
 async function dispatchAndSettle(
   dispatch,
   { reservationId = null, settle = null, command = 'spark-send', domain = null } = {},
@@ -294,7 +309,7 @@ async function dispatchAndSettle(
   // not happen succeeded. `pending` is not a failure: it keeps a zero exit.
   if (isFailedStatus(status)) {
     process.exitCode = 1;
-    console.error(`Payment reported status '${status}'. Exiting non-zero.`);
+    console.error(`Payment reported status '${displayStatus(status)}'. Exiting non-zero.`);
   }
   return { payment, status, paymentId: (payment && (payment.id || payment.paymentHash)) || null };
 }

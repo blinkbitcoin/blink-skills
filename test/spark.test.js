@@ -1039,6 +1039,10 @@ describe('spark_send token/conversion budget integration', () => {
     await runMain(['sprt1x', '10.5', '--token', 'usdb', '--from-btc']);
     assert.equal(process.exitCode, 1);
     assert.deepEqual(budget.readLog(), [], 'terminal failure — budget freed');
+    // The diagnostic must render the tagged shape usefully, never
+    // '[object Object]'.
+    assert.match(lastErr, /Payment reported status 'failed'/);
+    assert.equal(lastErr.includes('[object Object]'), false);
   });
 
   // ── seam caller wiring: each path's settle/reservation/exit combination ────

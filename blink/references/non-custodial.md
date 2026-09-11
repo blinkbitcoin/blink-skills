@@ -202,15 +202,18 @@ Set it as `BREEZ_API_KEY` alongside `SPARK_MNEMONIC`.
 
 ## Status & budget policy (cross-path)
 
-The pinned SDK's status union is exactly `completed | pending | failed`, but
-each surface applies the fail-closed rule where a status or outcome is
-UNKNOWN rather than known-good:
+The pinned SDK's status union is exactly `completed | pending | failed`. Every
+path applies the fail-closed rule to an **outcome-unknown rejection** (the
+payment may still settle, so the reservation stays). For an unknown
+**status**, only the autonomous l402 path stays reserved — `spark-send`
+settles unrecognized statuses (safe under the pinned union) and the custodial
+commands release:
 
 | Path                                                                                 | Outcome-unknown rejection            | Explicit terminal failure | Unknown STATUS                                                                   |
 | ------------------------------------------------------------------------------------ | ------------------------------------ | ------------------------- | -------------------------------------------------------------------------------- |
 | `spark-send` (BTC, token, conversions — all via the shared `dispatchAndSettle` seam) | keep reservation (25h prune)         | release + exit 1          | reads via `isFailedStatus`; anything unrecognized settles/exits 0 (pinned union) |
 | `l402-pay --spark`                                                                   | keep reservation                     | release                   | keep reservation fail-closed (autonomous path)                                   |
-| Custodial pay commands                                                               | keep reservation (GraphQL transport) | release                   | PENDING settles; ALREADY_PAID releases                                           |
+| Custodial pay commands                                                               | keep reservation (GraphQL transport) | release                   | PENDING settles; ALREADY_PAID and all other/unrecognized statuses release        |
 
 One shared seam (`dispatchAndSettle` in `spark_send.js`) now carries the
 spark-send row — the token/conversion branches previously inlined the policy
