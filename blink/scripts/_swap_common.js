@@ -12,12 +12,7 @@
  * Zero external dependencies — Node.js 18+ built-ins only.
  */
 
-const {
-  graphqlRequest,
-  CONVERSION_QUERY,
-  MUTATION_TIMEOUT_MS,
-  getAllWallets,
-} = require('./_blink_client');
+const { graphqlRequest, CONVERSION_QUERY, MUTATION_TIMEOUT_MS, getAllWallets } = require('./_blink_client');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -137,8 +132,7 @@ function parseCommonSwapArgs(argv) {
   const direction = normalizeDirection(argv[0]);
   if (!direction) {
     return {
-      error:
-        'Invalid direction. Use btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc).',
+      error: 'Invalid direction. Use btc-to-usd or usd-to-btc (aliases: sell-btc, buy-usd, sell-usd, buy-btc).',
     };
   }
 
@@ -302,15 +296,7 @@ function computeBalanceDelta(preBalance, postBalance) {
  * @param {string}  opts.apiUrl
  * @returns {{ preBalance: object, quote: object }}
  */
-async function estimateSwapQuote({
-  direction,
-  amount,
-  unit,
-  ttlSeconds,
-  immediateExecution,
-  apiKey,
-  apiUrl,
-}) {
+async function estimateSwapQuote({ direction, amount, unit, ttlSeconds, immediateExecution, apiKey, apiUrl }) {
   assertSupportedDirectionUnit(direction, unit);
 
   const { btcWallet, usdWallet } = await getWalletPair({ apiKey, apiUrl });
@@ -372,12 +358,14 @@ async function estimateSwapQuote({
         value: amount,
         unit,
       },
-      amountIn: direction === DIRECTION_BTC_TO_USD
-        ? { value: amountInSats, unit: 'sats' }
-        : { value: amountInCents, unit: 'cents' },
-      amountOut: direction === DIRECTION_BTC_TO_USD
-        ? { value: amountOutCents, unit: 'cents' }
-        : { value: amountOutSats, unit: 'sats' },
+      amountIn:
+        direction === DIRECTION_BTC_TO_USD
+          ? { value: amountInSats, unit: 'sats' }
+          : { value: amountInCents, unit: 'cents' },
+      amountOut:
+        direction === DIRECTION_BTC_TO_USD
+          ? { value: amountOutCents, unit: 'cents' }
+          : { value: amountOutSats, unit: 'sats' },
       feeSats: 0,
       feeBps: 0,
       slippageBps: 0,
@@ -389,9 +377,7 @@ async function estimateSwapQuote({
       },
       quoteSource: 'blink:currencyConversionEstimation',
       executionPath:
-        direction === DIRECTION_BTC_TO_USD
-          ? 'blink:intraLedgerPaymentSend'
-          : 'blink:intraLedgerUsdPaymentSend',
+        direction === DIRECTION_BTC_TO_USD ? 'blink:intraLedgerPaymentSend' : 'blink:intraLedgerUsdPaymentSend',
     },
   };
 }
@@ -409,13 +395,7 @@ async function estimateSwapQuote({
  * @param {string}  opts.apiUrl
  * @returns {{ status: string, transactionId: string|null, preBalance: object, postBalance: object, balanceDelta: object }}
  */
-async function executeSwap({
-  direction,
-  quote,
-  memo,
-  apiKey,
-  apiUrl,
-}) {
+async function executeSwap({ direction, quote, memo, apiKey, apiUrl }) {
   const { btcWallet, usdWallet } = await getWalletPair({ apiKey, apiUrl });
   const preBalance = walletSnapshot(btcWallet, usdWallet);
 
