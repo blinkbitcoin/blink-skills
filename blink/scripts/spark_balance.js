@@ -46,7 +46,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          accountType: 'lnaddress',
+          accountType: 'spark',
           network,
           balanceSats,
           stable,

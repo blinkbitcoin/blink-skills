@@ -40,21 +40,23 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
-const { connect, lnurlDomainFor } = require('./_spark_sdk');
+const { connect, lnurlDomainFor, probeLnLookupHealthy } = require('./_spark_sdk');
 
 // Username rules mirrored from the Blink LNURL server (identifier.rs) and the
 // app's own validation — validated client-side so bad input never hits the
-// network. 3-50 chars, [a-z0-9_], at least one letter, lowercased; the
-// server additionally rejects lookalike-payment prefixes (1/3/_/bc1/lnbc1)
-// which we surface as a warning-level check too.
+// network. 3-50 chars, [a-z0-9_], at least one letter; uppercase is REJECTED
+// (never silently normalized — fail fast like every other rule); the server
+// additionally rejects lookalike-payment prefixes (1/3/_/bc1/lnbc1) which we
+// surface as a warning-level check too.
 const RESERVED_PREFIXES = ['1', '3', '_', 'bc1', 'lnbc1'];
 
 function validateUsername(raw) {
-  const username = String(raw || '')
-    .trim()
-    .toLowerCase();
+  const username = String(raw || '').trim();
   if (username.length < 3 || username.length > 50) {
     throw new Error('Username must be 3-50 characters');
+  }
+  if (/[A-Z]/.test(username)) {
+    throw new Error('Username must be lowercase — uppercase letters are rejected, not silently normalized');
   }
   if (!/^[a-z0-9_]+$/.test(username)) {
     throw new Error('Username may contain only lowercase letters, digits, and underscores');
@@ -112,27 +114,67 @@ async function main() {
   try {
     if (args.subcommand === 'get') {
       const info = await sdk.getLightningAddress();
+      if (info) {
+        console.log(
+          JSON.stringify(
+            {
+              accountType: 'spark',
+              network: args.network,
+              lnurlDomain: domain,
+              registered: true,
+              lightningAddress: info.lightningAddress,
+              username: info.username,
+              lnurl: info.lnurl,
+              description: info.description,
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      // Cache miss. getLightningAddress() reads the recovery-on-connect cache,
+      // and recovery fails SILENTLY inside the SDK — if the LNURL management
+      // service is unreachable (observed live: blink.sv endpoints 404'd while
+      // the address existed), null means "cannot know", not "none". Probe the
+      // service before claiming the negative: a false `registered: false`
+      // invites the user to re-register and replace an existing address.
+      const probe = await probeLnLookupHealthy(sdk);
+      if (!probe.healthy) {
+        console.log(
+          JSON.stringify(
+            {
+              accountType: 'spark',
+              network: args.network,
+              lnurlDomain: domain,
+              registered: 'unknown',
+              lightningAddress: null,
+              username: null,
+              lookupError: probe.error,
+              message:
+                'Cannot verify whether an address is registered — the LNURL lookup service is unreachable. ' +
+                'This is NOT a "no address" answer. Do not register/delete until the service answers.',
+            },
+            null,
+            2,
+          ),
+        );
+        console.error(
+          `Warning: LNURL lookup service unreachable (${probe.error}) — registered status is UNKNOWN, not false.`,
+        );
+        process.exitCode = 1;
+        return;
+      }
       console.log(
         JSON.stringify(
-          info
-            ? {
-                accountType: 'lnaddress',
-                network: args.network,
-                lnurlDomain: domain,
-                registered: true,
-                lightningAddress: info.lightningAddress,
-                username: info.username,
-                lnurl: info.lnurl,
-                description: info.description,
-              }
-            : {
-                accountType: 'lnaddress',
-                network: args.network,
-                lnurlDomain: domain,
-                registered: false,
-                lightningAddress: null,
-                username: null,
-              },
+          {
+            accountType: 'spark',
+            network: args.network,
+            lnurlDomain: domain,
+            registered: false,
+            lightningAddress: null,
+            username: null,
+          },
           null,
           2,
         ),
@@ -146,7 +188,7 @@ async function main() {
       console.log(
         JSON.stringify(
           {
-            accountType: 'lnaddress',
+            accountType: 'spark',
             network: args.network,
             lnurlDomain: domain,
             username,
@@ -182,7 +224,7 @@ async function main() {
           {
             event: 'lnaddress_register',
             status: 'REGISTERED',
-            accountType: 'lnaddress',
+            accountType: 'spark',
             network: args.network,
             lnurlDomain: domain,
             lightningAddress: info.lightningAddress,
@@ -204,7 +246,7 @@ async function main() {
         {
           event: 'lnaddress_delete',
           status: 'DELETED',
-          accountType: 'lnaddress',
+          accountType: 'spark',
           network: args.network,
           lnurlDomain: domain,
         },

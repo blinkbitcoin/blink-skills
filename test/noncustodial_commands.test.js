@@ -138,6 +138,16 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
       async getLightningAddress() {
         return undefined;
       },
+      // Mirror of _spark_sdk.probeLnLookupHealthy: a null LN-address cache is
+      // only trustworthy when the service answers a benign lookup.
+      async probeLnLookupHealthy(sdk) {
+        try {
+          await sdk.checkLightningAddressAvailable({ username: 'zz0000000001' });
+          return { healthy: true, error: null };
+        } catch (e) {
+          return { healthy: false, error: String((e && e.message) || e) };
+        }
+      },
       async waitForStableBalance(sdk) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };
@@ -505,7 +515,7 @@ describe('spark_balance main()', () => {
     const j = r.json();
     assert.equal(j.balanceSats, 2551);
     assert.equal(j.stable, true);
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
     assert.equal(disconnected, true, 'must always disconnect');
   });
 
@@ -570,7 +580,11 @@ describe('spark_info main()', () => {
     const j = r.json();
     assert.equal(j.balanceSats, 2551);
     assert.equal(j.identityPubkey, '02abcd');
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
+    // No fakeSdk.getLightningAddress here -> the module mock's undefined
+    // cache + a probe that cannot run (no checkLightningAddressAvailable on
+    // the fake sdk) => honestly unverified, never a bare "none".
+    assert.equal(j.lnAddressStatus, 'unverified');
     assert.equal(disconnected, true, 'must always disconnect');
   });
 

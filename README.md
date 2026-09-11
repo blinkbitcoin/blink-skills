@@ -10,7 +10,7 @@ Bitcoin Lightning wallet for the command line — zero required runtime npm depe
 - **35 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **706 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **712 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
 
@@ -119,16 +119,16 @@ Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
 `SPARK_MNEMONIC` (12/24 BIP39 words — spend authority, keep secret) and
 `BREEZ_API_KEY`:
 
-| Command                                 | Description                                                   |
-| --------------------------------------- | ------------------------------------------------------------- |
-| `blink spark-balance`                   | Show a Spark account BTC balance via the SDK                  |
-| `blink spark-info`                      | Show a Spark account info (`getInfo`) via the SDK             |
-| `blink spark-token-info <usdb\|id>`      | Show BTKN token metadata (name, ticker, decimals)             |
-| `blink spark-receive-token <amount>`     | Mint a Spark invoice to receive USDB / BTKN tokens            |
-| `blink spark-lnaddress get\|check\|register\|delete` | Manage the wallet's @blink.sv Lightning address |
-| `blink spark-send <destination> <sats>` | Sign & send BTC from a Spark account (`--dry-run` shows fees) |
-| `blink spark-transactions`              | List Spark account payments (SDK-local history)               |
-| `blink spark-subscribe`                 | Stream live Spark wallet events                               |
+| Command                                              | Description                                                   |
+| ---------------------------------------------------- | ------------------------------------------------------------- |
+| `blink spark-balance`                                | Show a Spark account BTC balance via the SDK                  |
+| `blink spark-info`                                   | Show a Spark account info (`getInfo`) via the SDK             |
+| `blink spark-token-info <usdb\|id>`                  | Show BTKN token metadata (name, ticker, decimals)             |
+| `blink spark-receive-token <amount>`                 | Mint a Spark invoice to receive USDB / BTKN tokens            |
+| `blink spark-lnaddress get\|check\|register\|delete` | Manage the wallet's @blink.sv Lightning address               |
+| `blink spark-send <destination> <sats>`              | Sign & send BTC from a Spark account (`--dry-run` shows fees) |
+| `blink spark-transactions`                           | List Spark account payments (SDK-local history)               |
+| `blink spark-subscribe`                              | Stream live Spark wallet events                               |
 
 **Getting a `BREEZ_API_KEY`.** The `spark-*` commands will not connect without
 one. It is a **Breez infrastructure credential, not custody** — it never touches
@@ -229,7 +229,7 @@ blink balance
 
 ### OpenClaw / Hermes Agents
 
-Published on ClawHub as [`blink-wallet@2.3.0`](https://clawhub.ai/pretyflaco/skills/blink-wallet) (the older `blink` skill is deprecated). The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
+Published on ClawHub as [`blink-wallet@2.4.0`](https://clawhub.ai/pretyflaco/skills/blink-wallet) (the older `blink` skill is deprecated). The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
 
 ### With blink-mcp
 
@@ -255,7 +255,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 706 tests, node:test framework, zero test dependencies
+npm test    # 712 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation

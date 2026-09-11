@@ -83,9 +83,7 @@ describe('l402_search — searchDirectory (mocked)', () => {
       return {
         ok: true,
         json: async () => ({
-          services: [
-            { service_id: 'abc123', name: 'Test Service', status: 'live' },
-          ],
+          services: [{ service_id: 'abc123', name: 'Test Service', status: 'live' }],
         }),
       };
     };

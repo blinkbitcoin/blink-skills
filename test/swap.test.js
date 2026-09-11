@@ -71,14 +71,20 @@ function setupTestEnv() {
   let stdoutLines = [];
   let stderrLines = [];
 
-  console.log = (...args) => { stdoutLines.push(args.join(' ')); };
-  console.error = (...args) => { stderrLines.push(args.join(' ')); };
+  console.log = (...args) => {
+    stdoutLines.push(args.join(' '));
+  };
+  console.error = (...args) => {
+    stderrLines.push(args.join(' '));
+  };
 
   return {
     getStdout: () => stdoutLines.join('\n'),
     getStdoutJson: () => JSON.parse(stdoutLines.join('\n')),
     getStderr: () => stderrLines.join('\n'),
-    setFetch: (mockFn) => { global.fetch = mockFn; },
+    setFetch: (mockFn) => {
+      global.fetch = mockFn;
+    },
     restore: () => {
       process.env = originalEnv;
       process.argv = originalArgv;
@@ -241,8 +247,16 @@ describe('_swap_common: parseCommonSwapArgs', () => {
   it('parses all flags', () => {
     const { parseCommonSwapArgs, DIRECTION_USD_TO_BTC } = freshRequireSwapCommon();
     const result = parseCommonSwapArgs([
-      'usd-to-btc', '500', '--unit', 'cents', '--ttl-seconds', '120',
-      '--immediate', '--dry-run', '--memo', 'test memo',
+      'usd-to-btc',
+      '500',
+      '--unit',
+      'cents',
+      '--ttl-seconds',
+      '120',
+      '--immediate',
+      '--dry-run',
+      '--memo',
+      'test memo',
     ]);
     assert.equal(result.direction, DIRECTION_USD_TO_BTC);
     assert.equal(result.amount, 500);
@@ -320,14 +334,20 @@ describe('_swap_common: computeBalanceDelta', () => {
 describe('swap_quote', () => {
   let env;
 
-  beforeEach(() => { env = setupTestEnv(); });
-  afterEach(() => { env.restore(); });
+  beforeEach(() => {
+    env = setupTestEnv();
+  });
+  afterEach(() => {
+    env.restore();
+  });
 
   it('returns a quote JSON with correct structure', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'btc-to-usd', '1000'];
     const { main } = freshRequire('swap_quote.js');
@@ -350,10 +370,12 @@ describe('swap_quote', () => {
   });
 
   it('USD-to-BTC quote uses cents as default unit', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'usd-to-btc', '500'];
     const { main } = freshRequire('swap_quote.js');
@@ -367,10 +389,12 @@ describe('swap_quote', () => {
   });
 
   it('includes pre-balance snapshot', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'btc-to-usd', '1000'];
     const { main } = freshRequire('swap_quote.js');
@@ -384,10 +408,12 @@ describe('swap_quote', () => {
   });
 
   it('includes execution path in quote', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'btc-to-usd', '1000'];
     const { main } = freshRequire('swap_quote.js');
@@ -398,10 +424,12 @@ describe('swap_quote', () => {
   });
 
   it('USD-to-BTC uses intraLedgerUsdPaymentSend path', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'usd-to-btc', '500'];
     const { main } = freshRequire('swap_quote.js');
@@ -417,8 +445,12 @@ describe('swap_quote', () => {
 describe('swap_execute', () => {
   let env;
 
-  beforeEach(() => { env = setupTestEnv(); });
-  afterEach(() => { env.restore(); });
+  beforeEach(() => {
+    env = setupTestEnv();
+  });
+  afterEach(() => {
+    env.restore();
+  });
 
   it('--dry-run outputs JSON with dryRun: true and does not send mutation', async () => {
     let mutationCalled = false;
@@ -452,10 +484,12 @@ describe('swap_execute', () => {
   });
 
   it('--dry-run shows zero balance delta', async () => {
-    env.setFetch(createMockFetch({
-      'query Me': MOCK_WALLETS_DATA,
-      'CurrencyConversion': MOCK_CONVERSION_DATA,
-    }));
+    env.setFetch(
+      createMockFetch({
+        'query Me': MOCK_WALLETS_DATA,
+        CurrencyConversion: MOCK_CONVERSION_DATA,
+      }),
+    );
 
     process.argv = ['node', 'blink', 'btc-to-usd', '2000', '--dry-run'];
     const { main } = freshRequire('swap_execute.js');

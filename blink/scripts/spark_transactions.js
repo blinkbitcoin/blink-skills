@@ -69,7 +69,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          accountType: 'lnaddress',
+          accountType: 'spark',
           network: args.network,
           count: normalized.length,
           transactions: normalized,

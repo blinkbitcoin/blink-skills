@@ -908,6 +908,7 @@ commands['l402-pay'] = {
   options: {
     wallet: { type: 'string', short: 'w', default: 'BTC' },
     'max-amount': { type: 'string' },
+    wait: { type: 'string' },
     'dry-run': { type: 'boolean', default: false },
     method: { type: 'string', default: 'GET' },
     header: { type: 'string', multiple: true },
@@ -920,6 +921,11 @@ commands['l402-pay'] = {
   optMeta: {
     wallet: { description: 'Wallet to pay from', valueName: 'currency' },
     'max-amount': { description: 'Refuse to pay more than N sats', valueName: 'sats' },
+    wait: {
+      description:
+        'Spark only: seconds to poll an async (PENDING) payment for settlement before failing (0 disables; default 60)',
+      valueName: 'seconds',
+    },
     'dry-run': { description: 'Discover price without paying (always bypasses cache)' },
     method: { description: 'HTTP method (default: GET)', valueName: 'method' },
     header: { description: 'Extra request header in key:value format (repeatable)', valueName: 'key:value' },
@@ -939,6 +945,7 @@ commands['l402-pay'] = {
   action: async (pos, opts) => {
     const argv = [pos[0], '--wallet', opts.wallet];
     if (opts['max-amount']) argv.push('--max-amount', opts['max-amount']);
+    if (opts.wait !== undefined) argv.push('--wait', opts.wait);
     if (opts['dry-run']) argv.push('--dry-run');
     if (opts.method !== 'GET') argv.push('--method', opts.method);
     if (opts.header) {

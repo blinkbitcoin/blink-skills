@@ -23,6 +23,7 @@ const target = path.resolve(__dirname, '..', '..', 'blink', 'scripts', '_spark_s
 
 const balance = Number(process.env.SPARK_STUB_BALANCE || 1234);
 const payments = JSON.parse(process.env.SPARK_STUB_PAYMENTS || '[]');
+let getPaymentCalls = 0; // per-process: the stub is required fresh in every CLI child
 const status = process.env.SPARK_STUB_STATUS || 'COMPLETED';
 const echo = process.env.SPARK_STUB_ECHO === '1';
 
@@ -94,6 +95,11 @@ const fakeSdk = {
     };
   },
   async checkLightningAddressAvailable(req) {
+    // SPARK_STUB_LN_LOOKUP_BROKEN=1: the management service is unreachable
+    // (field-test reproduction: every check 404'd while an address existed).
+    if (process.env.SPARK_STUB_LN_LOOKUP_BROKEN === '1') {
+      throw new Error('stub: network request failed with status 404');
+    }
     if (echo) console.error(`STUB_LN_CHECK=${req && req.username}`);
     return process.env.SPARK_STUB_LN_AVAILABLE !== '0';
   },
@@ -173,6 +179,10 @@ const fakeSdk = {
     return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
   },
   async sendPayment() {
+    // PENDING payments have no preimage yet — the preimage arrives in
+    // htlcDetails only once the HTLC reaches preimageShared (what getPayment
+    // then reports; see below).
+    const inFlight = String(status).toLowerCase() === 'pending';
     return {
       payment: {
         id: 'spark-1',
@@ -180,7 +190,35 @@ const fakeSdk = {
         fees: 0,
         details: {
           type: 'lightning',
-          htlcDetails: { paymentHash: 'd'.repeat(64), preimage: 'f'.repeat(64), status: 'preimageShared' },
+          htlcDetails: inFlight
+            ? { paymentHash: 'd'.repeat(64), preimage: null, status: 'pending' }
+            : { paymentHash: 'd'.repeat(64), preimage: 'f'.repeat(64), status: 'preimageShared' },
+        },
+      },
+    };
+  },
+  // Settlement refresh for the l402-pay --spark PENDING poll.
+  //   SPARK_STUB_SETTLE_AFTER_POLLS=N  getPayment returns the terminal payment
+  //                                     (completed + preimage) once it has been
+  //                                     called more than N times; until then
+  //                                     (and when unset) the payment stays
+  //                                     PENDING.
+  async getPayment(req) {
+    if (echo) console.error(`STUB_GETPAYMENT=${req && req.paymentId}`);
+    getPaymentCalls += 1;
+    const settleAfter = process.env.SPARK_STUB_SETTLE_AFTER_POLLS;
+    const terminal = settleAfter !== undefined && getPaymentCalls > Number(settleAfter);
+    const id = (req && req.paymentId) || 'spark-1';
+    return {
+      payment: {
+        id,
+        status: terminal ? 'completed' : 'pending',
+        fees: 0,
+        details: {
+          type: 'lightning',
+          htlcDetails: terminal
+            ? { paymentHash: 'd'.repeat(64), preimage: 'f'.repeat(64), status: 'preimageShared' }
+            : { paymentHash: 'd'.repeat(64), preimage: null, status: 'pending' },
         },
       },
     };
@@ -292,6 +330,17 @@ const stub = {
   async connect({ network } = {}) {
     if (echo) console.error(`STUB_NETWORK=${network}`);
     return { sdk: fakeSdk, disconnect: async () => {} };
+  },
+  // Mirror of the real _spark_sdk.probeLnLookupHealthy — spark_info and
+  // spark_lnaddress import it from _spark_sdk, which this stub replaces.
+  async probeLnLookupHealthy(sdk) {
+    const probeUsername = 'zz' + String(Math.floor(Math.random() * 1e10)).padStart(10, '0');
+    try {
+      await sdk.checkLightningAddressAvailable({ username: probeUsername });
+      return { healthy: true, error: null };
+    } catch (e) {
+      return { healthy: false, error: String((e && e.message) || e) };
+    }
   },
   // Mirror of the real _spark_sdk.feeFromPrepare — spark_send now imports it
   // from _spark_sdk, which this stub replaces.

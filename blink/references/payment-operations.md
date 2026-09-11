@@ -14,11 +14,11 @@ Use this reference for sending payments and estimating fees with the Blink skill
 
 Three ways to send Lightning payments:
 
-| Method | Script | Input | Use When |
-|--------|--------|-------|----------|
-| BOLT-11 invoice | `pay_invoice.js` | `lnbc...` string | Recipient gave you an invoice |
-| Lightning Address | `pay_lnaddress.js` | `user@domain` + amount | Recipient has a Lightning Address |
-| LNURL | `pay_lnurl.js` | `lnurl1...` + amount | Recipient gave you an LNURL payRequest |
+| Method            | Script             | Input                  | Use When                               |
+| ----------------- | ------------------ | ---------------------- | -------------------------------------- |
+| BOLT-11 invoice   | `pay_invoice.js`   | `lnbc...` string       | Recipient gave you an invoice          |
+| Lightning Address | `pay_lnaddress.js` | `user@domain` + amount | Recipient has a Lightning Address      |
+| LNURL             | `pay_lnurl.js`     | `lnurl1...` + amount   | Recipient gave you an LNURL payRequest |
 
 All three support the `--wallet BTC|USD` flag to choose which wallet to send from.
 
@@ -35,6 +35,7 @@ node pay_invoice.js lnbc1000n1... --wallet USD
 ```
 
 **How it works under the hood:**
+
 - Scripts query `me { defaultAccount { wallets { id walletCurrency } } }` to get both wallet IDs
 - The selected wallet's ID is passed to the GraphQL mutation
 - The same `lnInvoicePaymentSend` mutation handles both BTC and USD wallets
@@ -54,22 +55,24 @@ node fee_probe.js lnbc1000n1... --wallet USD
 ```
 
 **Important**: BTC and USD wallets use different fee probe mutations:
+
 - BTC: `lnInvoiceFeeProbe` — estimates routing fee in sats
 - USD: `lnUsdInvoiceFeeProbe` — estimates routing fee from USD wallet perspective
 
 Fee probe results:
+
 - `0 sats` — intraledger (both sender and receiver are Blink users) or direct channel peer
 - `> 0 sats` — routing fee for multi-hop payment
 - Error — no route found (payment will likely fail too)
 
 ## Payment Status Values
 
-| Status | Meaning | Action |
-|--------|---------|--------|
-| `SUCCESS` | Payment delivered | Done |
-| `PENDING` | In flight, not yet settled | Wait and check transactions |
-| `FAILURE` | Payment failed | Check error, possibly retry |
-| `ALREADY_PAID` | Invoice was already paid | No action needed |
+| Status         | Meaning                    | Action                      |
+| -------------- | -------------------------- | --------------------------- |
+| `SUCCESS`      | Payment delivered          | Done                        |
+| `PENDING`      | In flight, not yet settled | Wait and check transactions |
+| `FAILURE`      | Payment failed             | Check error, possibly retry |
+| `ALREADY_PAID` | Invoice was already paid   | No action needed            |
 
 ## Standard Send Workflow
 

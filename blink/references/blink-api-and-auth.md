@@ -11,10 +11,10 @@ Use this reference for Blink API configuration, authentication, and environment 
 
 ## API Endpoints
 
-| Environment | GraphQL Endpoint | WebSocket Endpoint | Purpose |
-|-------------|-----------------|--------------------|---------|
-| Production | `https://api.blink.sv/graphql` | `wss://ws.blink.sv/graphql` | Live wallets, real sats |
-| Staging | `https://api.staging.blink.sv/graphql` | `wss://ws.staging.blink.sv/graphql` | Signet testnet, free test sats |
+| Environment | GraphQL Endpoint                       | WebSocket Endpoint                  | Purpose                        |
+| ----------- | -------------------------------------- | ----------------------------------- | ------------------------------ |
+| Production  | `https://api.blink.sv/graphql`         | `wss://ws.blink.sv/graphql`         | Live wallets, real sats        |
+| Staging     | `https://api.staging.blink.sv/graphql` | `wss://ws.staging.blink.sv/graphql` | Signet testnet, free test sats |
 
 The endpoint is controlled by the `BLINK_API_URL` environment variable. If unset, production is used.
 
@@ -41,15 +41,16 @@ API keys are created in the Blink Dashboard under API Keys. Each key has one or 
 
 ## API Key Scopes
 
-| Scope | Allows | Scripts That Require It |
-|-------|--------|------------------------|
-| **Read** | Query balances, transactions, invoice status, account info, price | `balance.js`, `check_invoice.js`, `transactions.js`, `account_info.js`, `fee_probe.js` |
-| **Receive** | Create invoices (BTC and USD) | `create_invoice.js`, `create_invoice_usd.js` |
-| **Write** | Send payments (invoice, LN address, LNURL) | `pay_invoice.js`, `pay_lnaddress.js`, `pay_lnurl.js` |
+| Scope       | Allows                                                            | Scripts That Require It                                                                |
+| ----------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| **Read**    | Query balances, transactions, invoice status, account info, price | `balance.js`, `check_invoice.js`, `transactions.js`, `account_info.js`, `fee_probe.js` |
+| **Receive** | Create invoices (BTC and USD)                                     | `create_invoice.js`, `create_invoice_usd.js`                                           |
+| **Write**   | Send payments (invoice, LN address, LNURL)                        | `pay_invoice.js`, `pay_lnaddress.js`, `pay_lnurl.js`                                   |
 
 **Public endpoints** (no API key required): `price.js` for exchange rates, price history, and currency list.
 
 Use the minimum scope needed:
+
 - Balance monitoring agent: Read only
 - Invoice-receiving agent: Read + Receive
 - Full payment agent: Read + Receive + Write
@@ -58,10 +59,10 @@ Use the minimum scope needed:
 
 Every Blink account has two wallets:
 
-| Wallet | Currency | Balance Unit | ID Format |
-|--------|----------|--------------|-----------|
-| BTC | Bitcoin | satoshis | UUID string |
-| USD | Stablesats (USD-pegged) | cents | UUID string |
+| Wallet | Currency                | Balance Unit | ID Format   |
+| ------ | ----------------------- | ------------ | ----------- |
+| BTC    | Bitcoin                 | satoshis     | UUID string |
+| USD    | Stablesats (USD-pegged) | cents        | UUID string |
 
 Wallet IDs are resolved automatically by scripts via the `query me { defaultAccount { wallets { id walletCurrency } } }` query.
 
@@ -69,19 +70,20 @@ Wallet IDs are resolved automatically by scripts via the `query me { defaultAcco
 
 Blink API errors are returned in the GraphQL `errors` array. Common patterns:
 
-| Error Code | Meaning | Action |
-|------------|---------|--------|
-| `INSUFFICIENT_BALANCE` | Not enough funds | Check balance first |
-| `INVOICE_ALREADY_PAID` | Duplicate payment attempt | Check status, no retry needed |
-| `ROUTE_FINDING_ERROR` | No path to destination | Fee probe will also fail; may need smaller amount |
-| `INVOICE_EXPIRED` | Invoice TTL exceeded | Request a new invoice |
-| Authentication error | Invalid or missing API key | Verify `BLINK_API_KEY` is set and has correct scopes |
+| Error Code             | Meaning                    | Action                                               |
+| ---------------------- | -------------------------- | ---------------------------------------------------- |
+| `INSUFFICIENT_BALANCE` | Not enough funds           | Check balance first                                  |
+| `INVOICE_ALREADY_PAID` | Duplicate payment attempt  | Check status, no retry needed                        |
+| `ROUTE_FINDING_ERROR`  | No path to destination     | Fee probe will also fail; may need smaller amount    |
+| `INVOICE_EXPIRED`      | Invoice TTL exceeded       | Request a new invoice                                |
+| Authentication error   | Invalid or missing API key | Verify `BLINK_API_KEY` is set and has correct scopes |
 
 All scripts exit with code 0 on success and code 1 on failure. Errors are written to stderr; structured JSON goes to stdout.
 
 ## Rate Limits
 
 The Blink API enforces per-key rate limits. For agent automation:
+
 - Space out rapid-fire queries (balance polling, transaction listing)
 - Use WebSocket subscriptions instead of polling where possible
 - Fee probes count toward rate limits

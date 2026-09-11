@@ -1732,13 +1732,22 @@ describe('_spark_sdk.connect() lnurlDomain wiring', () => {
 describe('spark_lnaddress.validateUsername', () => {
   const { validateUsername } = require('../blink/scripts/spark_lnaddress');
 
-  it('accepts and lowercases a valid username', () => {
-    assert.equal(validateUsername('Satoshi'), 'satoshi');
-    assert.equal(validateUsername('ab_12'), 'ab_12');
+  it('accepts a valid lowercase username and trims surrounding whitespace', () => {
+    assert.equal(validateUsername('satoshi'), 'satoshi');
+    assert.equal(validateUsername('  ab_12  '), 'ab_12');
   });
   it('rejects short, long, non-[a-z0-9_], letterless, and reserved-prefix names', () => {
     for (const bad of ['ab', 'a'.repeat(51), 'has space', 'ABC!', '123', '1abc', '3abc', '_x', 'bc1x', 'lnbc1x']) {
       assert.throws(() => validateUsername(bad), bad);
+    }
+  });
+  it('rejects uppercase input instead of silently normalizing it (field test: UPPERCASE1 leaked to the network)', () => {
+    for (const bad of ['Satoshi', 'UPPERCASE1', 'Ab_c', 'satoshiX']) {
+      assert.throws(
+        () => validateUsername(bad),
+        (e) => /lowercase/.test(e.message) && /normaliz/i.test(e.message),
+        bad,
+      );
     }
   });
 });

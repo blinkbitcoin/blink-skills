@@ -37,18 +37,50 @@ function preDispatchError(stage, value) {
 }
 
 /**
+ * Decode a sendPayment/getPayment result into the normalized vocabulary.
+ *
+ * @param {object} result  SDK result ({ payment } or the payment itself)
+ * @returns {{ payment: object, status: string, preimage: string|null }}
+ */
+function decodePaymentResult(result) {
+  const payment = result && result.payment ? result.payment : result;
+  const rawStatus = String((payment && payment.status) || 'SUBMITTED');
+  const lower = rawStatus.toLowerCase();
+
+  let status;
+  if (lower === 'completed' || lower === 'success') status = 'SUCCESS';
+  else if (lower === 'pending' || lower === 'submitted') status = 'PENDING';
+  else if (lower === 'failed' || lower === 'failure') status = 'FAILURE';
+  else status = rawStatus; // unknown — preserved raw so the caller sees the truth
+
+  let preimage = null;
+  const details = payment && payment.details;
+  if (details && details.type === 'lightning' && details.htlcDetails) {
+    preimage = details.htlcDetails.preimage || null;
+  }
+  return { payment, status, preimage };
+}
+
+/**
  * Pay a BOLT-11 invoice from a Spark account.
  *
  * @param {string} invoice  BOLT-11 payment request (the L402 challenge invoice).
  * @param {object} [opts]
  * @param {string} [opts.network]  'mainnet' (default) or 'regtest'.
+ * @param {number} [opts.waitSeconds]  How long to poll an in-flight (PENDING)
+ *   payment for settlement before giving up. Default 60. 0 disables polling.
+ *   Spark settlement is asynchronous: sendPayment routinely resolves PENDING
+ *   and the preimage arrives seconds later in htlcDetails (status
+ *   preimageShared). Aborting on PENDING loses the payment — observed live:
+ *   sats spent, budget debited, no L402 token captured.
+ * @param {number} [opts.pollIntervalMs]  Poll cadence (default 3000).
  * @returns {Promise<{ payment: object, status: string, preimage: string|null, feeSats: number|null }>}
  *   status is NORMALIZED at this boundary, case-insensitively, onto the
  *   custodial vocabulary: the SDK's 'completed'/'pending'/'failed' (any
  *   casing) become 'SUCCESS'/'PENDING'/'FAILURE'; unknown statuses pass
  *   through raw. Callers must branch on these values only.
  */
-async function payInvoiceViaSpark(invoice, { network } = {}) {
+async function payInvoiceViaSpark(invoice, { network, waitSeconds = 60, pollIntervalMs = 3000 } = {}) {
   let sdk;
   let disconnect;
   try {
@@ -92,23 +124,9 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
     // on payment/status/details) would otherwise escape untagged and the
     // caller would release the reservation. Decode failures after dispatch are
     // outcome-unknown, same class as a thrown dispatch error.
-    let payment;
-    let status;
-    let preimage = null;
+    let decoded;
     try {
-      payment = result && result.payment ? result.payment : result;
-      const rawStatus = String((payment && payment.status) || 'SUBMITTED');
-      const lower = rawStatus.toLowerCase();
-
-      if (lower === 'completed' || lower === 'success') status = 'SUCCESS';
-      else if (lower === 'pending' || lower === 'submitted') status = 'PENDING';
-      else if (lower === 'failed' || lower === 'failure') status = 'FAILURE';
-      else status = rawStatus; // unknown — preserved raw so the caller sees the truth
-
-      const details = payment && payment.details;
-      if (details && details.type === 'lightning' && details.htlcDetails) {
-        preimage = details.htlcDetails.preimage || null;
-      }
+      decoded = decodePaymentResult(result);
     } catch (e) {
       const err = new Error(
         `Spark payment result could not be decoded after dispatch (outcome unknown): ${safeErrorDetail(e)}`,
@@ -117,6 +135,30 @@ async function payInvoiceViaSpark(invoice, { network } = {}) {
       err.code = 'SPARK_DISPATCH_OUTCOME_UNKNOWN';
       err.stage = 'dispatch'; // outcome unknown — the caller must keep the reservation
       throw err;
+    }
+
+    // Spark settlement is asynchronous: PENDING here is NORMAL, not failure.
+    // Poll getPayment until the payment reaches a terminal state or the wait
+    // budget is spent — the preimage (the L402 token material) only appears
+    // in htlcDetails once the HTLC reaches preimageShared.
+    let { payment, status, preimage } = decoded;
+    const deadlineMs = Math.max(0, Number(waitSeconds) || 0) * 1000;
+    let waitedMs = 0;
+    while (status === 'PENDING' && deadlineMs > 0 && waitedMs < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, deadlineMs - waitedMs)));
+      waitedMs += pollIntervalMs;
+      const paymentId = payment && payment.id;
+      if (!paymentId) break; // nothing to refresh — surface the PENDING truth
+      try {
+        const refreshed = await sdk.getPayment({ paymentId });
+        decoded = decodePaymentResult(refreshed);
+        payment = decoded.payment;
+        status = decoded.status;
+        preimage = decoded.preimage;
+      } catch {
+        // Transient query failure — keep polling; the payment itself is
+        // unaffected and the final state is re-read on the next tick.
+      }
     }
 
     return { payment, status, preimage, feeSats };
