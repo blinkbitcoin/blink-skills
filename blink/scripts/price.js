@@ -210,7 +210,7 @@ async function cmdHistory(range, apiKey, apiUrl) {
     if (btcPriceUsd === null) {
       // Fallback: base * 10^offset gives the price in the denominator currency units
       // For USD, the API returns cents, so divide by 100 to get dollars
-      btcPriceUsd = Math.round(decimalFromBaseOffset(p.price.base, p.price.offset) / 100 * 100) / 100;
+      btcPriceUsd = Math.round((decimalFromBaseOffset(p.price.base, p.price.offset) / 100) * 100) / 100;
     }
     return {
       timestamp: p.timestamp,

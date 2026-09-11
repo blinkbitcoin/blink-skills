@@ -23,12 +23,7 @@
  */
 
 const { getApiKey, getApiUrl } = require('./_blink_client');
-const {
-  parseCommonSwapArgs,
-  estimateSwapQuote,
-  executeSwap,
-  computeBalanceDelta,
-} = require('./_swap_common');
+const { parseCommonSwapArgs, estimateSwapQuote, executeSwap, computeBalanceDelta } = require('./_swap_common');
 
 async function main() {
   const parsed = parseCommonSwapArgs(process.argv.slice(2));

@@ -24,6 +24,8 @@ module.exports = defineConfig([
         // Node 18+ built-in fetch
         fetch: 'readonly',
         AbortController: 'readonly',
+        AbortSignal: 'readonly',
+        URLSearchParams: 'readonly',
         // WebSocket (available with --experimental-websocket or Node 22+)
         WebSocket: 'readonly',
       },
