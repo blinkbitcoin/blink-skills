@@ -2011,3 +2011,104 @@ describe('SKILL.md output examples contract', () => {
     }
   });
 });
+
+// ── SDK stdout-noise guard against the PINNED Node storage path ──────────────
+// Review round 1 (PR #16): "Skipping redundant payment event: …" is emitted
+// by nodejs/storage/index.cjs:362-364 via console.debug DIRECTLY (an alias
+// of console.log → stdout), not through the initLogging-configured logger —
+// so only the connection-lifetime guard can keep stdout JSON-only. This
+// test drives the REAL storage module through the duplicate-update path.
+
+describe('suppressSdkStdoutNoise (pinned Node storage, review round 1)', () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const pathMod = require('node:path');
+
+  function captureStdout(fn) {
+    const chunks = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, ...rest) => {
+      chunks.push(String(chunk));
+      return realWrite(chunk, ...rest);
+    };
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        process.stdout.write = realWrite;
+      })
+      .then(() => chunks.join(''));
+  }
+
+  it(
+    'a duplicate payment update leaks to stdout UNGUARDED and is silenced by the production guard',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      let storage;
+      let dir;
+      try {
+        // The storage subpath is not exported by the package's exports map —
+        // reach the pinned file directly (the same module the SDK's nodejs
+        // entry loads).
+        const mainEntry = require.resolve('@breeztech/breez-sdk-spark');
+        const pkgRoot = pathMod.dirname(pathMod.dirname(mainEntry)); // …/<pkg>/nodejs/index.js → <pkg>
+        const { SqliteStorage } = require(pathMod.join(pkgRoot, 'nodejs', 'storage', 'index.cjs'));
+        dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-noise-guard-'));
+        storage = new SqliteStorage(pathMod.join(dir, 'storage.sql')).initialize();
+      } catch (e) {
+        // Storage backend not usable in this environment (missing/broken
+        // better-sqlite3 binding) — the emission path cannot be exercised.
+        if (
+          e &&
+          /Cannot find module|better-sqlite3|NODE_MODULE_VERSION|bindings|not compiled/i.test(String(e && e.message))
+        ) {
+          return;
+        }
+        throw e;
+      }
+      try {
+        const payment = {
+          id: 'duplicate-id',
+          paymentType: 'receive',
+          status: 'completed',
+          amount: 1000,
+          fees: 0,
+          timestamp: 1740000000,
+          method: 'lightning',
+        };
+        await storage.applyPaymentUpdate(payment);
+
+        // Counterfactual first — WITHOUT the guard the duplicate update MUST
+        // leak (proves this environment actually exercises the pinned
+        // emission path; a pass here without a leak would make the guarded
+        // half vacuous).
+        const unguarded = await captureStdout(() => storage.applyPaymentUpdate(payment));
+        assert.ok(
+          unguarded.includes('Skipping redundant payment event'),
+          `expected the pinned storage to leak on stdout unguarded, got: ${JSON.stringify(unguarded)}`,
+        );
+
+        // With the production guard installed (the same one connect() holds
+        // for the connection lifetime), stdout must stay clean.
+        const restoreQuiet = spark.suppressSdkStdoutNoise();
+        const guarded = await captureStdout(async () => {
+          try {
+            await storage.applyPaymentUpdate(payment);
+          } finally {
+            restoreQuiet();
+          }
+        });
+        assert.equal(guarded, '', 'stdout must remain JSON-only while the guard is installed');
+
+        // And the guard restores the original console.debug afterwards.
+        assert.equal(typeof console.debug, 'function');
+      } finally {
+        try {
+          storage.close();
+        } catch {
+          // best-effort cleanup
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});

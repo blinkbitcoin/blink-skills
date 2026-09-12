@@ -55,9 +55,9 @@ function loadSdkModule() {
   console.warn = noop;
   console.error = noop;
   try {
-    const mod = require(SPARK_PACKAGE);
-    silenceSdkLogger(mod);
-    return mod;
+    // Logging is silenced in connect() (awaited, before the SDK connects) —
+    // loadSdkModule is sync and must stay so.
+    return require(SPARK_PACKAGE);
   } catch (err) {
     // Restore before throwing so the error is actually visible.
     console.log = saved.log;
@@ -78,21 +78,19 @@ function loadSdkModule() {
 }
 
 /**
- * Route every SDK log entry to a noop sink. Post-init SDK chatter — notably
- * "Skipping redundant payment event: …" replayed on stdout after recent
- * payment activity (observed live, field tests 2/3: spark_balance and
- * spark_send emitted SDK lines into stdout, breaking the all-JSON contract
- * for any consumer piping the output) — flows through the SDK's own logger
- * (initLogging), so a noop logger silences it at the source. The require()
- * muzzle above only covers load-time noise, which predates the logger.
- * Best-effort: older SDK builds without initLogging are left as-is.
+ * Route every SDK log entry to a noop sink. This covers only entries that
+ * flow through the SDK's Rust/WASM logger (initLogging). It does NOT cover
+ * the Node-side storage chatter — "Skipping redundant payment event: …" is
+ * a direct console.debug call (see suppressSdkStdoutNoise) — so both
+ * mechanisms are applied for the full connection lifetime. Best-effort:
+ * older SDK builds without initLogging are left as-is, and a rejection here
+ * must never break connecting.
  * @param {object} mod  the loaded SDK module
  */
-function silenceSdkLogger(mod) {
+async function silenceSdkLogger(mod) {
   try {
     if (mod && typeof mod.initLogging === 'function') {
-      // Fire-and-forget: initLogging is async; failures must never break loading.
-      Promise.resolve(mod.initLogging({ log: () => {} })).catch(() => {});
+      await mod.initLogging({ log: () => {} });
     }
   } catch {
     // Never let log silencing interfere with SDK availability.
@@ -547,6 +545,36 @@ async function probeLnLookupHealthy(sdk) {
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
  * @returns {Promise<{ sdk: object, disconnect: () => Promise<void> }>}
  */
+/**
+ * Muzzle the SDK's runtime STDOUT noise for the duration of a connection.
+ *
+ * The pinned SDK's Node storage emits "Skipping redundant payment event: …"
+ * DIRECTLY via console.debug (nodejs/storage/index.cjs:362-364 — same in the
+ * mysql/postgres storage variants) whenever a duplicate payment update is
+ * applied, i.e. whenever cached events replay after recent payment activity
+ * (observed live in field tests 2/3: spark_balance and spark_send emitted
+ * SDK lines into stdout, breaking the all-JSON contract). console.debug is
+ * an alias of console.log in Node — stdout. This does NOT flow through the
+ * Rust/WASM logger that initLogging configures, so the noop logger alone
+ * cannot suppress it (review round 1, PR #16 — confirmed against the
+ * pinned source and by a storage-level reproduction).
+ *
+ * Only console.debug is muzzled: our own output and the SDK's informational
+ * require-time line use console.log/warn/error, and the require-time noise
+ * is already covered by the muzzle in loadSdkModule.
+ *
+ * @returns {() => void} restore function — call exactly once when the
+ *   connection ends (or fails to open).
+ */
+function suppressSdkStdoutNoise() {
+  if (typeof console.debug !== 'function') return () => {};
+  const saved = console.debug;
+  console.debug = () => {};
+  return () => {
+    console.debug = saved;
+  };
+}
+
 async function connect({ network = DEFAULT_NETWORK } = {}) {
   requireNode22();
   const mod = loadSdkModule();
@@ -563,11 +591,24 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
   // Fail fast with a build-tools message rather than an opaque bindings error.
   assertStorageAvailable();
 
-  const sdk = await mod.connect({
-    config,
-    seed: { type: 'mnemonic', mnemonic, passphrase: undefined },
-    storageDir,
-  });
+  // Silence SDK logging (awaited — no race with the first payment) and hold
+  // the stdout guard for the ENTIRE connection lifetime: the duplicate-event
+  // replay that pollutes stdout happens any time after connect, not just at
+  // load (see suppressSdkStdoutNoise).
+  await silenceSdkLogger(mod);
+  const restoreQuiet = suppressSdkStdoutNoise();
+
+  let sdk;
+  try {
+    sdk = await mod.connect({
+      config,
+      seed: { type: 'mnemonic', mnemonic, passphrase: undefined },
+      storageDir,
+    });
+  } catch (err) {
+    restoreQuiet();
+    throw err;
+  }
 
   const disconnect = async () => {
     // Bounded AND non-rejecting by contract: the SDK's disconnect can hang or
@@ -578,6 +619,8 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
       await Promise.race([sdk.disconnect(), new Promise((resolve) => setTimeout(resolve, 5000))]);
     } catch {
       // best-effort
+    } finally {
+      restoreQuiet();
     }
   };
 
@@ -916,4 +959,5 @@ module.exports = {
   lnurlDomainFor,
   canonicalizeLnurlDomain,
   probeLnLookupHealthy,
+  suppressSdkStdoutNoise,
 };

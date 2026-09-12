@@ -21,6 +21,13 @@ const path = require('node:path');
 const scriptsDir = path.resolve(__dirname, '..', 'blink', 'scripts');
 const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
 
+// Capture the PRODUCTION _spark_sdk exports before any test mocks it: pure
+// helpers (normalizePayment) are passed through so the mock below cannot
+// drift from the real adapter (review round 1, PR #16 — the mirrored copy
+// had drifted in null handling and fallback fields).
+const realSparkSdk = require(sparkSdkPath);
+delete require.cache[sparkSdkPath];
+
 // ── shared harness ───────────────────────────────────────────────────────────
 
 let saved = {};
@@ -159,55 +166,9 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };
       },
-      // Mirror of the real _spark_sdk.normalizePayment — token rows carry
-      // base units, never sats (field test 3: a $0.999 USDB receive rendered
-      // as "999,001 sats" when this funnelled everything into amountSats).
-      normalizePayment: (p) => {
-        const details = p.details && typeof p.details === 'object' ? p.details : null;
-        const base = {
-          id: p.id || null,
-          type: p.paymentType || p.type || null,
-          status: p.status || null,
-          timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
-        };
-        if (p.method === 'token' || (details && details.type === 'token')) {
-          const meta = (details && details.metadata) || {};
-          const decimals = meta.decimals === undefined ? null : meta.decimals;
-          const fmt =
-            p.amount !== undefined && decimals !== null
-              ? (() => {
-                  const n = BigInt(p.amount);
-                  const neg = n < 0n;
-                  const abs = neg ? -n : n;
-                  const d = 10n ** BigInt(decimals);
-                  const whole = abs / d;
-                  const frac = (abs % d).toString().padStart(decimals, '0');
-                  return `${neg ? '-' : ''}${whole}${decimals > 0 ? '.' + frac : ''}`;
-                })()
-              : null;
-          return {
-            ...base,
-            asset: 'token',
-            amountSats: null,
-            feeSats: null,
-            amountBaseUnits: p.amount === undefined ? null : String(p.amount),
-            feeBaseUnits: p.fees === undefined ? null : String(p.fees),
-            amountFormatted: fmt,
-            token: {
-              ticker: meta.ticker || null,
-              name: meta.name || null,
-              decimals,
-              identifier: meta.identifier || meta.tokenIdentifier || null,
-            },
-          };
-        }
-        return {
-          ...base,
-          asset: 'btc',
-          amountSats: p.amount === undefined ? null : Number(p.amount),
-          feeSats: p.fees === undefined ? null : Number(p.fees),
-        };
-      },
+      // PRODUCTION passthrough (captured at file load): command tests run
+      // the real adapter; only SDK-boundary functions are faked here.
+      normalizePayment: realSparkSdk.normalizePayment,
     },
   };
 }

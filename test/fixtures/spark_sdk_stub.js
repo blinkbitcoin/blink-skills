@@ -21,6 +21,17 @@ const path = require('node:path');
 
 const target = path.resolve(__dirname, '..', '..', 'blink', 'scripts', '_spark_sdk.js');
 
+// Capture the PRODUCTION _spark_sdk exports BEFORE installing the
+// Module._load interception. Pure helpers (normalizePayment — and only
+// those) are passed through from production so this fixture can never
+// drift from the real adapter (review round 1, PR #16: the mirrored copy
+// had already drifted in null handling and fallback fields, letting
+// command tests stay green while production regressed). The cache entry is
+// deleted immediately so every later require from the CLI still resolves
+// to THIS stub — only this captured reference survives.
+const realSparkSdk = require(target);
+delete require.cache[target];
+
 const balance = Number(process.env.SPARK_STUB_BALANCE || 1234);
 const payments = JSON.parse(process.env.SPARK_STUB_PAYMENTS || '[]');
 let getPaymentCalls = 0; // per-process: the stub is required fresh in every CLI child
@@ -391,43 +402,9 @@ const stub = {
     const info = await sdk.getInfo({ ensureSynced: true });
     return { balanceSats: Number(info.balanceSats), stable: true };
   },
-  // Mirror of the real _spark_sdk.normalizePayment — token rows carry BASE
-  // UNITS (amountSats must be null for them; a $0.999 USDB receive is NOT
-  // "999,001 sats"). Mirrors the production token shape incl. amountFormatted.
-  normalizePayment: (p) => {
-    const details = p.details && typeof p.details === 'object' ? p.details : null;
-    const base = {
-      id: p.id || null,
-      type: p.paymentType || p.type || null,
-      status: p.status || null,
-      timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
-    };
-    if (p.method === 'token' || (details && details.type === 'token')) {
-      const meta = (details && details.metadata) || {};
-      const decimals = meta.decimals === undefined ? null : meta.decimals;
-      return {
-        ...base,
-        asset: 'token',
-        amountSats: null,
-        feeSats: null,
-        amountBaseUnits: p.amount === undefined ? null : String(p.amount),
-        feeBaseUnits: p.fees === undefined ? null : String(p.fees),
-        amountFormatted: p.amount !== undefined && decimals !== null ? formatTokenAmount(p.amount, decimals) : null,
-        token: {
-          ticker: meta.ticker || null,
-          name: meta.name || null,
-          decimals,
-          identifier: meta.identifier || meta.tokenIdentifier || null,
-        },
-      };
-    }
-    return {
-      ...base,
-      asset: 'btc',
-      amountSats: p.amount === undefined ? null : Number(p.amount),
-      feeSats: p.fees === undefined ? null : Number(p.fees),
-    };
-  },
+  // PRODUCTION passthrough (captured before the interception was installed):
+  // command tests run the real adapter, so the fixture cannot drift.
+  normalizePayment: realSparkSdk.normalizePayment,
 };
 
 const realLoad = Module._load;
