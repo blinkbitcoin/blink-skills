@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.3.0
+version: 2.4.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.3.0'
+    version: '2.4.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -509,12 +509,12 @@ blink spark-lnaddress delete
 
 Manages the self-custodial wallet's registered **`user@blink.sv`** Lightning address via the SDK. All operations run against the **Blink domain** — pinned by `_spark_sdk.connect()` (`lnurlDomainFor`: `blink.sv` on mainnet, `staging.blink.sv` on regtest, `SPARK_LNURL_DOMAIN` override for other Blink deployments; `breez.tips`, the Breez SDK's default, is **refused**).
 
-- `get` — reports the registered address. The SDK recovers it automatically on connect (keyed by the seed-derived identity pubkey), so **a seed imported from blink-mobile with a registered address is discoverable from the seed alone**. `registered: false` when the wallet has none.
+- `get` — reports the registered address. The SDK recovers it automatically on connect (keyed by the seed-derived identity pubkey), so **a seed imported from blink-mobile with a registered address is discoverable from the seed alone**. `registered` is three-state: `true` (address from the recovery cache), `false` (verified negative — the lookup service answered a probe), or `"unknown"` (service unreachable; **exit 1** — the answer cannot be trusted, do not register/delete). The probe exists because recovery fails silently inside the SDK when the LNURL service is down (observed live 2026-09-12: `registered: false` while a registered address existed).
 - `check <username>` — server-side availability (a uniqueness lookup across BOTH account providers: an available name is claimable by anyone).
-- `register <username>` — claims the username on the wallet's pubkey. One username per pubkey per domain — **a new registration replaces the wallet's previous one**. Usernames: 3–50 chars `[a-z0-9_]`, ≥1 letter, lowercased. Confirms availability first; exits 1 on `UNAVAILABLE`. No funds move.
+- `register <username>` — claims the username on the wallet's pubkey. One username per pubkey per domain — **a new registration replaces the wallet's previous one**. Usernames: 3–50 chars `[a-z0-9_]`, ≥1 letter; uppercase is rejected client-side — never silently normalized onto the network. Confirms availability first; exits 1 on `UNAVAILABLE`. No funds move.
 - `delete` — removes the address (reversible by re-registering, subject to availability).
 
-`spark-info` also reports the recovered `lightningAddress` and the pinned `lnurlDomain`. Note: `accountType: 'lnaddress'` across spark outputs is the **account-kind discriminator** (non-custodial, reachable at `user@blink.sv`) — not a claim that a per-wallet address exists; the per-wallet truth is the `lightningAddress` field.
+`spark-info` also reports the recovered `lightningAddress`, a `lnAddressStatus` (`registered` | `none` = verified negative | `unverified` = service unreachable — null then means "cannot know", not "no address"), and the pinned `lnurlDomain`. Since v2.4.0 spark outputs carry `accountType: 'spark'` (the wallet kind); whether a Lightning address is registered is the `lightningAddress` / `lnAddressStatus` pair, never the accountType. (`create-invoice-lnaddress` and `resolve-receiver` still classify a _receiver_ as `type: 'lnaddress'` when an address is Spark-backed — a different field, a different vocabulary.)
 
 > **AGENT:** Confirm the username with the user before `register` — it is a public identity choice — and warn that registration replaces any previous address.
 
@@ -802,7 +802,7 @@ Second JSON (when payment resolves):
 
 ```json
 {
-  "accountType": "lnaddress",
+  "accountType": "spark",
   "network": "mainnet",
   "balanceSats": 25000,
   "stable": true
@@ -829,7 +829,7 @@ Second JSON (when payment resolves):
 
 ```json
 {
-  "accountType": "lnaddress",
+  "accountType": "spark",
   "network": "mainnet",
   "count": 1,
   "transactions": [
@@ -1159,10 +1159,12 @@ Probes a URL for L402 payment requirements without paying. Returns the detected 
 
 **No API key required for discovery.**
 
-Known public L402 endpoints for testing (use specific paths, not root URLs):
+Known public L402 endpoints for testing (use specific paths, not root URLs; verified live 2026-09-12):
 
-- `https://l402.services/geoip/8.8.8.8` — GeoIP lookup, 1 sat, Lightning Labs format
+- `https://lightningenable.com/api/v1/endpoint/<id>` — Lightning Labs format, from 1 sat (discovery: `l402-discover https://lightningenable.com`)
 - `https://www.l402apps.com/api/apis` — L402 API directory, 10 sats, Lightning Labs format
+
+> Upstream availability shifts: `l402.services` (dead as of 2026-09-12) and `l402.directory` (intermittent 503 during rebuilds) have both been unreachable at times — `l402-search --source 402index` is the reliable directory fallback. Probe with `l402-discover` before relying on any endpoint.
 
 ### Pay for an L402-Gated Resource
 
@@ -1184,6 +1186,7 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 - `--dry-run` — discover price without paying; always bypasses the token cache so the current invoice price is always shown even if a cached token exists; uses the same conservative charge as real execution
 - `--method GET|POST|PUT|DELETE|PATCH` — HTTP method (default: GET)
 - `--header key:value` — extra request header (repeatable)
+- `--wait <seconds>` — Spark only: how long to poll an async (PENDING) settlement before failing (default 60; `0` disables). Spark settlement is asynchronous — a PENDING payment routinely settles seconds later carrying the preimage (the L402 token material), so the default waits rather than aborts. A timeout means the sats were spent but no token was captured: the error names the payment id (check `spark-transactions` before retrying — a retry pays again).
 - `--body <string>` — request body for POST/PUT
 - `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`)
 - `--force` — pay even if a valid cached token exists
@@ -1458,11 +1461,11 @@ Prevent runaway spending in autonomous agent workflows with rolling spend limits
 
 Env vars take precedence over the config file (`~/.blink/budget.json`):
 
-| Env var                      | Config file key   | Default | Description                               |
-| ---------------------------- | ----------------- | ------- | ----------------------------------------- |
-| `BLINK_BUDGET_HOURLY_SATS`   | `hourlyLimitSats` | none    | Max sats in rolling 1-hour window         |
-| `BLINK_BUDGET_DAILY_SATS`    | `dailyLimitSats`  | none    | Max sats in rolling 24-hour window        |
-| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist`       | none    | Comma-separated domains for L402 auto-pay |
+| Env var                      | Config file key   | Default         | Description                                                                               |
+| ---------------------------- | ----------------- | --------------- | ----------------------------------------------------------------------------------------- |
+| `BLINK_BUDGET_HOURLY_SATS`   | `hourlyLimitSats` | none            | Max sats in rolling 1-hour window                                                         |
+| `BLINK_BUDGET_DAILY_SATS`    | `dailyLimitSats`  | none            | Max sats in rolling 24-hour window                                                        |
+| `BLINK_L402_ALLOWED_DOMAINS` | `allowlist`       | none (deny all) | Comma-separated domains for L402 auto-pay — empty/unset denies every domain (fail-closed) |
 
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:

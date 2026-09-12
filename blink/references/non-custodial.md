@@ -224,17 +224,30 @@ public information and the seed holder is its owner.
 
 **Server rules mirrored client-side:** one username per pubkey per domain (a
 new registration REPLACES the wallet's previous one); usernames are 3–50
-chars `[a-z0-9_]` with ≥1 letter, lowercased, with payment-like prefixes
+chars `[a-z0-9_]` with ≥1 letter (uppercase is REJECTED client-side — never
+silently normalized onto the network), with payment-like prefixes
 ('1', '3', '\_', 'bc1', 'lnbc1') reserved; phone identifiers are not
 supported for Spark; availability is a uniqueness lookup across BOTH account
 providers (an available name is claimable by anyone); `anon`-mode accounts
 are refused registration and inbound minting.
 
-**On `accountType: 'lnaddress'`:** the label in spark outputs is the
-account-kind discriminator (non-custodial, reachable at `user@blink.sv`) —
-NOT a claim that a per-wallet Lightning address is registered. The
-per-wallet truth is the `lightningAddress` field (`spark-info`,
-`spark-lnaddress get`).
+**On `accountType` (v2.4.0):** spark outputs carry `accountType: 'spark'` —
+the wallet kind, full stop. Whether a Lightning address is registered is the
+`lightningAddress` / `lnAddressStatus` pair (`spark-info`,
+`spark-lnaddress get`): `registered` (recovered from the cache),
+`none` (verified negative — the lookup service answered a probe), or
+`unverified` (service unreachable; null then means "cannot know", not "no
+address"). The probe exists because recovery fails silently inside the SDK —
+observed live 2026-09-12: blink.sv management endpoints 404'd while a
+registered address existed, and `get` reported a false `registered: false`
+(a payment to the address settled fine). The probe proves the service is
+REACHABLE — necessary, not sufficient, for the recovery route having run
+(they are distinct service operations; the definitive fix is the server-side
+pubkey→address lookup requested in blink-lnurl-server#43). `spark-lnaddress get` exits 1 on
+`registered: "unknown"` so an unverifiable answer never masquerades as a
+verified negative. (`create-invoice-lnaddress` / `resolve-receiver` still
+classify a _receiver_ as `type: 'lnaddress'` when Spark-backed — a receiver
+classification, unchanged.)
 
 **Out of scope:** transferring an existing custodial blink.sv address to
 the Spark wallet (blink-mobile does this via the Galoy
@@ -250,11 +263,11 @@ payment may still settle, so the reservation stays). For an unknown
 settles unrecognized statuses (safe under the pinned union) and the custodial
 commands release:
 
-| Path                                                                                 | Outcome-unknown rejection            | Explicit terminal failure | Unknown STATUS                                                                   |
-| ------------------------------------------------------------------------------------ | ------------------------------------ | ------------------------- | -------------------------------------------------------------------------------- |
-| `spark-send` (BTC, token, conversions — all via the shared `dispatchAndSettle` seam) | keep reservation (25h prune)         | release + exit 1          | reads via `isFailedStatus`; anything unrecognized settles/exits 0 (pinned union) |
-| `l402-pay --spark`                                                                   | keep reservation                     | release                   | keep reservation fail-closed (autonomous path)                                   |
-| Custodial pay commands                                                               | keep reservation (GraphQL transport) | release                   | PENDING settles; ALREADY_PAID and all other/unrecognized statuses release        |
+| Path                                                                                 | Outcome-unknown rejection            | Explicit terminal failure | Unknown STATUS                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------ | ------------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `spark-send` (BTC, token, conversions — all via the shared `dispatchAndSettle` seam) | keep reservation (25h prune)         | release + exit 1          | reads via `isFailedStatus`; anything unrecognized settles/exits 0 (pinned union)                                                                                                       |
+| `l402-pay --spark`                                                                   | keep reservation                     | release                   | keep reservation fail-closed (autonomous path); PENDING first polls settlement (`--wait`, default 60s — async settlement is normal for Spark; the preimage/token arrive seconds later) |
+| Custodial pay commands                                                               | keep reservation (GraphQL transport) | release                   | PENDING settles; ALREADY_PAID and all other/unrecognized statuses release                                                                                                              |
 
 One shared seam (`dispatchAndSettle` in `spark_send.js`) now carries the
 spark-send row — the token/conversion branches previously inlined the policy

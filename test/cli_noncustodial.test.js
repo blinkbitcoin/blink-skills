@@ -104,9 +104,13 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.ok(!killed, 'command must not hit the timeout');
     assert.equal(code, 0);
     const j = JSON.parse(stdout);
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
     assert.equal(j.balanceSats, 2551);
     assert.equal(j.network, 'mainnet');
+    // No address registered AND the lookup service answered the probe —
+    // a verified negative, not a silent one.
+    assert.equal(j.lnAddressStatus, 'none');
+    assert.equal(j.lightningAddress, null);
   });
 
   it('spark-info forwards --network to connect()', async () => {
@@ -264,9 +268,37 @@ describe('CLI: spark commands return instead of hanging', () => {
     const { code, stdout } = await runCli(['spark-lnaddress', 'get']);
     assert.equal(code, 0);
     const j = JSON.parse(stdout);
+    assert.equal(j.accountType, 'spark');
     assert.equal(j.registered, false);
     assert.equal(j.lightningAddress, null);
     assert.equal(j.lnurlDomain, 'blink.sv', 'the Blink domain is always reported');
+  });
+
+  // Field-test reproduction (2026-09-12): blink.sv management endpoints 404'd
+  // while a registered address existed; getLightningAddress() read an empty
+  // recovery cache and reported a FALSE registered:false. A cache miss is now
+  // only trusted after probing the service.
+  it("spark-lnaddress get reports registered:'unknown' and exits non-zero when the lookup service is unreachable", async () => {
+    const { code, stdout, stderr } = await runCli(['spark-lnaddress', 'get'], {
+      env: { SPARK_STUB_LN_LOOKUP_BROKEN: '1' },
+    });
+    assert.equal(code, 1, 'an unverifiable answer must fail loudly, not exit 0');
+    const j = JSON.parse(stdout);
+    assert.equal(j.registered, 'unknown');
+    assert.equal(j.lightningAddress, null);
+    assert.ok(j.lookupError, 'the probe error is surfaced');
+    assert.match(j.message, /NOT a "no address" answer/i);
+    assert.match(stderr, /UNKNOWN, not false/);
+  });
+
+  it("spark-info reports lnAddressStatus:'unverified' (exit 0) when the lookup service is unreachable", async () => {
+    const { code, stdout } = await runCli(['spark-info'], {
+      env: { SPARK_STUB_LN_LOOKUP_BROKEN: '1', SPARK_STUB_BALANCE: '2551' },
+    });
+    assert.equal(code, 0, 'spark-info stays non-fatal — but never presents null as a verified negative');
+    const j = JSON.parse(stdout);
+    assert.equal(j.lnAddressStatus, 'unverified');
+    assert.equal(j.lightningAddress, null);
   });
 
   it('spark-lnaddress get reports a registered address with the Blink domain', async () => {
@@ -316,6 +348,15 @@ describe('CLI: spark commands return instead of hanging', () => {
       assert.notEqual(code, 0, bad);
       assert.ok(stderr.length > 0);
     }
+  });
+
+  it('spark-lnaddress rejects uppercase client-side — never normalizes it onto the network (field test)', async () => {
+    const { code, stderr } = await runCli(['spark-lnaddress', 'check', 'UPPERCASE1'], {
+      env: { SPARK_STUB_ECHO: '1' },
+    });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /lowercase/);
+    assert.ok(!/STUB_LN_CHECK/.test(stderr), 'rejection must happen BEFORE any network call');
   });
 
   it('spark-lnaddress delete succeeds and reports the domain', async () => {
@@ -373,7 +414,7 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.ok(!result.killed, 'must not hang on the SDK event loop');
     assert.equal(result.code, 0);
     const j = JSON.parse(result.stdout);
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
     assert.equal(j.balanceSats, 777);
   });
 
@@ -730,6 +771,146 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.equal(log.length, 1);
       assert.equal(log[0].sats, 100000);
       assert.equal(log[0].state, undefined, 'finalized spend');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // Field-test reproduction (2026-09-12): sendPayment resolved PENDING and the
+  // caller aborted instantly — sats spent, no L402 token, no resource. The
+  // payment now polls getPayment until the preimage appears.
+  it('pays via spark when settlement is async: PENDING polls to SUCCESS and captures the token', async () => {
+    const server = await startServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const { address, port } = server.address();
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+              SPARK_STUB_STATUS: 'PENDING',
+              SPARK_STUB_SETTLE_AFTER_POLLS: '0', // first getPayment returns terminal + preimage
+              BLINK_SPARK_POLL_INTERVAL_MS: '25',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout) => resolve({ err, stdout }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'must terminate promptly');
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.backend, 'spark');
+      assert.equal(j.paymentStatus, 'SUCCESS', 'the PENDING payment settled within the poll window');
+      const log = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'spending-log.json'), 'utf8'));
+      assert.equal(log.length, 1, 'the settled payment is debited exactly once');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed --wait values outright (no silent prefix parsing, no infinite deadlines)', async () => {
+    for (const bad of ['0.5', '1e2', '10seconds', '-1', '+5', '999999999999999999999']) {
+      const { code, stderr } = await runCli(['l402-pay', 'https://example.com/x', '--spark', '--wait', bad]);
+      assert.notEqual(code, 0, bad);
+      // '-1' is caught earlier by the CLI's own dash-argument guard; every
+      // rejection must name --wait and happen before any network activity.
+      assert.match(stderr, /--wait/, bad);
+      assert.ok(!stderr.includes('Requesting:'), 'rejected before any network activity');
+    }
+  });
+
+  it('BLINK_SPARK_POLL_INTERVAL_MS=0 falls back to the default and still polls to settlement', async () => {
+    // Review round 1: a zero interval was a non-terminating hot loop. The
+    // caller-side validation must fall back to 3000ms — proven end-to-end by
+    // a stub payment that settles on the first refresh.
+    const server = await startServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const { address, port } = server.address();
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+              SPARK_STUB_STATUS: 'PENDING',
+              SPARK_STUB_SETTLE_AFTER_POLLS: '0',
+              BLINK_SPARK_POLL_INTERVAL_MS: '0',
+              SPARK_STUB_ECHO: '1',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout, stderr) => resolve({ err, stdout, stderr }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'must terminate — no hot loop');
+      assert.match(result.stderr, /STUB_GETPAYMENT=spark-1/, 'the refresh ran despite the invalid interval');
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.paymentStatus, 'SUCCESS');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a payment stuck PENDING past --wait fails loudly with the payment id (and still debits)', async () => {
+    const server = await startServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const { address, port } = server.address();
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          [
+            '--require',
+            stubPath,
+            binPath,
+            'l402-pay',
+            `http://${address}:${port}/resource`,
+            '--spark',
+            '--no-store',
+            '--wait',
+            '1',
+          ],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+              SPARK_STUB_STATUS: 'PENDING',
+              // no SPARK_STUB_SETTLE_AFTER_POLLS: getPayment never settles
+              BLINK_SPARK_POLL_INTERVAL_MS: '25',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout, stderr) => resolve({ err, stdout, stderr }),
+        );
+      });
+      assert.ok(result.err && result.err.code !== 0, 'must exit non-zero');
+      assert.match(result.stderr, /still PENDING after 1s/);
+      assert.match(result.stderr, /token was NOT captured/);
+      assert.match(result.stderr, /spark-1/, 'names the payment id for spark-transactions follow-up');
+      assert.match(result.stderr, /retrying pays again/);
+      const log = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'spending-log.json'), 'utf8'));
+      assert.equal(log.length, 1, 'the in-flight sats are debited — they are spent');
     } finally {
       server.close();
       fs.rmSync(home, { recursive: true, force: true });

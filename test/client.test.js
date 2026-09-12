@@ -51,7 +51,9 @@ describe('warnIfNotBolt11', () => {
     // Capture stderr to verify no warning
     const original = console.error;
     let warned = false;
-    console.error = () => { warned = true; };
+    console.error = () => {
+      warned = true;
+    };
     try {
       warnIfNotBolt11('lnbc100n1p0...');
       assert.equal(warned, false);
@@ -63,7 +65,9 @@ describe('warnIfNotBolt11', () => {
   it('does not warn for lntbs prefix (testnet)', () => {
     const original = console.error;
     let warned = false;
-    console.error = () => { warned = true; };
+    console.error = () => {
+      warned = true;
+    };
     try {
       warnIfNotBolt11('lntbs100n1p0...');
       assert.equal(warned, false);
@@ -75,7 +79,9 @@ describe('warnIfNotBolt11', () => {
   it('does not warn for lntb prefix (testnet)', () => {
     const original = console.error;
     let warned = false;
-    console.error = () => { warned = true; };
+    console.error = () => {
+      warned = true;
+    };
     try {
       warnIfNotBolt11('lntb100n1p0...');
       assert.equal(warned, false);
@@ -87,7 +93,9 @@ describe('warnIfNotBolt11', () => {
   it('warns for unrecognised prefix', () => {
     const original = console.error;
     let warned = false;
-    console.error = () => { warned = true; };
+    console.error = () => {
+      warned = true;
+    };
     try {
       warnIfNotBolt11('xyz123...');
       assert.equal(warned, true);
@@ -99,7 +107,9 @@ describe('warnIfNotBolt11', () => {
   it('is case-insensitive', () => {
     const original = console.error;
     let warned = false;
-    console.error = () => { warned = true; };
+    console.error = () => {
+      warned = true;
+    };
     try {
       warnIfNotBolt11('LNBC100n1p0...');
       assert.equal(warned, false);
@@ -202,7 +212,14 @@ describe('parseWalletArg', () => {
 
   it('strips all payment flags from remaining', () => {
     const result = parseWalletArg([
-      'addr@blink.sv', '5000', '--wallet', 'USD', '--dry-run', '--force', '--max-amount', '10000',
+      'addr@blink.sv',
+      '5000',
+      '--wallet',
+      'USD',
+      '--dry-run',
+      '--force',
+      '--max-amount',
+      '10000',
     ]);
     assert.equal(result.walletCurrency, 'USD');
     assert.equal(result.dryRun, true);

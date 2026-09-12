@@ -13,10 +13,10 @@ Use this reference for creating, monitoring, and managing Lightning invoices wit
 
 ## Invoice Types
 
-| Type | Script | Amount Unit | Credited To | Expiration |
-|------|--------|-------------|-------------|------------|
-| BTC | `create_invoice.js` | satoshis | BTC wallet | Standard (hours) |
-| USD | `create_invoice_usd.js` | cents | USD wallet | ~5 minutes (exchange rate lock) |
+| Type | Script                  | Amount Unit | Credited To | Expiration                      |
+| ---- | ----------------------- | ----------- | ----------- | ------------------------------- |
+| BTC  | `create_invoice.js`     | satoshis    | BTC wallet  | Standard (hours)                |
+| USD  | `create_invoice_usd.js` | cents       | USD wallet  | ~5 minutes (exchange rate lock) |
 
 BTC invoices are denominated in satoshis. USD invoices lock an exchange rate at creation time, so the sender pays in Lightning (BTC) but the receiver gets a fixed USD amount credited to their USD wallet.
 
@@ -25,16 +25,25 @@ BTC invoices are denominated in satoshis. USD invoices lock an exchange rate at 
 Both `create_invoice.js` and `create_invoice_usd.js` output **two separate JSON objects** to stdout:
 
 **Phase 1 — Immediate** (invoice created):
+
 ```json
-{"event": "invoice_created", "paymentRequest": "lnbc...", "paymentHash": "abc123...", "satoshis": 1000, "status": "PENDING"}
+{
+  "event": "invoice_created",
+  "paymentRequest": "lnbc...",
+  "paymentHash": "abc123...",
+  "satoshis": 1000,
+  "status": "PENDING"
+}
 ```
 
 **Phase 2 — Resolution** (payment settles or expires):
+
 ```json
-{"event": "subscription_result", "status": "PAID", "isPaid": true}
+{ "event": "subscription_result", "status": "PAID", "isPaid": true }
 ```
 
 The agent should:
+
 1. Parse the first JSON immediately to get `paymentRequest` and share it with the user
 2. Optionally generate a QR code with `qr_invoice.js`
 3. Wait for the second JSON to confirm payment status
@@ -89,11 +98,11 @@ Cons: Requires Node 22+ (or Node 20+ with `--experimental-websocket`).
 
 ## Invoice Status Values
 
-| Status | Meaning | Terminal? |
-|--------|---------|-----------|
-| `PENDING` | Created, awaiting payment | No |
-| `PAID` | Payment received and settled | Yes |
-| `EXPIRED` | TTL exceeded, no payment received | Yes |
+| Status    | Meaning                           | Terminal? |
+| --------- | --------------------------------- | --------- |
+| `PENDING` | Created, awaiting payment         | No        |
+| `PAID`    | Payment received and settled      | Yes       |
+| `EXPIRED` | TTL exceeded, no payment received | Yes       |
 
 ## QR Code Generation
 
@@ -104,6 +113,7 @@ node qr_invoice.js <paymentRequest>
 ```
 
 Output:
+
 - **Terminal QR** rendered to stderr (for visual verification)
 - **PNG file** written to `/tmp/blink_qr_<timestamp>.png`
 - **JSON to stdout** with `pngPath` field pointing to the PNG file

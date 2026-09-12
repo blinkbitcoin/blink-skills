@@ -52,6 +52,7 @@ afterEach(() => {
     'spark_transactions.js',
     'spark_subscribe.js',
     'resolve_receiver.js',
+    'l402_pay_spark.js',
   ]) {
     delete require.cache[path.join(scriptsDir, f)];
   }
@@ -138,6 +139,22 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
       async getLightningAddress() {
         return undefined;
       },
+      // Mirror of _spark_sdk.probeLnLookupHealthy: a null LN-address cache is
+      // only trustworthy when the service answers a benign lookup. (The REAL
+      // probe is unit-tested directly in spark.test.js; this mirror exists
+      // because requiring production _spark_sdk from these script-level mocks
+      // is not possible without replacing it wholesale.)
+      async probeLnLookupHealthy(sdk) {
+        try {
+          await sdk.checkLightningAddressAvailable({ username: 'zz0000000001' });
+          return { healthy: true, error: null };
+        } catch (e) {
+          return { healthy: false, error: String((e && e.message) || e) };
+        }
+      },
+      // l402_pay_spark imports these — mirrors of the production helpers.
+      feeFromPrepare: () => 3,
+      safeErrorDetail: (value) => String((value && value.message) || value),
       async waitForStableBalance(sdk) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };
@@ -505,7 +522,7 @@ describe('spark_balance main()', () => {
     const j = r.json();
     assert.equal(j.balanceSats, 2551);
     assert.equal(j.stable, true);
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
     assert.equal(disconnected, true, 'must always disconnect');
   });
 
@@ -570,8 +587,45 @@ describe('spark_info main()', () => {
     const j = r.json();
     assert.equal(j.balanceSats, 2551);
     assert.equal(j.identityPubkey, '02abcd');
-    assert.equal(j.accountType, 'lnaddress');
+    assert.equal(j.accountType, 'spark');
+    // No fakeSdk.getLightningAddress here -> the module mock's undefined
+    // cache + a probe that cannot run (no checkLightningAddressAvailable on
+    // the fake sdk) => honestly unverified, never a bare "none".
+    assert.equal(j.lnAddressStatus, 'unverified');
     assert.equal(disconnected, true, 'must always disconnect');
+  });
+
+  it('reports lnAddressStatus "registered" when the recovery cache has the address', async () => {
+    mockSparkSdk({
+      async getInfo() {
+        return { balanceSats: 2551n, identityPubkey: '02abcd' };
+      },
+      async getLightningAddress() {
+        return { lightningAddress: 'satoshi@blink.sv', username: 'satoshi' };
+      },
+    });
+    const r = await runScript('spark_info.js', []);
+    const j = r.json();
+    assert.equal(j.lnAddressStatus, 'registered');
+    assert.equal(j.lightningAddress, 'satoshi@blink.sv');
+  });
+
+  it('reports lnAddressStatus "unverified" (never "none") when getLightningAddress() itself throws', async () => {
+    mockSparkSdk({
+      async getInfo() {
+        return { balanceSats: 2551n };
+      },
+      async getLightningAddress() {
+        throw new Error('cache read failed');
+      },
+      async checkLightningAddressAvailable() {
+        return true; // service is healthy — but the cache read already failed
+      },
+    });
+    const r = await runScript('spark_info.js', []);
+    const j = r.json();
+    assert.equal(j.lnAddressStatus, 'unverified');
+    assert.equal(j.lightningAddress, null);
   });
 
   it('still disconnects when getInfo() rejects', async () => {
@@ -694,5 +748,213 @@ describe('spark_subscribe main()', () => {
       },
     });
     await assert.rejects(() => runScript('spark_subscribe.js', ['--timeout', '-1']), /non-negative/);
+  });
+});
+
+// ── l402_pay_spark settlement polling ────────────────────────────────────────
+
+describe('payInvoiceViaSpark settlement poll (review round 1: deadline bounds)', () => {
+  // beforeEach clears the script cache, so each test re-requires the leg
+  // AFTER installing its mock — the leg binds connect() at load time.
+  const legPath = require.resolve('../blink/scripts/l402_pay_spark');
+  const freshLeg = () => require(legPath).payInvoiceViaSpark;
+
+  function pendingPayment(overrides = {}) {
+    return {
+      payment: {
+        id: 'pay-1',
+        status: 'pending',
+        fees: 0,
+        details: { type: 'lightning', htlcDetails: { paymentHash: 'd'.repeat(64), preimage: null, status: 'pending' } },
+        ...overrides,
+      },
+    };
+  }
+
+  function terminalPayment(status) {
+    return {
+      payment: {
+        id: 'pay-1',
+        status,
+        fees: 0,
+        details: {
+          type: 'lightning',
+          htlcDetails: { paymentHash: 'd'.repeat(64), preimage: 'f'.repeat(64), status: 'preimageShared' },
+        },
+      },
+    };
+  }
+
+  function stubSdk({ sendResult, onGetPayment }) {
+    return {
+      async prepareSendPayment() {
+        return { paymentMethod: { type: 'bolt11Invoice', lightningFeeSats: 3 } };
+      },
+      async sendPayment() {
+        return sendResult;
+      },
+      async getPayment(req) {
+        return onGetPayment(req);
+      },
+    };
+  }
+
+  it('a NEVER-RESOLVING getPayment is bounded by the deadline and returns PENDING (wall-clock bound)', async () => {
+    let getPaymentCalls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          getPaymentCalls += 1;
+          return new Promise(() => {}); // stalls forever
+        },
+      }),
+    );
+    const started = Date.now();
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 0.2, pollIntervalMs: 20 });
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 'PENDING');
+    assert.ok(elapsed < 2000, `must return near the 0.2s deadline, took ${elapsed}ms`);
+    assert.ok(getPaymentCalls >= 1, 'the stalled refresh was attempted');
+  });
+
+  it('a sub-interval wait (1s with the 3000ms DEFAULT interval) refreshes IMMEDIATELY — no sleep-first burn', async () => {
+    // Review round 2 repro: sleep-first ordering consumed the whole 1s
+    // budget sleeping and performed ZERO refreshes for an already-settled
+    // payment. The first refresh must run before any sleep.
+    let calls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          calls += 1;
+          return terminalPayment('completed'); // settlement already available
+        },
+      }),
+    );
+    const started = Date.now();
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 1 }); // default interval: 3000
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 'SUCCESS', 'the already-terminal state is observed on the first refresh');
+    assert.equal(r.preimage, 'f'.repeat(64));
+    assert.equal(calls, 1);
+    assert.ok(elapsed < 1500, `returns near the 1s deadline, took ${elapsed}ms`);
+  });
+
+  it('a garbage waitSeconds (Infinity) still yields a FINITE deadline and a working first refresh', async () => {
+    // The cap itself (MAX_WAIT_SECONDS) keeps Date.now()+deadline finite for
+    // Infinity/1e21 inputs; exhausting a full clamped hour is not testable in
+    // bounded time, so the observable contract here is: garbage input does
+    // not disable or break the poll — the immediate first refresh still runs
+    // and a terminal settlement is observed.
+    let calls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          calls += 1;
+          return terminalPayment('completed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: Infinity, pollIntervalMs: 10 });
+    assert.equal(r.status, 'SUCCESS', 'a non-finite wait still performs the immediate first refresh');
+    assert.equal(calls, 1);
+    // And the exported ceiling is a safe integer at the documented value.
+    const { MAX_WAIT_SECONDS } = require('../blink/scripts/l402_pay_spark');
+    assert.ok(Number.isSafeInteger(MAX_WAIT_SECONDS) && MAX_WAIT_SECONDS === 3600);
+  });
+
+  it('a REJECTING getPayment keeps polling until the deadline, then returns PENDING', async () => {
+    let getPaymentCalls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          getPaymentCalls += 1;
+          throw new Error('transient');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 0.2, pollIntervalMs: 20 });
+    assert.equal(r.status, 'PENDING');
+    assert.ok(getPaymentCalls >= 2, 'transient failures do not end the poll early');
+  });
+
+  it('a payment with NO id is surfaced PENDING without any refresh', async () => {
+    let getPaymentCalls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment({ id: undefined }),
+        onGetPayment() {
+          getPaymentCalls += 1;
+          return terminalPayment('completed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 60, pollIntervalMs: 10 });
+    assert.equal(r.status, 'PENDING');
+    assert.equal(getPaymentCalls, 0, 'nothing to refresh — no getPayment call');
+  });
+
+  it('waitSeconds 0 disables polling entirely', async () => {
+    let getPaymentCalls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          getPaymentCalls += 1;
+          return terminalPayment('completed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 0 });
+    assert.equal(r.status, 'PENDING');
+    assert.equal(getPaymentCalls, 0);
+  });
+
+  it('a refresh to FAILURE exits the poll with FAILURE', async () => {
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          return terminalPayment('failed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 60, pollIntervalMs: 10 });
+    assert.equal(r.status, 'FAILURE');
+  });
+
+  it('a refresh to SUCCESS carries the preimage', async () => {
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          return terminalPayment('completed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 60, pollIntervalMs: 10 });
+    assert.equal(r.status, 'SUCCESS');
+    assert.equal(r.preimage, 'f'.repeat(64));
+  });
+
+  it('invalid poll intervals (0, negative, NaN) are clamped and the poll still terminates', async () => {
+    for (const bad of [0, -5, NaN]) {
+      mockSparkSdk(
+        stubSdk({
+          sendResult: pendingPayment(),
+          onGetPayment() {
+            return new Promise(() => {});
+          },
+        }),
+      );
+      const started = Date.now();
+      const r = await freshLeg()('lnbc1x', { waitSeconds: 0.1, pollIntervalMs: bad });
+      const elapsed = Date.now() - started;
+      assert.equal(r.status, 'PENDING', `interval ${bad}`);
+      assert.ok(elapsed < 4000, `interval ${bad}: must terminate at the deadline, took ${elapsed}ms`);
+    }
   });
 });

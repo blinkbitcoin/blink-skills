@@ -99,7 +99,7 @@ async function main() {
       JSON.stringify(
         {
           event: 'token_invoice_created',
-          accountType: 'lnaddress',
+          accountType: 'spark',
           network: args.network,
           tokenIdentifier: identifier,
           amountBaseUnits,

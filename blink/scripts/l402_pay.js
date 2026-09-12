@@ -193,6 +193,7 @@ function parseArgs(argv) {
   let url = null;
   let walletCurrency = 'BTC';
   let maxAmount = null;
+  let waitSeconds = 60;
   let dryRun = false;
   let method = 'GET';
   let noStore = false;
@@ -220,6 +221,23 @@ function parseArgs(argv) {
         process.exit(1);
       }
       maxAmount = n;
+    } else if (arg === '--wait' && i + 1 < argv.length) {
+      // Full-string integer validation: parseInt's prefix parsing would
+      // silently accept '0.5' as 0 (disabling the settlement poll entirely),
+      // '10seconds' as 10, and '1e2' as 1. Arbitrarily long digit strings
+      // convert to Infinity (an infinite deadline), so a documented maximum
+      // of 1 hour is enforced too.
+      const raw = argv[++i];
+      if (!/^\d+$/.test(raw)) {
+        console.error('Error: --wait must be a non-negative whole number of seconds (0 disables settlement polling)');
+        process.exit(1);
+      }
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n > 3600) {
+        console.error('Error: --wait must be at most 3600 seconds (1 hour)');
+        process.exit(1);
+      }
+      waitSeconds = n;
     } else if (arg === '--dry-run') {
       dryRun = true;
     } else if (arg === '--no-store') {
@@ -249,7 +267,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { url, walletCurrency, maxAmount, dryRun, method, noStore, force, probe, spark, headers, body };
+  return { url, walletCurrency, maxAmount, waitSeconds, dryRun, method, noStore, force, probe, spark, headers, body };
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -789,6 +807,14 @@ async function main() {
     try {
       spark = await payInvoiceViaSpark(challenge.invoice, {
         network: process.env.SPARK_NETWORK || 'mainnet',
+        waitSeconds: args.waitSeconds,
+        // Debug/CI knob for the settlement poll cadence. Validated here and
+        // clamped again inside payInvoiceViaSpark: a zero/negative/NaN value
+        // must never become a non-terminating hot loop.
+        pollIntervalMs: (() => {
+          const raw = Number(process.env.BLINK_SPARK_POLL_INTERVAL_MS);
+          return process.env.BLINK_SPARK_POLL_INTERVAL_MS !== undefined && Number.isFinite(raw) && raw > 0 ? raw : 3000;
+        })(),
       });
     } catch (e) {
       if (e.stage === 'dispatch') {
@@ -814,15 +840,25 @@ async function main() {
     }
 
     if (paymentStatus === 'PENDING') {
-      // In flight: count it against the budget like the custodial PENDING
-      // path, then surface the failure — no preimage yet, so no token.
+      // Still in flight after the settlement poll (--wait, default 60s).
+      // Spark settlement is asynchronous; count it against the budget like
+      // the custodial PENDING path — the sats are committed. No preimage
+      // means no L402 token could be captured; say so loudly rather than
+      // pretending nothing happened (field-tested failure mode: 1 sat + fee
+      // spent, budget debited, token lost).
       if (reservationId) {
         settleSpend({ reservationId, sats: budgetSats, command: 'l402-pay', domain, label: 'the in-flight payment' });
         reservationId = null;
       } else {
         releaseSpend(reservationId);
       }
-      throw new Error(`Payment not successful: status=${paymentStatus}`);
+      const paymentId = (spark.payment && (spark.payment.id || spark.payment.paymentHash)) || null;
+      throw new Error(
+        `Payment dispatched and still PENDING after ${args.waitSeconds}s — the sats were spent but the L402 token was NOT captured.` +
+          (paymentId
+            ? ` Payment id: ${paymentId} — inspect \`spark-transactions\` (it may settle; retrying pays again).`
+            : ' Inspect `spark-transactions` before retrying — a retry pays again.'),
+      );
     }
     if (paymentStatus === 'FAILURE') {
       // The only post-dispatch status that proves nothing settled — the

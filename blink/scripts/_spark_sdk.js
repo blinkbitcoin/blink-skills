@@ -472,6 +472,45 @@ function lnurlDomainFor(network) {
 }
 
 /**
+ * Cross-check that the LNURL management service is actually reachable.
+ *
+ * getLightningAddress() reads a cache filled by the SDK's recovery-on-connect,
+ * and that recovery fails SILENTLY — observed live (2026-09-12, blink.sv):
+ * the management endpoints 404'd while a registered address existed, so
+ * getLightningAddress() returned null and callers reported `registered: false`
+ * as a verified fact (a false negative; the address really was registered and
+ * routable). This probe distinguishes "no address" from "cannot know":
+ *
+ * A null cache is only trustworthy when the service answers a benign lookup
+ * for a username that can never collide with a real claim (fresh random
+ * `zz<digits>` passes both client and server username rules). If even that
+ * throws, the service is unreachable and any "not registered" answer is
+ * unverified.
+ *
+ * Epistemic limit (deliberate): the probe proves the LNURL SERVICE is
+ * reachable — a necessary, not sufficient, condition for the SDK's
+ * identity-keyed recovery route having run. They are distinct service
+ * operations, and a deployment could serve availability checks while the
+ * recovery route is broken (the reverse of the observed outage). The
+ * definitive client-side fix is a server-side pubkey→address lookup
+ * (blink-lnurl-server#43); until then, 'verified' means "service reachable",
+ * which is the strongest claim available without it.
+ *
+ *
+ * @param {object} sdk  connected SDK instance
+ * @returns {Promise<{ healthy: boolean, error: string|null }>}
+ */
+async function probeLnLookupHealthy(sdk) {
+  const probeUsername = 'zz' + String(Math.floor(Math.random() * 1e10)).padStart(10, '0');
+  try {
+    await sdk.checkLightningAddressAvailable({ username: probeUsername });
+    return { healthy: true, error: null };
+  } catch (e) {
+    return { healthy: false, error: safeErrorDetail(e) };
+  }
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
  *
  * Setting lnurlDomain makes the SDK's automatic recover_lightning_address
@@ -819,4 +858,5 @@ module.exports = {
   normalizeTokenBalances,
   lnurlDomainFor,
   canonicalizeLnurlDomain,
+  probeLnLookupHealthy,
 };
