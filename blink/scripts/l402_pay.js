@@ -224,13 +224,20 @@ function parseArgs(argv) {
     } else if (arg === '--wait' && i + 1 < argv.length) {
       // Full-string integer validation: parseInt's prefix parsing would
       // silently accept '0.5' as 0 (disabling the settlement poll entirely),
-      // '10seconds' as 10, and '1e2' as 1.
+      // '10seconds' as 10, and '1e2' as 1. Arbitrarily long digit strings
+      // convert to Infinity (an infinite deadline), so a documented maximum
+      // of 1 hour is enforced too.
       const raw = argv[++i];
       if (!/^\d+$/.test(raw)) {
         console.error('Error: --wait must be a non-negative whole number of seconds (0 disables settlement polling)');
         process.exit(1);
       }
-      waitSeconds = Number(raw);
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n > 3600) {
+        console.error('Error: --wait must be at most 3600 seconds (1 hour)');
+        process.exit(1);
+      }
+      waitSeconds = n;
     } else if (arg === '--dry-run') {
       dryRun = true;
     } else if (arg === '--no-store') {

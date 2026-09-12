@@ -923,7 +923,7 @@ commands['l402-pay'] = {
     'max-amount': { description: 'Refuse to pay more than N sats', valueName: 'sats' },
     wait: {
       description:
-        'Spark only: seconds to poll an async (PENDING) payment for settlement before failing (0 disables; default 60)',
+        'Spark only: seconds to poll an async (PENDING) payment for settlement before failing (0 disables; default 60; max 3600)',
       valueName: 'seconds',
     },
     'dry-run': { description: 'Discover price without paying (always bypasses cache)' },

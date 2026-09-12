@@ -818,6 +818,53 @@ describe('payInvoiceViaSpark settlement poll (review round 1: deadline bounds)',
     assert.ok(getPaymentCalls >= 1, 'the stalled refresh was attempted');
   });
 
+  it('a sub-interval wait (1s with the 3000ms DEFAULT interval) refreshes IMMEDIATELY — no sleep-first burn', async () => {
+    // Review round 2 repro: sleep-first ordering consumed the whole 1s
+    // budget sleeping and performed ZERO refreshes for an already-settled
+    // payment. The first refresh must run before any sleep.
+    let calls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          calls += 1;
+          return terminalPayment('completed'); // settlement already available
+        },
+      }),
+    );
+    const started = Date.now();
+    const r = await freshLeg()('lnbc1x', { waitSeconds: 1 }); // default interval: 3000
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 'SUCCESS', 'the already-terminal state is observed on the first refresh');
+    assert.equal(r.preimage, 'f'.repeat(64));
+    assert.equal(calls, 1);
+    assert.ok(elapsed < 1500, `returns near the 1s deadline, took ${elapsed}ms`);
+  });
+
+  it('a garbage waitSeconds (Infinity) still yields a FINITE deadline and a working first refresh', async () => {
+    // The cap itself (MAX_WAIT_SECONDS) keeps Date.now()+deadline finite for
+    // Infinity/1e21 inputs; exhausting a full clamped hour is not testable in
+    // bounded time, so the observable contract here is: garbage input does
+    // not disable or break the poll — the immediate first refresh still runs
+    // and a terminal settlement is observed.
+    let calls = 0;
+    mockSparkSdk(
+      stubSdk({
+        sendResult: pendingPayment(),
+        onGetPayment() {
+          calls += 1;
+          return terminalPayment('completed');
+        },
+      }),
+    );
+    const r = await freshLeg()('lnbc1x', { waitSeconds: Infinity, pollIntervalMs: 10 });
+    assert.equal(r.status, 'SUCCESS', 'a non-finite wait still performs the immediate first refresh');
+    assert.equal(calls, 1);
+    // And the exported ceiling is a safe integer at the documented value.
+    const { MAX_WAIT_SECONDS } = require('../blink/scripts/l402_pay_spark');
+    assert.ok(Number.isSafeInteger(MAX_WAIT_SECONDS) && MAX_WAIT_SECONDS === 3600);
+  });
+
   it('a REJECTING getPayment keeps polling until the deadline, then returns PENDING', async () => {
     let getPaymentCalls = 0;
     mockSparkSdk(

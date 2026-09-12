@@ -818,6 +818,57 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     }
   });
 
+  it('rejects malformed --wait values outright (no silent prefix parsing, no infinite deadlines)', async () => {
+    for (const bad of ['0.5', '1e2', '10seconds', '-1', '+5', '999999999999999999999']) {
+      const { code, stderr } = await runCli(['l402-pay', 'https://example.com/x', '--spark', '--wait', bad]);
+      assert.notEqual(code, 0, bad);
+      // '-1' is caught earlier by the CLI's own dash-argument guard; every
+      // rejection must name --wait and happen before any network activity.
+      assert.match(stderr, /--wait/, bad);
+      assert.ok(!stderr.includes('Requesting:'), 'rejected before any network activity');
+    }
+  });
+
+  it('BLINK_SPARK_POLL_INTERVAL_MS=0 falls back to the default and still polls to settlement', async () => {
+    // Review round 1: a zero interval was a non-terminating hot loop. The
+    // caller-side validation must fall back to 3000ms — proven end-to-end by
+    // a stub payment that settles on the first refresh.
+    const server = await startServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    const { address, port } = server.address();
+    try {
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://${address}:${port}/resource`, '--spark', '--no-store'],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              SPARK_MNEMONIC: 'test seed words for the stub',
+              BREEZ_API_KEY: 'breez-test-key',
+              SPARK_STUB_STATUS: 'PENDING',
+              SPARK_STUB_SETTLE_AFTER_POLLS: '0',
+              BLINK_SPARK_POLL_INTERVAL_MS: '0',
+              SPARK_STUB_ECHO: '1',
+            },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout, stderr) => resolve({ err, stdout, stderr }),
+        );
+      });
+      assert.ok(!result.err || !result.err.killed, 'must terminate — no hot loop');
+      assert.match(result.stderr, /STUB_GETPAYMENT=spark-1/, 'the refresh ran despite the invalid interval');
+      const j = JSON.parse(result.stdout);
+      assert.equal(j.event, 'l402_paid');
+      assert.equal(j.paymentStatus, 'SUCCESS');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('a payment stuck PENDING past --wait fails loudly with the payment id (and still debits)', async () => {
     const server = await startServer();
     const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });

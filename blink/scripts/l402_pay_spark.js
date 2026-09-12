@@ -43,6 +43,15 @@ function withTimeout(promise, ms, label) {
 }
 
 /**
+ * Documented ceiling for waitSeconds (1 hour). Keeps the deadline finite
+ * (Number('9'.repeat(400)) is Infinity — an infinite deadline plus a stuck
+ * payment would poll forever) and inside the range where Node timers behave.
+ * Applied defensively here in addition to the CLI's own validation, because
+ * this function is exported and must not trust its caller.
+ */
+const MAX_WAIT_SECONDS = 3600;
+
+/**
  * Wrap a pre-dispatch rejection (connect / prepareSendPayment) in an owned
  * Error carrying the original value as `cause`. These are third-party Promise
  * boundaries: a rejection value of null/undefined (or anything non-object)
@@ -90,6 +99,9 @@ function decodePaymentResult(result) {
  * @param {string} [opts.network]  'mainnet' (default) or 'regtest'.
  * @param {number} [opts.waitSeconds]  How long to poll an in-flight (PENDING)
  *   payment for settlement before giving up. Default 60. 0 disables polling.
+ *   Clamped to [0, 3600] defensively (non-finite/negative values disable the
+ *   poll; anything above 1 hour is capped) — the exported boundary does not
+ *   trust its caller.
  *   Spark settlement is asynchronous: sendPayment routinely resolves PENDING
  *   and the preimage arrives seconds later in htlcDetails (status
  *   preimageShared). Aborting on PENDING loses the payment — observed live:
@@ -170,18 +182,29 @@ async function payInvoiceViaSpark(invoice, { network, waitSeconds = 60, pollInte
     // budget is spent — the preimage (the L402 token material) only appears
     // in htlcDetails once the HTLC reaches preimageShared.
     //
+    // Order matters: the FIRST refresh runs IMMEDIATELY (review round 2: a
+    // sleep-first loop burned a whole sub-interval wait --wait 1 with the
+    // 3000ms default consumed the entire budget sleeping and performed zero
+    // refreshes, reporting PENDING for an already-settled payment); later
+    // iterations sleep between refreshes.
+    //
     // The deadline is ABSOLUTE wall-clock (Date.now()), and every ingredient
-    // is bounded by the REMAINING time: the sleep, and each getPayment
+    // is bounded by the REMAINING time: the sleeps, and each getPayment
     // refresh (raced against the remaining budget — the SDK exposes no
     // request timeout, and an unbounded await would let one stalled refresh
     // outlive --wait indefinitely). Expiry returns the last-known PENDING
     // result so the caller's fail-closed accounting and retry warning run.
     let { payment, status, preimage } = decoded;
-    const deadlineMs = Math.max(0, Number(waitSeconds) || 0) * 1000;
+    const deadlineMs = Math.max(0, Math.min(Number(waitSeconds) || 0, MAX_WAIT_SECONDS)) * 1000;
     const deadline = Date.now() + deadlineMs;
+    let firstIteration = true;
     while (status === 'PENDING' && deadlineMs > 0 && Date.now() < deadline) {
-      const remainingBeforeSleep = deadline - Date.now();
-      await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remainingBeforeSleep)));
+      if (!firstIteration) {
+        const remainingForSleep = deadline - Date.now();
+        if (remainingForSleep <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remainingForSleep)));
+      }
+      firstIteration = false;
       const paymentId = payment && payment.id;
       if (!paymentId) break; // nothing to refresh — surface the PENDING truth
       const remaining = deadline - Date.now();
@@ -219,4 +242,4 @@ if (require.main === module) {
   process.exit(1);
 }
 
-module.exports = { payInvoiceViaSpark };
+module.exports = { payInvoiceViaSpark, MAX_WAIT_SECONDS };
