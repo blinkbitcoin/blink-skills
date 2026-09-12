@@ -39,8 +39,9 @@ balance.
 your funds; **receive works with no credentials at all** (any Blink Lightning
 address); send is signed locally with no server signer.
 **Limitations:** whoever has the seed has the funds — lose it and they're gone,
-leak it and they're stolen; BTC-only (no USD); requires Node 22+ and a native
-module build; and the extra `BREEZ_API_KEY`.
+leak it and they're stolen; funds are BTC plus BTKN tokens (USDB — send,
+receive, and sats<->token conversions; USD/Stablesats remains custodial-side);
+requires Node 22+ and a native module build; and the extra `BREEZ_API_KEY`.
 
 Both account types share the `blink.sv` Lightning-address domain — the account
 type is not encoded in the address. See
@@ -146,9 +147,11 @@ Then `export BREEZ_API_KEY="..."` alongside `SPARK_MNEMONIC`. See
 [`blink/references/non-custodial.md`](blink/references/non-custodial.md) for the
 full detail.
 
-> **Note:** Non-custodial **send** is BTC-only in this spike and cannot go
-> through the Blink API — it is signed locally with the seed. Only receive works
-> credential-free. USD/Stablesats is out of scope.
+> **Note:** Non-custodial **send** is signed locally with the seed (no Blink
+> API signer) — BTC to BOLT-11/LNURL/Spark destinations, plus BTKN token sends
+> and sats<->token conversions (`--token`, `--from-btc`, `--from-token`).
+> Receive works credential-free at any Blink Lightning address. USD
+> (Stablesats) remains custodial-side only.
 
 #### Installing the Spark dependencies
 
@@ -229,7 +232,7 @@ blink balance
 
 ### OpenClaw / Hermes Agents
 
-Published on ClawHub as [`blink-wallet@2.5.0`](https://clawhub.ai/pretyflaco/skills/blink-wallet) (the older `blink` skill is deprecated). The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
+Published on ClawHub as [`blink-wallet@2.6.0`](https://clawhub.ai/pretyflaco/skills/blink-wallet) (the older `blink` skill is deprecated). The full skill manifest and agent instructions are in [`blink/SKILL.md`](blink/SKILL.md).
 
 ### With blink-mcp
 

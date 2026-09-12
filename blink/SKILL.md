@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.5.0
+version: 2.6.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.5.0'
+    version: '2.6.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -1527,6 +1527,13 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
   "logEntries": 8
 }
 ```
+
+> **The rolling windows are absolute across sessions.** `dailySpent` counts
+> every logged spend from the last 24 hours — including those made by
+> previous CLI runs — so a freshly set tight limit can refuse a small payment
+> for reasons that look like a defect. Check `dailySpent` before setting low
+> test caps (observed live, FT4: `--daily 100` refused a 1-sat l402 payment
+> because the prior session's spends were still in-window).
 
 `effectiveRemaining` = min(hourlyRemaining, dailyRemaining) — the actual amount the agent can spend right now.
 

@@ -1643,6 +1643,9 @@ describe('_spark_sdk.lnurlDomainFor', () => {
         'under_score',
         ':8080',
         'a:b:c',
+        'host.invalid:0',
+        'host.invalid:65536',
+        'host.invalid:99999',
       ]) {
         process.env.SPARK_LNURL_DOMAIN = bad;
         assert.throws(
@@ -1664,6 +1667,8 @@ describe('_spark_sdk.lnurlDomainFor', () => {
       assert.equal(spark.lnurlDomainFor('mainnet'), 'custom.blink.example');
       process.env.SPARK_LNURL_DOMAIN = '  spark.regtest.local:8080  ';
       assert.equal(spark.lnurlDomainFor('regtest'), 'spark.regtest.local:8080');
+      process.env.SPARK_LNURL_DOMAIN = 'spark.regtest.local:65535';
+      assert.equal(spark.lnurlDomainFor('regtest'), 'spark.regtest.local:65535', '65535 is the valid upper edge');
     } finally {
       if (saved === undefined) delete process.env.SPARK_LNURL_DOMAIN;
       else process.env.SPARK_LNURL_DOMAIN = saved;

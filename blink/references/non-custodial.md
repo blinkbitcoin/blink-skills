@@ -105,10 +105,16 @@ approval step (`npm rebuild better-sqlite3`, `pnpm approve-builds` then
 `pnpm rebuild`, `yarn rebuild`). Verify a fix by opening a database, not by
 trusting a rebuild exit code — a rebuild can exit 0 without producing a binding.
 
-**Version pinning:** the SDK is pinned to `0.23.1` rather than `0.24.x`:
-`0.24.0` and `0.24.1` share a commit, carry no release notes, and GitHub still
-marks `0.23.0` latest — `0.23.1` is the announced `0.23.0` tree. Revisit the pin
-when a documented `0.24.x` release appears.
+**Version pinning:** the SDK is pinned to `0.25.0` (v2.6.0; previously
+`0.23.1` — `0.24.x` shipped npm-only with no release notes, and the pin
+deliberately skipped it). `0.25.0` is a documented GitHub release adding
+USDT/USDC receive, Orchestra cross-chain receive, unilateral-exit and
+deposit-claim fixes, and a zero-balance stable on-chain send fix. Verified
+against the full 748-test suite with zero fallout; the stdout-noise guard and
+its pinned-storage regression test carry over unchanged (the duplicate-event
+`console.debug` emission is byte-identical in `nodejs/storage`). New SDK
+capabilities (USDT/USDC receive, cross-chain) are NOT yet exposed as skill
+commands — future surface.
 
 **Invoice validation scope (receive path):** the BOLT-11 check verifies
 **structure and request-binding**, not the cryptographic signature. It confirms
@@ -275,8 +281,8 @@ and drifted from it (PR #10 review).
 
 ## Tokens (USDB / BTKN)
 
-The pinned SDK 0.23.1 already supports the full token surface (no upgrade
-needed — 0.24.x adds only deposit/proxy infra, no token APIs):
+The pinned SDK 0.25.0 supports the full token surface (0.25 adds USDT/USDC
+receive on top of the USDB/BTKN surface the skill uses):
 
 - `spark-balance` / `spark-info` surface `tokenBalances` (balances are
   precision-preserving strings; metadata flattened per entry).
