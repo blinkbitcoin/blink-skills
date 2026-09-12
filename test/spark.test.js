@@ -2206,6 +2206,35 @@ describe('suppressSdkStdoutNoise lease (overlap, passthrough, idempotence)', () 
     });
   });
 
+  it('handles a non-function console.debug (no crash, noop release)', () => {
+    const original = console.debug;
+    console.debug = undefined; // exotic environment — typeof guard must hold
+    try {
+      const release = spark.suppressSdkStdoutNoise();
+      release();
+      release(); // idempotent
+    } finally {
+      console.debug = original;
+    }
+  });
+
+  it('forwards zero-argument and non-string-first-argument debug calls', () => {
+    const original = console.debug;
+    const calls = [];
+    console.debug = (...args) => calls.push(args);
+    const release = spark.suppressSdkStdoutNoise();
+    try {
+      console.debug();
+      console.debug({ an: 'object' }, 'second');
+      console.debug(42);
+    } finally {
+      release();
+    }
+    console.debug = original;
+    assert.equal(calls.length, 3, 'all non-matching calls forwarded');
+    assert.equal(calls[1][0].an, 'object');
+  });
+
   it('does not clobber a third-party console.debug replacement at restore', () => {
     const original = console.debug;
     const release = spark.suppressSdkStdoutNoise();
@@ -2232,7 +2261,12 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
   const VALID_MNEMONIC =
     'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-  function installFakeSdk({ connectImpl, disconnectImpl = async () => {} }) {
+  function installFakeSdk({
+    connectImpl,
+    disconnectImpl = async () => {},
+    initLoggingImpl = null,
+    withInitLogging = true,
+  }) {
     const sequence = [];
     const realResolve = Module._resolveFilename;
     const realLoad = Module._load;
@@ -2243,16 +2277,20 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
     };
     Module._load = function (request, parent, isMain) {
       if (request === '@breeztech/breez-sdk-spark') {
-        return {
+        const fake = {
           defaultConfig: () => ({ apiKey: '', lnurlDomain: 'breez.tips' }),
-          async initLogging() {
-            sequence.push('initLogging');
-          },
           async connect(opts) {
             sequence.push('connect');
             return connectImpl(opts);
           },
         };
+        if (withInitLogging) {
+          fake.initLogging = async () => {
+            sequence.push('initLogging');
+            if (initLoggingImpl) return initLoggingImpl();
+          };
+        }
+        return fake;
       }
       if (request === 'better-sqlite3' || request === 'FAKE_SQLITE') {
         return function FakeDatabase() {
@@ -2268,6 +2306,26 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
         Module._load = realLoad;
       },
     };
+  }
+
+  function patchedEnv(fn) {
+    const os = require('node:os');
+    const fs = require('node:fs');
+    const pathMod2 = require('node:path');
+    const tmpHome = fs.mkdtempSync(pathMod2.join(os.tmpdir(), 'spark-guard-'));
+    const savedHome = os.homedir;
+    const savedEnv = { ...process.env };
+    os.homedir = () => tmpHome;
+    process.env.SPARK_MNEMONIC = VALID_MNEMONIC;
+    process.env.BREEZ_API_KEY = 'breez-test-key';
+    delete process.env.SPARK_LNURL_DOMAIN;
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        os.homedir = savedHome;
+        process.env = savedEnv;
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      });
   }
 
   function fakeSdkWith(disconnectImpl) {
@@ -2376,6 +2434,120 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
         os.homedir = savedHome;
         process.env = savedEnv;
         fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // ── review round 3: the lease must follow the SDK's REAL shutdown ────────
+
+  it(
+    'NEVER-SETTLING disconnect: the public timeout returns but the guard STAYS installed; release only when the real disconnect settles',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const originalDebug = console.debug;
+      let settleRealDisconnect;
+      const harness = installFakeSdk({
+        connectImpl: () =>
+          fakeSdkWith(
+            () =>
+              new Promise((resolve) => {
+                settleRealDisconnect = resolve; // never settles until we say so
+              }),
+          ),
+      });
+      try {
+        await patchedEnv(async () => {
+          const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet', disconnectTimeoutMs: 50 }));
+          assert.notEqual(console.debug, originalDebug, 'guard active while connected');
+
+          const started = Date.now();
+          await result.disconnect(); // bounded by the injectable timeout
+          const elapsed = Date.now() - started;
+          assert.ok(elapsed < 2000, `public disconnect returned promptly (${elapsed}ms)`);
+          assert.notEqual(
+            console.debug,
+            originalDebug,
+            'guard STILL installed after the caller timeout — the SDK connection is alive (round-3 defect)',
+          );
+
+          settleRealDisconnect(); // the real disconnect finally settles
+          await new Promise((resolve) => setImmediate(resolve)); // let .finally run
+          assert.equal(console.debug, originalDebug, 'released when the REAL disconnect settles');
+        });
+      } finally {
+        harness.restore();
+        assert.equal(console.debug, originalDebug, 'no wrapper leaks into the test process');
+      }
+    },
+  );
+
+  it(
+    'LATE-SETTLING disconnect: same guarantees when settlement arrives well after the timeout',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const originalDebug = console.debug;
+      let settleRealDisconnect;
+      const harness = installFakeSdk({
+        connectImpl: () =>
+          fakeSdkWith(
+            () =>
+              new Promise((resolve) => {
+                settleRealDisconnect = resolve;
+              }),
+          ),
+      });
+      try {
+        await patchedEnv(async () => {
+          const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet', disconnectTimeoutMs: 30 }));
+          await result.disconnect();
+          await new Promise((resolve) => setTimeout(resolve, 30)); // settle AFTER the timeout window
+          assert.notEqual(console.debug, originalDebug, 'guard held while the real disconnect is still pending');
+          settleRealDisconnect();
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(console.debug, originalDebug);
+        });
+      } finally {
+        harness.restore();
+        assert.equal(console.debug, originalDebug);
+      }
+    },
+  );
+
+  it(
+    'connect proceeds when the SDK has NO initLogging and when initLogging rejects',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      // No initLogging at all — older SDK builds.
+      let harness = installFakeSdk({ connectImpl: () => fakeSdkWith(async () => {}), withInitLogging: false });
+      try {
+        await patchedEnv(async () => {
+          const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet' }));
+          await result.disconnect();
+        });
+        assert.deepEqual(harness.sequence, ['connect'], 'no logger call attempted, connect unaffected');
+      } finally {
+        harness.restore();
+      }
+
+      // initLogging rejects — swallowed, connect proceeds.
+      harness = installFakeSdk({
+        connectImpl: () => fakeSdkWith(async () => {}),
+        initLoggingImpl: () => {
+          throw new Error('initLogging exploded');
+        },
+      });
+      try {
+        await patchedEnv(async () => {
+          const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet' }));
+          assert.deepEqual(
+            harness.sequence,
+            ['initLogging', 'connect'],
+            'a rejected initLogging does not block connect',
+          );
+          await result.disconnect();
+        });
+      } finally {
+        harness.restore();
       }
     },
   );

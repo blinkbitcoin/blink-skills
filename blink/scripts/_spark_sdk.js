@@ -603,9 +603,13 @@ function suppressSdkStdoutNoise() {
  *
  * @param {object} [opts]
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
+ * @param {number} [opts.disconnectTimeoutMs]  How long the returned
+ *   disconnect() waits for the SDK before returning (default 5000). The
+ *   stdout-noise lease is NOT bound to this timeout — it releases only when
+ *   the SDK's real disconnect settles. Injectable for tests.
  * @returns {Promise<{ sdk: object, disconnect: () => Promise<void> }>}
  */
-async function connect({ network = DEFAULT_NETWORK } = {}) {
+async function connect({ network = DEFAULT_NETWORK, disconnectTimeoutMs = 5000 } = {}) {
   requireNode22();
   const mod = loadSdkModule();
   const mnemonic = getMnemonic();
@@ -640,18 +644,31 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
     throw err;
   }
 
+  // The lease is owned by the SDK's ACTUAL shutdown, not by the caller's
+  // wait (review round 3, PR #16): on a hung sdk.disconnect(), the old code
+  // released the noise guard when the 5s race timed out — while the SDK's
+  // still-pending storage/event workers could emit "Skipping redundant
+  // payment event" to stdout after the command's JSON. The real disconnect
+  // is memoized ONCE, kept non-rejecting, and releases the lease only when
+  // IT settles; the public disconnect() merely bounds how long the CALLER
+  // waits. disconnectTimeoutMs is injectable so tests can exercise the
+  // timeout path without a real 5-second stall.
+  let rawDisconnect = null;
+  const startDisconnect = () => {
+    if (!rawDisconnect) {
+      rawDisconnect = Promise.resolve()
+        .then(() => sdk.disconnect())
+        .catch(() => {}) // non-rejecting by contract — callers rely on this
+        .finally(restoreQuiet); // the lease follows the REAL settlement
+    }
+    return rawDisconnect;
+  };
   const disconnect = async () => {
     // Bounded AND non-rejecting by contract: the SDK's disconnect can hang or
     // reject; cleanup must never block the caller or mask a payment outcome.
     // Callers that inject alternate connectors (tests) still guard at their
     // own layer — see the comments in spark_send.js and l402_pay_spark.js.
-    try {
-      await Promise.race([sdk.disconnect(), new Promise((resolve) => setTimeout(resolve, 5000))]);
-    } catch {
-      // best-effort
-    } finally {
-      restoreQuiet();
-    }
+    await Promise.race([startDisconnect(), new Promise((resolve) => setTimeout(resolve, disconnectTimeoutMs))]);
   };
 
   return { sdk, disconnect };
