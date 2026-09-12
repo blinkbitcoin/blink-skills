@@ -449,6 +449,10 @@ function canonicalizeLnurlDomain(raw) {
     host = portMatch[1];
     port = portMatch[2];
     if (!host) throw domainError('missing hostname before the port');
+    // TCP ports are 1-65535 — the regex alone would let :0, :65536 and :99999
+    // through (review round 1 nit, PR #13; hardened here in v2.6.0).
+    const portNum = Number(port);
+    if (portNum < 1 || portNum > 65535) throw domainError('port must be 1-65535');
   }
   // Exactly one trailing root dot is the canonical FQDN form — strip it.
   if (host.endsWith('.')) host = host.slice(0, -1);

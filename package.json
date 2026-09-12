@@ -1,6 +1,6 @@
 {
   "name": "blink-claw-skill",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "private": true,
   "description": "Bitcoin Lightning wallet CLI for OpenClaw agents via the Blink API",
   "license": "MIT",
@@ -24,7 +24,7 @@
     "prettier": "^3.0.0"
   },
   "optionalDependencies": {
-    "@breeztech/breez-sdk-spark": "0.23.1",
+    "@breeztech/breez-sdk-spark": "0.25.0",
     "bip39": "^3.1.0"
   }
 }
