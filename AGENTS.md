@@ -36,12 +36,17 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
    ```bash
    clawhub skill publish blink --slug blink-wallet --owner pretyflaco \
      --version X.Y.Z --tags latest --changelog "…" \
-     --topics "openclaw,agents,bitcoin,lightning-network,spark,cli" \
+     --topics "agents,bitcoin,lightning-network,spark,cli" \
      --source-repo blinkbitcoin/blink-skills --source-ref vX.Y.Z \
      --source-commit <merge-sha> --source-path blink --json
    ```
    Dry-run first (`--dry-run --json`). CLI is installed at the nvm node-20 bin; auth persists (`clawhub whoami` → pretyflaco).
-6. **Verify the registry**: `https://clawhub.ai/api/v1/skills/blink-wallet?ownerHandle=pretyflaco` must report the new `version`, and `clawhub inspect blink-wallet@X.Y.Z` must match the tree. The README's `blink-wallet@X.Y.Z` claim is only true after this step — skipping it recreates the PR #17 review finding.
+   ClawHub gotchas (learned publishing 2.6.0):
+   - The topic `openclaw` is **reserved** by ClawHub — using it fails the publish (and rate-limits validation ~50s).
+   - Publish returns `pending-publication`: the version goes through ClawHub's security scan before the registry serves it. `clawhub skill verify` fails while the current published version is not scan-clean.
+   - This skill inherently trips two scan heuristics: `suspicious.env_credential_access` (reads `BLINK_API_KEY` + network send — the skill IS an API client) and `suspicious.insecure_tls_verification` (the `--no-verify` flag whose DEFAULT is verify-on). Both are by-design; do NOT contort the code to satisfy the scanner.
+   - Retrieve evidence: `clawhub scan download blink-wallet --version X.Y.Z` (writes a ZIP to cwd — delete it, don't commit).
+6. **Verify the registry**: `https://clawhub.ai/api/v1/skills/blink-wallet?ownerHandle=pretyflaco` must report the new `version`, and `clawhub inspect blink-wallet@X.Y.Z` must resolve. The README's `blink-wallet@X.Y.Z` claim is only true after this step — skipping it recreates the PR #17 review finding. If the scan leaves the version pending (suspicious heuristics), the claim stays false until moderation clears — surface this to the user immediately rather than waiting.
 
 ## Multi-model review loop
 
