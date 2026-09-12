@@ -533,6 +533,66 @@ async function probeLnLookupHealthy(sdk) {
 }
 
 /**
+ * SDK stdout-noise suppression — a reference-counted lease around a single
+ * process-global filtering wrapper (review round 2, PR #16: per-connection
+ * save/restore corrupted overlapping lifecycles — closing connection A
+ * restored the original console.debug while B still needed suppression, and
+ * closing B then restored A's noop, leaving debug permanently muted).
+ *
+ * What is suppressed and why: the pinned SDK's Node storage emits
+ * "Skipping redundant payment event: …" DIRECTLY via console.debug
+ * (nodejs/storage/index.cjs:362-364 — same in the mysql/postgres storage
+ * variants) whenever a duplicate payment update is applied, i.e. whenever
+ * cached events replay after recent payment activity (observed live in
+ * field tests 2/3: spark_balance and spark_send emitted SDK lines into
+ * stdout, breaking the all-JSON contract). console.debug is an alias of
+ * console.log in Node — stdout. The message does not flow through the
+ * Rust/WASM logger that initLogging configures.
+ *
+ * Lease semantics: the FIRST active connection installs ONE wrapper that
+ * forwards unrelated console.debug calls untouched and drops only the known
+ * noise prefix; the LAST lease to close restores the original — and only if
+ * console.debug is still our wrapper, so a third-party replacement that
+ * appeared meanwhile is never clobbered. Releases are idempotent (duplicate
+ * disconnect is a no-op), so overlapping connections in any close order keep
+ * stdout protected exactly while at least one is active.
+ *
+ * @returns {() => void} release function — call when the connection ends
+ *   (or fails to open); safe to call more than once.
+ */
+const SDK_STDOUT_NOISE_PREFIX = 'Skipping redundant payment event';
+let stdoutNoiseLease = null; // { count, savedDebug, wrapper } | null
+
+function suppressSdkStdoutNoise() {
+  if (typeof console.debug !== 'function') return () => {};
+  if (!stdoutNoiseLease) {
+    const savedDebug = console.debug;
+    const wrapper = (...args) => {
+      const first = args.length > 0 ? String(args[0]) : '';
+      if (first.startsWith(SDK_STDOUT_NOISE_PREFIX)) return; // known SDK noise
+      return savedDebug.apply(console, args); // everything else flows through
+    };
+    console.debug = wrapper;
+    stdoutNoiseLease = { count: 0, savedDebug, wrapper };
+  }
+  stdoutNoiseLease.count += 1;
+  let released = false;
+  return () => {
+    if (released || !stdoutNoiseLease) return; // idempotent / already drained
+    released = true;
+    stdoutNoiseLease.count -= 1;
+    if (stdoutNoiseLease.count === 0) {
+      // Restore only OUR wrapper — if a third party replaced console.debug
+      // while we were active, theirs stays (ours comes off with it anyway).
+      if (console.debug === stdoutNoiseLease.wrapper) {
+        console.debug = stdoutNoiseLease.savedDebug;
+      }
+      stdoutNoiseLease = null;
+    }
+  };
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
  *
  * Setting lnurlDomain makes the SDK's automatic recover_lightning_address
@@ -545,36 +605,6 @@ async function probeLnLookupHealthy(sdk) {
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
  * @returns {Promise<{ sdk: object, disconnect: () => Promise<void> }>}
  */
-/**
- * Muzzle the SDK's runtime STDOUT noise for the duration of a connection.
- *
- * The pinned SDK's Node storage emits "Skipping redundant payment event: …"
- * DIRECTLY via console.debug (nodejs/storage/index.cjs:362-364 — same in the
- * mysql/postgres storage variants) whenever a duplicate payment update is
- * applied, i.e. whenever cached events replay after recent payment activity
- * (observed live in field tests 2/3: spark_balance and spark_send emitted
- * SDK lines into stdout, breaking the all-JSON contract). console.debug is
- * an alias of console.log in Node — stdout. This does NOT flow through the
- * Rust/WASM logger that initLogging configures, so the noop logger alone
- * cannot suppress it (review round 1, PR #16 — confirmed against the
- * pinned source and by a storage-level reproduction).
- *
- * Only console.debug is muzzled: our own output and the SDK's informational
- * require-time line use console.log/warn/error, and the require-time noise
- * is already covered by the muzzle in loadSdkModule.
- *
- * @returns {() => void} restore function — call exactly once when the
- *   connection ends (or fails to open).
- */
-function suppressSdkStdoutNoise() {
-  if (typeof console.debug !== 'function') return () => {};
-  const saved = console.debug;
-  console.debug = () => {};
-  return () => {
-    console.debug = saved;
-  };
-}
-
 async function connect({ network = DEFAULT_NETWORK } = {}) {
   requireNode22();
   const mod = loadSdkModule();

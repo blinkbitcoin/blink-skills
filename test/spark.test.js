@@ -2101,6 +2101,22 @@ describe('suppressSdkStdoutNoise (pinned Node storage, review round 1)', () => {
 
         // And the guard restores the original console.debug afterwards.
         assert.equal(typeof console.debug, 'function');
+
+        // Overlap (review round 2's probe, pinned to the real emission
+        // path): two concurrent leases around a duplicate update — closing
+        // the FIRST lease must not reopen the leak while the second lives.
+        const originalDebug = console.debug;
+        const releaseA = spark.suppressSdkStdoutNoise();
+        const releaseB = spark.suppressSdkStdoutNoise();
+        const whileBothActive = await captureStdout(() => storage.applyPaymentUpdate(payment));
+        releaseA(); // close order: A first, B still active
+        const whileBActive = await captureStdout(() => storage.applyPaymentUpdate(payment));
+        releaseB();
+        const afterBoth = await captureStdout(() => storage.applyPaymentUpdate(payment));
+        assert.equal(whileBothActive, '', 'suppressed while both leases are active');
+        assert.equal(whileBActive, '', 'still suppressed after the FIRST lease closes (round-2 defect)');
+        assert.equal(console.debug, originalDebug, 'original restored after the LAST lease closes');
+        assert.ok(afterBoth.includes('Skipping redundant payment event'), 'unguarded again once all leases closed');
       } finally {
         try {
           storage.close();
@@ -2108,6 +2124,258 @@ describe('suppressSdkStdoutNoise (pinned Node storage, review round 1)', () => {
           // best-effort cleanup
         }
         fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+// ── suppressSdkStdoutNoise lease semantics (review round 2) ──────────────────
+// Overlapping connections corrupted the old save/restore guard: closing A
+// first restored the original while B was still active (leak window), and
+// closing B then restored A's noop (debug permanently muted). The lease
+// keeps ONE filtering wrapper until the LAST connection closes, forwards
+// unrelated debug calls, and never clobbers a third-party replacement.
+
+describe('suppressSdkStdoutNoise lease (overlap, passthrough, idempotence)', () => {
+  function withCapturedDebug(fn) {
+    const calls = [];
+    const original = console.debug;
+    console.debug = (...args) => calls.push(args.map(String).join(' '));
+    try {
+      return fn(calls);
+    } finally {
+      console.debug = original;
+    }
+  }
+
+  it('suppresses the SDK noise prefix and FORWARDS unrelated debug output', () => {
+    withCapturedDebug((calls) => {
+      const release = spark.suppressSdkStdoutNoise();
+      try {
+        console.debug('Skipping redundant payment event: id=x status=completed');
+        console.debug('some unrelated diagnostic');
+      } finally {
+        release();
+      }
+      assert.deepEqual(calls, ['some unrelated diagnostic'], 'only the known noise prefix is dropped');
+    });
+  });
+
+  it('close order A-then-B: protected while B lives, restored exactly at the end', () => {
+    withCapturedDebug((calls) => {
+      const originalSpy = console.debug;
+      const releaseA = spark.suppressSdkStdoutNoise();
+      const releaseB = spark.suppressSdkStdoutNoise();
+      console.debug('Skipping redundant payment event: id=a status=pending');
+      assert.equal(calls.length, 0, 'suppressed while both leases active');
+
+      releaseA(); // A closes first — B still active
+      console.debug('Skipping redundant payment event: id=b status=completed');
+      assert.equal(calls.length, 0, 'still suppressed while B is active (the round-2 defect)');
+
+      releaseB(); // last lease closes
+      assert.equal(console.debug, originalSpy, 'the ORIGINAL debug returns exactly once');
+      console.debug('Skipping redundant payment event: id=c status=completed');
+      assert.equal(calls.length, 1, 'after all leases close, output flows again (no permanent mute)');
+    });
+  });
+
+  it('close order B-then-A: same guarantees', () => {
+    withCapturedDebug((calls) => {
+      const originalSpy = console.debug;
+      const releaseA = spark.suppressSdkStdoutNoise();
+      const releaseB = spark.suppressSdkStdoutNoise();
+      releaseB();
+      console.debug('Skipping redundant payment event: id=x status=completed');
+      assert.equal(calls.length, 0, 'still suppressed while A is active');
+
+      releaseA();
+      assert.equal(console.debug, originalSpy);
+    });
+  });
+
+  it('duplicate release is a no-op and cannot drain another lease', () => {
+    withCapturedDebug((calls) => {
+      const releaseA = spark.suppressSdkStdoutNoise();
+      const releaseB = spark.suppressSdkStdoutNoise();
+      releaseA();
+      releaseA(); // duplicate — must not decrement B's lease
+      console.debug('Skipping redundant payment event: id=x status=completed');
+      assert.equal(calls.length, 0, 'B still protected after A double-releases');
+      releaseB();
+    });
+  });
+
+  it('does not clobber a third-party console.debug replacement at restore', () => {
+    const original = console.debug;
+    const release = spark.suppressSdkStdoutNoise();
+    const thirdParty = () => {};
+    console.debug = thirdParty; // replaced while the guard was active
+    release();
+    assert.equal(console.debug, thirdParty, 'the third-party replacement stays — ours is not restored over it');
+    console.debug = original; // clean up for subsequent tests
+  });
+});
+
+// ── connect() guard lifecycle (review round 2 coverage gap) ─────────────────
+// The storage test exercises the lease directly; these pin the CONNECTOR
+// wiring: initLogging is awaited BEFORE mod.connect, the guard survives a
+// successful connection until disconnect, and it is restored on connect
+// rejection, on disconnect rejection/timeout, and across repeated
+// disconnects.
+
+describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const pathMod = require('node:path');
+  const Module = require('node:module');
+  const VALID_MNEMONIC =
+    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+  function installFakeSdk({ connectImpl, disconnectImpl = async () => {} }) {
+    const sequence = [];
+    const realResolve = Module._resolveFilename;
+    const realLoad = Module._load;
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === '@breeztech/breez-sdk-spark') return 'FAKE_SPARK_PACKAGE';
+      if (request === 'better-sqlite3') return 'FAKE_SQLITE';
+      return realResolve.call(this, request, ...rest);
+    };
+    Module._load = function (request, parent, isMain) {
+      if (request === '@breeztech/breez-sdk-spark') {
+        return {
+          defaultConfig: () => ({ apiKey: '', lnurlDomain: 'breez.tips' }),
+          async initLogging() {
+            sequence.push('initLogging');
+          },
+          async connect(opts) {
+            sequence.push('connect');
+            return connectImpl(opts);
+          },
+        };
+      }
+      if (request === 'better-sqlite3' || request === 'FAKE_SQLITE') {
+        return function FakeDatabase() {
+          return { prepare: () => ({ get: () => ({ ok: 1 }) }), close: () => {} };
+        };
+      }
+      return realLoad.call(this, request, parent, isMain);
+    };
+    return {
+      sequence,
+      restore() {
+        Module._resolveFilename = realResolve;
+        Module._load = realLoad;
+      },
+    };
+  }
+
+  function fakeSdkWith(disconnectImpl) {
+    return {
+      disconnect: disconnectImpl,
+      getInfo: async () => ({ balanceSats: 1n }),
+    };
+  }
+
+  async function withFreshSdk(fn) {
+    const sdkPath = require.resolve('../blink/scripts/_spark_sdk');
+    delete require.cache[sdkPath];
+    const fresh = require(sdkPath);
+    try {
+      return await fn(fresh);
+    } finally {
+      delete require.cache[sdkPath];
+    }
+  }
+
+  it(
+    'initLogging is awaited BEFORE connect; guard held until disconnect and restored exactly once',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
+      const savedHome = os.homedir;
+      const savedEnv = { ...process.env };
+      os.homedir = () => tmpHome;
+      process.env.SPARK_MNEMONIC = VALID_MNEMONIC;
+      process.env.BREEZ_API_KEY = 'breez-test-key';
+      delete process.env.SPARK_LNURL_DOMAIN;
+      const originalDebug = console.debug;
+      const harness = installFakeSdk({ connectImpl: () => fakeSdkWith(async () => {}) });
+      try {
+        const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet' }));
+        assert.deepEqual(
+          harness.sequence,
+          ['initLogging', 'connect'],
+          'logger initialized (awaited) BEFORE connecting',
+        );
+        assert.notEqual(console.debug, originalDebug, 'guard active (filtering wrapper installed) while connected');
+        await result.disconnect();
+        assert.equal(console.debug, originalDebug, 'restored after disconnect');
+        await result.disconnect(); // repeated disconnect: idempotent release
+        assert.equal(console.debug, originalDebug);
+      } finally {
+        harness.restore();
+        os.homedir = savedHome;
+        process.env = savedEnv;
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'guard restored when mod.connect() rejects',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
+      const savedHome = os.homedir;
+      const savedEnv = { ...process.env };
+      os.homedir = () => tmpHome;
+      process.env.SPARK_MNEMONIC = VALID_MNEMONIC;
+      process.env.BREEZ_API_KEY = 'breez-test-key';
+      const originalDebug = console.debug;
+      const harness = installFakeSdk({
+        connectImpl: () => {
+          throw new Error('connect exploded');
+        },
+      });
+      try {
+        await assert.rejects(() => withFreshSdk((fresh) => fresh.connect({ network: 'mainnet' })), /connect exploded/);
+        assert.equal(console.debug, originalDebug, 'guard restored after a failed connect');
+      } finally {
+        harness.restore();
+        os.homedir = savedHome;
+        process.env = savedEnv;
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'guard restored when the SDK disconnect() rejects (cleanup finally)',
+    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
+    async () => {
+      const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
+      const savedHome = os.homedir;
+      const savedEnv = { ...process.env };
+      os.homedir = () => tmpHome;
+      process.env.SPARK_MNEMONIC = VALID_MNEMONIC;
+      process.env.BREEZ_API_KEY = 'breez-test-key';
+      const originalDebug = console.debug;
+      const harness = installFakeSdk({
+        connectImpl: () =>
+          fakeSdkWith(async () => {
+            throw new Error('disconnect rejected');
+          }),
+      });
+      try {
+        const result = await withFreshSdk((fresh) => fresh.connect({ network: 'mainnet' }));
+        await result.disconnect(); // non-rejecting by contract; finally restores
+        assert.equal(console.debug, originalDebug, 'restored even when the SDK disconnect rejects');
+      } finally {
+        harness.restore();
+        os.homedir = savedHome;
+        process.env = savedEnv;
+        fs.rmSync(tmpHome, { recursive: true, force: true });
       }
     },
   );
