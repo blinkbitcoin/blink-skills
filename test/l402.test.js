@@ -2510,6 +2510,7 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
           Cookie: 'session=1',
           'Proxy-Authorization': 'Basic x',
           'X-Custom': 'keep',
+          'Content-Type': 'application/json',
         },
         retries: 0,
         what: 'cred probe',
@@ -2518,6 +2519,11 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
       assert.equal(seen[0].headers.Authorization, 'L402 mac:pre', 'first hop carries the credential');
       const second = seen[1].headers;
       assert.equal(second.Authorization, undefined, 'Authorization stripped cross-origin (round-1 HIGH defect)');
+      assert.equal(
+        second['Content-Type'],
+        undefined,
+        'body headers dropped with the body on the POST->GET rewrite (round-2 LOW)',
+      );
       assert.equal(second.Cookie, undefined, 'Cookie stripped');
       assert.equal(second['Proxy-Authorization'], undefined, 'Proxy-Authorization stripped');
       assert.equal(second['X-Custom'], 'keep', 'non-credential headers forwarded');
@@ -2579,11 +2585,11 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
-  it('303 rewrites ANY method to GET (body dropped)', async () => {
+  it('303 rewrites any NON-GET/HEAD method to GET (body + body headers dropped)', async () => {
     const seen = [];
     const origFetch = global.fetch;
     global.fetch = async (url, opts) => {
-      seen.push({ method: opts.method, body: opts.body });
+      seen.push({ method: opts.method, body: opts.body, headers: { ...opts.headers } });
       if (seen.length === 1) {
         return { status: 303, headers: { get: (n) => (n === 'location' ? '/next' : null) } };
       }
@@ -2593,11 +2599,39 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
       await fetchWithRetry('https://first.example/start', {
         method: 'DELETE',
         body: 'x',
+        headers: { 'Content-Type': 'application/json' },
         retries: 0,
         what: '303 probe',
       });
       assert.equal(seen[1].method, 'GET', '303 forces GET even for DELETE');
       assert.equal(seen[1].body, undefined);
+      assert.equal(
+        seen[1].headers['Content-Type'],
+        undefined,
+        'native Fetch drops body-associated headers with the body',
+      );
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('303 PRESERVES HEAD (the production resolveCanonicalUrl path) — review round 2', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ method: opts.method });
+      if (seen.length === 1) {
+        return { status: 303, headers: { get: (n) => (n === 'location' ? '/canonical-target' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, url: 'https://first.example/canonical-target' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'HEAD',
+        retries: 0,
+        what: 'HEAD 303 probe',
+      });
+      assert.equal(seen[1].method, 'HEAD', 'WHATWG: HEAD is preserved across 303 — never rewritten to GET');
     } finally {
       global.fetch = origFetch;
     }

@@ -272,8 +272,12 @@ async function fetchWithRetry(
   //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
   //   - 307/308: method and body are preserved.
   const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
+  // Headers that describe the request BODY — native Fetch removes them when a
+  // redirect rewrite drops the body (a redirected GET must not advertise a
+  // Content-Type for a body it no longer carries).
+  const BODY_HEADERS = new Set(['content-type', 'content-length', 'transfer-encoding']);
   let reqHeaders = { ...headers };
-  let reqMethod = method;
+  let reqMethod = String(method || 'GET').toUpperCase();
   let reqBody = body;
   let current = assertAllowedUrl(url, allowedHosts, what, { portsUnrestricted, strictLocal });
 
@@ -347,10 +351,21 @@ async function fetchWithRetry(
         Object.entries(reqHeaders).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
       );
     }
-    // WHATWG Fetch method semantics on redirect.
-    if (res.status === 303 || ((res.status === 301 || res.status === 302) && reqMethod === 'POST')) {
+    // WHATWG Fetch method semantics on redirect (review round 2): a 303
+    // rewrites to GET only when the method is NEITHER GET NOR HEAD (HEAD is
+    // preserved across 303 — the production resolveCanonicalUrl HEAD probes
+    // depend on this); 301/302 rewrite POST to GET; 307/308 preserve method
+    // and body. Whenever a rewrite drops the body, its body-associated
+    // headers are dropped with it, mirroring native Fetch.
+    const rewriteToGet =
+      (res.status === 303 && reqMethod !== 'GET' && reqMethod !== 'HEAD') ||
+      ((res.status === 301 || res.status === 302) && reqMethod === 'POST');
+    if (rewriteToGet) {
       reqMethod = 'GET';
       reqBody = undefined;
+      reqHeaders = Object.fromEntries(
+        Object.entries(reqHeaders).filter(([k]) => !BODY_HEADERS.has(String(k).toLowerCase())),
+      );
     }
     current = assertAllowedUrl(nextUrl.toString(), allowedHosts, `${what} redirect target`, {
       portsUnrestricted,
