@@ -93,16 +93,28 @@ function isPrivateAddress(hostname) {
  * @param {string} [what]  Label for the error message, e.g. "callback URL".
  * @returns {URL}
  */
-function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL') {
+/**
+ * Construct a URL-policy refusal. Tagged with code URL_POLICY so callers can
+ * distinguish a deterministic security decision (abort the whole flow — the
+ * target is hostile or out of policy) from a transient network failure
+ * (graceful fallback is fine).
+ */
+function policyError(message) {
+  const err = new Error(message);
+  err.code = 'URL_POLICY';
+  return err;
+}
+
+function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   let url;
   try {
     url = new URL(String(rawUrl));
   } catch {
-    throw new Error(`Refusing to fetch an unparseable ${what}: ${rawUrl}`);
+    throw policyError(`Refusing to fetch an unparseable ${what}: ${rawUrl}`);
   }
 
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
+    throw policyError(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
   }
 
   const host = url.hostname.toLowerCase();
@@ -118,26 +130,37 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL') {
   const explicitlyAllowed = allowed ? allowed.has(host) : false;
 
   if (allowed && !explicitlyAllowed) {
-    throw new Error(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
+    throw policyError(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
   }
 
   // Plaintext is tolerable only for a local host the caller deliberately
   // permitted (regtest / dev), never for one merely reached via a redirect.
   if (url.protocol === 'http:' && !(isLocal && (explicitlyAllowed || !allowed))) {
-    throw new Error(`Refusing to fetch ${what} over plaintext http from '${host}'; https is required.`);
+    throw policyError(`Refusing to fetch ${what} over plaintext http from '${host}'; https is required.`);
   }
 
   // Applies even with the allowlist disabled: opting out of the host allowlist
-  // is not opting in to internal network access.
+  // is not opting in to internal network access. Private IP LITERALS are
+  // always refused. Local NAMES (localhost et al.) are additionally refused by
+  // callers that pass strictLocal (the L402 flows: with no allowlist
+  // configured, 'http://localhost:6379/' must not sail through on a hostname
+  // technicality) — the LNURL flows keep their documented opt-out behavior of
+  // permitting plaintext localhost for regtest/dev when no allowlist is set.
   if (isPrivateAddress(host) && !explicitlyAllowed) {
-    throw new Error(`Refusing to fetch ${what} from private address '${host}'.`);
+    throw policyError(`Refusing to fetch ${what} from private address '${host}'.`);
+  }
+  if (opts.strictLocal && LOCAL_HOSTS.has(host) && !explicitlyAllowed) {
+    throw policyError(`Refusing to fetch ${what} from local host '${host}' (not allowlisted).`);
   }
 
   // A non-standard port on an allowed host is still a different service. The
   // allowlist names hosts, so anything but the default port is refused unless
-  // the caller listed `host:port` explicitly.
-  if (allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
-    throw new Error(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
+  // the caller listed `host:port` explicitly. L402 callers opt out
+  // (portsUnrestricted): L402 services routinely live on arbitrary ports, and
+  // the L402 allowlist is a PAYMENT policy list, not a network-access list —
+  // private-address and redirect re-validation still apply regardless.
+  if (!opts.portsUnrestricted && allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
+    throw policyError(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
   }
 
   return url;
@@ -228,11 +251,15 @@ async function fetchWithRetry(
     allowedHosts = null,
     what = 'URL',
     retryOn404 = false,
+    method = 'GET',
+    body = undefined,
+    portsUnrestricted = false,
+    strictLocal = false,
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
   // faults, so they must escape the retry loop instead of being swallowed.
-  let current = assertAllowedUrl(url, allowedHosts, what);
+  let current = assertAllowedUrl(url, allowedHosts, what, { portsUnrestricted, strictLocal });
 
   // One budget for the whole logical request. `timeoutMs` alone is per-attempt
   // and `retries` resets on every redirect, so without this a slow but
@@ -253,6 +280,8 @@ async function fetchWithRetry(
       const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
       try {
         res = await fetch(current.toString(), {
+          method,
+          body,
           signal: controller.signal,
           redirect: 'manual',
           headers: { Accept: 'application/json', Connection: 'close', ...headers },
@@ -283,7 +312,7 @@ async function fetchWithRetry(
 
     if (!res) {
       throw new Error(
-        `LNURL request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
+        `${what} request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
       );
     }
 
@@ -295,7 +324,7 @@ async function fetchWithRetry(
     }
     // Resolve relative Location headers against the current hop, then re-check.
     const next = new URL(res.headers.get('location'), current).toString();
-    current = assertAllowedUrl(next, allowedHosts, `${what} redirect target`);
+    current = assertAllowedUrl(next, allowedHosts, `${what} redirect target`, { portsUnrestricted, strictLocal });
   }
 }
 

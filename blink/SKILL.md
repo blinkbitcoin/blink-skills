@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.6.0
+version: 2.6.1
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.6.0'
+    version: '2.6.1'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -111,6 +111,8 @@ To use the Blink staging environment (signet) instead of real money:
 
 ```bash
 export BLINK_API_URL="https://api.staging.blink.sv/graphql"
+
+Overrides must be `https://`/`wss://` (plaintext only for literal `localhost`/`127.0.0.1` — regtest/dev), and hosts outside `*.blink.sv` additionally require `BLINK_ALLOW_CUSTOM_AUTH_HOST=1` so the API key cannot be silently pointed at an arbitrary host (v2.6.1). The http→ws auto-downgrade was removed: https API hosts derive wss sockets.
 ```
 
 Create a staging API key at [dashboard.staging.blink.sv](https://dashboard.staging.blink.sv). The staging environment uses signet bitcoin (no real value) — perfect for testing payment flows safely.
@@ -406,10 +408,11 @@ Output JSON includes:
 blink transactions [--first N] [--after CURSOR] [--wallet BTC|USD]
 ```
 
-Lists recent transactions (incoming and outgoing) with pagination. Returns direction, amount, status, type (lightning/onchain/intraledger), and metadata.
+Lists recent transactions (incoming and outgoing) with pagination. Returns direction, amount, status, type (lightning/onchain/intraledger), and metadata. Settlement **preimages are suppressed by default** — they are reusable L402 bearer credentials (a field-test cross-reference recovered 3 of 4 cached L402 tokens verbatim from this listing); pass `--include-preimage` only for deliberate proof-of-payment export. `paymentHash`, the non-secret correlator, is always present.
 
 - `--first N` — number of transactions to return (default: 20, max: 100)
 - `--after CURSOR` — pagination cursor from previous response's `endCursor`
+- `--include-preimage` — include settlement preimages in the output (deliberate proof-of-payment export; suppressed by default)
 - `--wallet BTC|USD` — filter to a specific wallet currency
 
 ### Get BTC/USD Price
@@ -1487,6 +1490,8 @@ Env vars take precedence over the config file (`~/.blink/budget.json`):
 
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:
+
+> **Security (v2.6.1):** the allowlist now gates **every non-dry-run `l402-pay` outbound request** (pre-flight, before canonicalization/probing), not only the payment itself — when an allowlist is configured, a URL outside it is refused before a single byte leaves the machine. All L402 fetches (`l402-pay`, `l402-discover`, and the server-supplied l402-protocol `payment_request_url`) route through the shared SSRF guard: private/loopback/link-local/metadata targets refused (incl. IPv4-mapped IPv6), redirects followed manually and re-validated per hop. `l402-discover` remains the ungated-but-guarded public prober; `l402-pay --dry-run` likewise. State files under `~/.blink` are `0700`/`0600` with atomic writes and symlink refusal (macaroons + preimages are a reusable bearer credential pair).
 
 - **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`,
   `spark-send`. You chose the recipient and amount, so these run with or

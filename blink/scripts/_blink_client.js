@@ -38,11 +38,53 @@ function getApiKey({ required = true } = {}) {
 }
 
 /**
+ * Validate a user-supplied API/WS endpoint override (security-audit fix).
+ *
+ * A poisoned BLINK_API_URL would send the X-API-KEY to an arbitrary host, so
+ * overrides must be https/wss (plaintext tolerated only for literal local
+ * hosts — regtest/dev), and hosts outside the Blink family require the
+ * explicit BLINK_ALLOW_CUSTOM_AUTH_HOST=1 opt-in. This is defence-in-depth —
+ * controlling the environment already implies far worse — but the key must
+ * not leak through an unvalidated URL by accident.
+ *
+ * @param {string} rawUrl   the env-supplied URL
+ * @param {string} secureScheme   'https:' or 'wss:'
+ * @param {string} insecureScheme 'http:'  or 'ws:'
+ * @param {string} what     label for error messages
+ * @returns {string} the validated URL
+ */
+function validateAuthEndpoint(rawUrl, secureScheme, insecureScheme, what) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error(`${what} is not a parseable URL: ${rawUrl}`);
+  }
+  const host = url.hostname.toLowerCase();
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+  const isBlinkHost = host === 'blink.sv' || host.endsWith('.blink.sv');
+  if (url.protocol !== secureScheme && !(url.protocol === insecureScheme && isLocal)) {
+    throw new Error(
+      `${what} must use ${secureScheme.slice(0, -1)} (plaintext ${insecureScheme.slice(0, -1)} is only allowed for localhost): ${rawUrl}`,
+    );
+  }
+  if (!isBlinkHost && !isLocal && process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST !== '1') {
+    throw new Error(
+      `${what} host '${host}' is outside the Blink family. Set BLINK_ALLOW_CUSTOM_AUTH_HOST=1 to explicitly trust it with your API key.`,
+    );
+  }
+  return url.toString();
+}
+
+/**
  * Resolve the Blink GraphQL API URL.
  * @returns {string}
  */
 function getApiUrl() {
-  return process.env.BLINK_API_URL || DEFAULT_API_URL;
+  if (process.env.BLINK_API_URL) {
+    return validateAuthEndpoint(process.env.BLINK_API_URL, 'https:', 'http:', 'BLINK_API_URL');
+  }
+  return DEFAULT_API_URL;
 }
 
 /**
@@ -51,10 +93,19 @@ function getApiUrl() {
  * @returns {string}
  */
 function getWsUrl() {
-  if (process.env.BLINK_WS_URL) return process.env.BLINK_WS_URL;
+  if (process.env.BLINK_WS_URL) {
+    return validateAuthEndpoint(process.env.BLINK_WS_URL, 'wss:', 'ws:', 'BLINK_WS_URL');
+  }
   const apiUrl = getApiUrl();
   const url = new URL(apiUrl);
-  url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:';
+  if (url.protocol !== 'https:') {
+    // Only a validated local http endpoint reaches here; the derived socket
+    // mirrors it. Never auto-DOWNGRADE https -> ws (audit finding): an https
+    // API host gets wss.
+    url.protocol = 'ws:';
+  } else {
+    url.protocol = 'wss:';
+  }
   if (url.hostname.startsWith('api.')) {
     url.hostname = url.hostname.replace(/^api\./, 'ws.');
   }

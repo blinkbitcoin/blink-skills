@@ -25,6 +25,15 @@
 
 'use strict';
 
+// The URL-policy guard shared with the LNURL/L402-pay flows (security-audit
+// fix: this script previously used bare fetch with redirect:'follow'). Discovery
+// deliberately has NO allowlist payment gate — it is the documented public
+// prober — but every fetch is SSRF-guarded: private/loopback/link-local
+// targets refused (unless the host appears in a configured budget allowlist),
+// redirects followed manually and re-validated per hop.
+const { fetchWithRetry, assertAllowedUrl } = require('./_lnurl');
+const { getAllowHosts } = require('./_budget');
+
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
 
 /**
@@ -81,20 +90,24 @@ function parseL402ProtocolBody(body) {
  * @param {number} [timeoutMs=10000]
  * @returns {Promise<string>}
  */
-async function resolveCanonicalUrl(url, timeoutMs = 10_000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function resolveCanonicalUrl(url, timeoutMs = 10_000, allowedHosts = null) {
+  // Policy first, synchronously: a refused target aborts the flow; only
+  // transient network failures degrade gracefully.
+  assertAllowedUrl(url, allowedHosts, 'L402 discovery URL', { portsUnrestricted: true, strictLocal: true });
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       method: 'HEAD',
-      redirect: 'follow',
-      signal: controller.signal,
+      timeoutMs,
+      retries: 1,
+      allowedHosts,
+      what: 'L402 discovery URL',
+      portsUnrestricted: true,
+      strictLocal: true,
     });
     return res.url || url;
-  } catch {
+  } catch (err) {
+    if (err && err.code === 'URL_POLICY') throw err;
     return url;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -106,15 +119,26 @@ async function resolveCanonicalUrl(url, timeoutMs = 10_000) {
  * @param {number} [timeoutMs=15000]
  * @returns {Promise<{ invoice: string, offerId: string | null } | null>}
  */
-async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000, allowedHosts = null) {
+  // payment_request_url is SERVER-SUPPLIED from the 402 challenge body — the
+  // one hop where a hostile L402 server picks the destination. It gets the
+  // same guard as user-supplied URLs; a policy refusal throws (fail loud),
+  // transient network failures keep the graceful null fallback.
+  assertAllowedUrl(paymentRequestUrl, allowedHosts, 'L402 payment_request_url', {
+    portsUnrestricted: true,
+    strictLocal: true,
+  });
   try {
-    const res = await fetch(paymentRequestUrl, {
+    const res = await fetchWithRetry(paymentRequestUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
-      signal: controller.signal,
+      timeoutMs,
+      retries: 0,
+      allowedHosts,
+      what: 'L402 payment_request_url',
+      portsUnrestricted: true,
+      strictLocal: true,
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -123,8 +147,6 @@ async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000) {
     return invoice ? { invoice, offerId: data.offer_id || null } : null;
   } catch {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -281,29 +303,27 @@ async function main() {
 
   // Resolve canonical URL (follow any HTTP redirects) so the probe always
   // hits the final endpoint and reports the correct URL.
-  const canonicalUrl = await resolveCanonicalUrl(args.url);
+  const allowHosts = getAllowHosts();
+  const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-
   let res;
   try {
-    res = await fetch(canonicalUrl, {
+    res = await fetchWithRetry(canonicalUrl, {
       method: args.method,
-      headers: {
-        Accept: 'application/json',
-        ...args.headers,
-      },
-      signal: controller.signal,
+      headers: { ...args.headers },
+      timeoutMs: 15_000,
+      retries: 0,
+      allowedHosts: allowHosts,
+      what: 'L402 discovery probe',
+      portsUnrestricted: true,
+      strictLocal: true,
     });
   } catch (err) {
-    clearTimeout(timer);
+    if (err && err.code === 'URL_POLICY') throw err;
     throw new Error(`Request failed: ${err.message}`);
-  } finally {
-    clearTimeout(timer);
   }
 
   if (res.status !== 402) {
@@ -365,7 +385,7 @@ async function main() {
 
     if (l402proto.paymentRequestUrl) {
       console.error(`Fetching invoice from: ${l402proto.paymentRequestUrl}`);
-      const fetched = await fetchL402ProtocolInvoice(l402proto.paymentRequestUrl);
+      const fetched = await fetchL402ProtocolInvoice(l402proto.paymentRequestUrl, 15_000, allowHosts);
       if (fetched) {
         invoice = fetched.invoice;
         offerId = fetched.offerId;
