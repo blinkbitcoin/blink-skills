@@ -55,6 +55,8 @@ function loadSdkModule() {
   console.warn = noop;
   console.error = noop;
   try {
+    // Logging is silenced in connect() (awaited, before the SDK connects) —
+    // loadSdkModule is sync and must stay so.
     return require(SPARK_PACKAGE);
   } catch (err) {
     // Restore before throwing so the error is actually visible.
@@ -72,6 +74,26 @@ function loadSdkModule() {
     console.log = saved.log;
     console.warn = saved.warn;
     console.error = saved.error;
+  }
+}
+
+/**
+ * Route every SDK log entry to a noop sink. This covers only entries that
+ * flow through the SDK's Rust/WASM logger (initLogging). It does NOT cover
+ * the Node-side storage chatter — "Skipping redundant payment event: …" is
+ * a direct console.debug call (see suppressSdkStdoutNoise) — so both
+ * mechanisms are applied for the full connection lifetime. Best-effort:
+ * older SDK builds without initLogging are left as-is, and a rejection here
+ * must never break connecting.
+ * @param {object} mod  the loaded SDK module
+ */
+async function silenceSdkLogger(mod) {
+  try {
+    if (mod && typeof mod.initLogging === 'function') {
+      await mod.initLogging({ log: () => {} });
+    }
+  } catch {
+    // Never let log silencing interfere with SDK availability.
   }
 }
 
@@ -511,6 +533,66 @@ async function probeLnLookupHealthy(sdk) {
 }
 
 /**
+ * SDK stdout-noise suppression — a reference-counted lease around a single
+ * process-global filtering wrapper (review round 2, PR #16: per-connection
+ * save/restore corrupted overlapping lifecycles — closing connection A
+ * restored the original console.debug while B still needed suppression, and
+ * closing B then restored A's noop, leaving debug permanently muted).
+ *
+ * What is suppressed and why: the pinned SDK's Node storage emits
+ * "Skipping redundant payment event: …" DIRECTLY via console.debug
+ * (nodejs/storage/index.cjs:362-364 — same in the mysql/postgres storage
+ * variants) whenever a duplicate payment update is applied, i.e. whenever
+ * cached events replay after recent payment activity (observed live in
+ * field tests 2/3: spark_balance and spark_send emitted SDK lines into
+ * stdout, breaking the all-JSON contract). console.debug is an alias of
+ * console.log in Node — stdout. The message does not flow through the
+ * Rust/WASM logger that initLogging configures.
+ *
+ * Lease semantics: the FIRST active connection installs ONE wrapper that
+ * forwards unrelated console.debug calls untouched and drops only the known
+ * noise prefix; the LAST lease to close restores the original — and only if
+ * console.debug is still our wrapper, so a third-party replacement that
+ * appeared meanwhile is never clobbered. Releases are idempotent (duplicate
+ * disconnect is a no-op), so overlapping connections in any close order keep
+ * stdout protected exactly while at least one is active.
+ *
+ * @returns {() => void} release function — call when the connection ends
+ *   (or fails to open); safe to call more than once.
+ */
+const SDK_STDOUT_NOISE_PREFIX = 'Skipping redundant payment event';
+let stdoutNoiseLease = null; // { count, savedDebug, wrapper } | null
+
+function suppressSdkStdoutNoise() {
+  if (typeof console.debug !== 'function') return () => {};
+  if (!stdoutNoiseLease) {
+    const savedDebug = console.debug;
+    const wrapper = (...args) => {
+      const first = args.length > 0 ? String(args[0]) : '';
+      if (first.startsWith(SDK_STDOUT_NOISE_PREFIX)) return; // known SDK noise
+      return savedDebug.apply(console, args); // everything else flows through
+    };
+    console.debug = wrapper;
+    stdoutNoiseLease = { count: 0, savedDebug, wrapper };
+  }
+  stdoutNoiseLease.count += 1;
+  let released = false;
+  return () => {
+    if (released || !stdoutNoiseLease) return; // idempotent / already drained
+    released = true;
+    stdoutNoiseLease.count -= 1;
+    if (stdoutNoiseLease.count === 0) {
+      // Restore only OUR wrapper — if a third party replaced console.debug
+      // while we were active, theirs stays (ours comes off with it anyway).
+      if (console.debug === stdoutNoiseLease.wrapper) {
+        console.debug = stdoutNoiseLease.savedDebug;
+      }
+      stdoutNoiseLease = null;
+    }
+  };
+}
+
+/**
  * Connect to the Breez Spark SDK using the seed from SPARK_MNEMONIC.
  *
  * Setting lnurlDomain makes the SDK's automatic recover_lightning_address
@@ -521,9 +603,13 @@ async function probeLnLookupHealthy(sdk) {
  *
  * @param {object} [opts]
  * @param {string} [opts.network]  "mainnet" (default) or "regtest".
+ * @param {number} [opts.disconnectTimeoutMs]  How long the returned
+ *   disconnect() waits for the SDK before returning (default 5000). The
+ *   stdout-noise lease is NOT bound to this timeout — it releases only when
+ *   the SDK's real disconnect settles. Injectable for tests.
  * @returns {Promise<{ sdk: object, disconnect: () => Promise<void> }>}
  */
-async function connect({ network = DEFAULT_NETWORK } = {}) {
+async function connect({ network = DEFAULT_NETWORK, disconnectTimeoutMs = 5000 } = {}) {
   requireNode22();
   const mod = loadSdkModule();
   const mnemonic = getMnemonic();
@@ -539,22 +625,50 @@ async function connect({ network = DEFAULT_NETWORK } = {}) {
   // Fail fast with a build-tools message rather than an opaque bindings error.
   assertStorageAvailable();
 
-  const sdk = await mod.connect({
-    config,
-    seed: { type: 'mnemonic', mnemonic, passphrase: undefined },
-    storageDir,
-  });
+  // Silence SDK logging (awaited — no race with the first payment) and hold
+  // the stdout guard for the ENTIRE connection lifetime: the duplicate-event
+  // replay that pollutes stdout happens any time after connect, not just at
+  // load (see suppressSdkStdoutNoise).
+  await silenceSdkLogger(mod);
+  const restoreQuiet = suppressSdkStdoutNoise();
 
+  let sdk;
+  try {
+    sdk = await mod.connect({
+      config,
+      seed: { type: 'mnemonic', mnemonic, passphrase: undefined },
+      storageDir,
+    });
+  } catch (err) {
+    restoreQuiet();
+    throw err;
+  }
+
+  // The lease is owned by the SDK's ACTUAL shutdown, not by the caller's
+  // wait (review round 3, PR #16): on a hung sdk.disconnect(), the old code
+  // released the noise guard when the 5s race timed out — while the SDK's
+  // still-pending storage/event workers could emit "Skipping redundant
+  // payment event" to stdout after the command's JSON. The real disconnect
+  // is memoized ONCE, kept non-rejecting, and releases the lease only when
+  // IT settles; the public disconnect() merely bounds how long the CALLER
+  // waits. disconnectTimeoutMs is injectable so tests can exercise the
+  // timeout path without a real 5-second stall.
+  let rawDisconnect = null;
+  const startDisconnect = () => {
+    if (!rawDisconnect) {
+      rawDisconnect = Promise.resolve()
+        .then(() => sdk.disconnect())
+        .catch(() => {}) // non-rejecting by contract — callers rely on this
+        .finally(restoreQuiet); // the lease follows the REAL settlement
+    }
+    return rawDisconnect;
+  };
   const disconnect = async () => {
     // Bounded AND non-rejecting by contract: the SDK's disconnect can hang or
     // reject; cleanup must never block the caller or mask a payment outcome.
     // Callers that inject alternate connectors (tests) still guard at their
     // own layer — see the comments in spark_send.js and l402_pay_spark.js.
-    try {
-      await Promise.race([sdk.disconnect(), new Promise((resolve) => setTimeout(resolve, 5000))]);
-    } catch {
-      // best-effort
-    }
+    await Promise.race([startDisconnect(), new Promise((resolve) => setTimeout(resolve, disconnectTimeoutMs))]);
   };
 
   return { sdk, disconnect };
@@ -651,6 +765,13 @@ async function waitForStableBalance(sdk, { maxWaitMs = 5000, intervalMs = 1000 }
 /**
  * Normalize a single Payment record from listPayments() defensively across
  * SDK versions.
+ *
+ * Token payments (method 'token' / details.type 'token') carry amounts in
+ * TOKEN BASE UNITS, not sats — funnelling them into amountSats mislabels a
+ * $0.999 USDB receive as "999,001 sats" (~$770 at 1293 sats/$; observed in
+ * live field test 3). Token rows therefore emit amountSats/feeSats: null and
+ * carry the base-unit amount as a precision string plus token metadata,
+ * mirroring the tokenBalances shape (balance string + decimals + formatted).
  * @param {object} p
  * @returns {object}
  */
@@ -666,13 +787,39 @@ function normalizePayment(p) {
   else if (has(p.feesSats)) fee = p.feesSats;
   else if (has(p.feeSats)) fee = p.feeSats;
 
-  return {
+  const base = {
     id: p.id || p.paymentHash || p.txId || null,
     type: p.paymentType || p.type || null, // "send" | "receive"
     status: p.status || null,
+    timestamp: has(p.timestamp) ? Number(p.timestamp) : null,
+  };
+
+  const details = p.details && typeof p.details === 'object' ? p.details : null;
+  if (p.method === 'token' || (details && details.type === 'token')) {
+    const meta = (details && details.metadata && typeof details.metadata === 'object' && details.metadata) || {};
+    const decimals = has(meta.decimals) ? meta.decimals : null;
+    return {
+      ...base,
+      asset: 'token',
+      amountSats: null,
+      feeSats: null,
+      amountBaseUnits: has(amount) ? String(amount) : null,
+      feeBaseUnits: has(fee) ? String(fee) : null,
+      amountFormatted: has(amount) && decimals !== null ? formatTokenAmount(amount, decimals) : null,
+      token: {
+        ticker: meta.ticker || null,
+        name: meta.name || null,
+        decimals,
+        identifier: meta.identifier || meta.tokenIdentifier || null,
+      },
+    };
+  }
+
+  return {
+    ...base,
+    asset: 'btc',
     amountSats: has(amount) ? Number(amount) : null,
     feeSats: has(fee) ? Number(fee) : null,
-    timestamp: has(p.timestamp) ? Number(p.timestamp) : null,
   };
 }
 
@@ -859,4 +1006,5 @@ module.exports = {
   lnurlDomainFor,
   canonicalizeLnurlDomain,
   probeLnLookupHealthy,
+  suppressSdkStdoutNoise,
 };

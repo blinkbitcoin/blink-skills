@@ -21,6 +21,13 @@ const path = require('node:path');
 const scriptsDir = path.resolve(__dirname, '..', 'blink', 'scripts');
 const sparkSdkPath = require.resolve('../blink/scripts/_spark_sdk');
 
+// Capture the PRODUCTION _spark_sdk exports before any test mocks it: pure
+// helpers (normalizePayment) are passed through so the mock below cannot
+// drift from the real adapter (review round 1, PR #16 — the mirrored copy
+// had drifted in null handling and fallback fields).
+const realSparkSdk = require(sparkSdkPath);
+delete require.cache[sparkSdkPath];
+
 // ── shared harness ───────────────────────────────────────────────────────────
 
 let saved = {};
@@ -159,14 +166,9 @@ function mockSparkSdk(fakeSdk, { onDisconnect, onConnect } = {}) {
         const info = await sdk.getInfo({ ensureSynced: true });
         return { balanceSats: Number(info.balanceSats), stable: true };
       },
-      normalizePayment: (p) => ({
-        id: p.id || null,
-        type: p.paymentType || null,
-        status: p.status || null,
-        amountSats: p.amount === undefined ? null : Number(p.amount),
-        feeSats: p.fees === undefined ? null : Number(p.fees),
-        timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
-      }),
+      // PRODUCTION passthrough (captured at file load): command tests run
+      // the real adapter; only SDK-boundary functions are faked here.
+      normalizePayment: realSparkSdk.normalizePayment,
     },
   };
 }

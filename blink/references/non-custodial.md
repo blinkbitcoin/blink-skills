@@ -290,6 +290,16 @@ needed — 0.24.x adds only deposit/proxy infra, no token APIs):
   invoices; `--from-btc` / `--from-token` attach Flashnet conversions
   (`conversionEstimate` in the prepare output is the quote; `--slippage-bps`
   caps slippage, default 50 bps; failed conversions auto-refund).
+
+  Live-tested (FT3): minimum conversion is **800 sats per `--from-btc` leg**
+  (budget ≥1000); round-trip spread ~0.1%; token-only sends to your own
+  invoice are refused by the SDK (`Self payment not allowed`) while
+  `--from-btc` to the same invoice succeeds — conversions aren't transfers.
+  In `spark-transactions`, token rows carry `asset: "token"` +
+  `amountBaseUnits`/`amountFormatted` + token metadata; `amountSats` is
+  null on token rows (a 999,001-base-unit USDB receive is $0.999, not
+  999,001 sats).
+
 - Budget: plain token sends are outside the sats budget (it is a sats
   instrument). `--from-btc` conversions reserve the SATS side of the
   estimate (`amountIn`); `--from-token` spends tokens (no sats reservation).

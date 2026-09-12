@@ -21,6 +21,17 @@ const path = require('node:path');
 
 const target = path.resolve(__dirname, '..', '..', 'blink', 'scripts', '_spark_sdk.js');
 
+// Capture the PRODUCTION _spark_sdk exports BEFORE installing the
+// Module._load interception. Pure helpers (normalizePayment — and only
+// those) are passed through from production so this fixture can never
+// drift from the real adapter (review round 1, PR #16: the mirrored copy
+// had already drifted in null handling and fallback fields, letting
+// command tests stay green while production regressed). The cache entry is
+// deleted immediately so every later require from the CLI still resolves
+// to THIS stub — only this captured reference survives.
+const realSparkSdk = require(target);
+delete require.cache[target];
+
 const balance = Number(process.env.SPARK_STUB_BALANCE || 1234);
 const payments = JSON.parse(process.env.SPARK_STUB_PAYMENTS || '[]');
 let getPaymentCalls = 0; // per-process: the stub is required fresh in every CLI child
@@ -391,14 +402,9 @@ const stub = {
     const info = await sdk.getInfo({ ensureSynced: true });
     return { balanceSats: Number(info.balanceSats), stable: true };
   },
-  normalizePayment: (p) => ({
-    id: p.id || null,
-    type: p.paymentType || null,
-    status: p.status || null,
-    amountSats: p.amount === undefined ? null : Number(p.amount),
-    feeSats: p.fees === undefined ? null : Number(p.fees),
-    timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
-  }),
+  // PRODUCTION passthrough (captured before the interception was installed):
+  // command tests run the real adapter, so the fixture cannot drift.
+  normalizePayment: realSparkSdk.normalizePayment,
 };
 
 const realLoad = Module._load;
