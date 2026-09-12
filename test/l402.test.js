@@ -2491,6 +2491,118 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
+  it('a CROSS-ORIGIN redirect strips credential headers (Authorization/Cookie/Proxy-Authorization)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'secret-body',
+        headers: {
+          Authorization: 'L402 mac:pre',
+          Cookie: 'session=1',
+          'Proxy-Authorization': 'Basic x',
+          'X-Custom': 'keep',
+        },
+        retries: 0,
+        what: 'cred probe',
+      });
+      assert.equal(seen.length, 2);
+      assert.equal(seen[0].headers.Authorization, 'L402 mac:pre', 'first hop carries the credential');
+      const second = seen[1].headers;
+      assert.equal(second.Authorization, undefined, 'Authorization stripped cross-origin (round-1 HIGH defect)');
+      assert.equal(second.Cookie, undefined, 'Cookie stripped');
+      assert.equal(second['Proxy-Authorization'], undefined, 'Proxy-Authorization stripped');
+      assert.equal(second['X-Custom'], 'keep', 'non-credential headers forwarded');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('a SAME-ORIGIN redirect preserves credential headers and body', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://first.example/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        headers: { Authorization: 'L402 mac:pre' },
+        retries: 0,
+        what: 'same-origin probe',
+      });
+      assert.equal(seen[1].headers.Authorization, 'L402 mac:pre', 'same-origin hop keeps credentials');
+      // 302 + POST -> GET per Fetch spec (body dropped), header preserved.
+      assert.equal(seen[1].method, 'GET');
+      assert.equal(seen[1].body, undefined);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('POST + 307 preserves method AND body (cross-origin still strips credentials)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        headers: { Authorization: 'L402 mac:pre' },
+        retries: 0,
+        what: '307 probe',
+      });
+      assert.equal(seen[1].method, 'POST', '307 preserves the method');
+      assert.equal(seen[1].body, 'payload', '307 preserves the body');
+      assert.equal(seen[1].headers.Authorization, undefined, 'cross-origin still strips credentials');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('303 rewrites ANY method to GET (body dropped)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ method: opts.method, body: opts.body });
+      if (seen.length === 1) {
+        return { status: 303, headers: { get: (n) => (n === 'location' ? '/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'DELETE',
+        body: 'x',
+        retries: 0,
+        what: '303 probe',
+      });
+      assert.equal(seen[1].method, 'GET', '303 forces GET even for DELETE');
+      assert.equal(seen[1].body, undefined);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
   it('getAllowHosts: configured allowlist -> Set; unconfigured -> null', async () => {
     const os = require('node:os');
     const fsMod = require('node:fs');

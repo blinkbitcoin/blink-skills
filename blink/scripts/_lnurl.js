@@ -259,6 +259,22 @@ async function fetchWithRetry(
 ) {
   // Guard failures are deterministic policy decisions, not transient network
   // faults, so they must escape the retry loop instead of being swallowed.
+  // Mutable per-hop request state — redirects are origin- and status-aware
+  // (review round 1, PR #20). The manual loop previously re-sent the caller's
+  // exact headers/method/body on EVERY hop, so a late cross-origin redirect on
+  // an L402 request forwarded `Authorization: L402 <macaroon>:<preimage>` (a
+  // reusable bearer credential) and POST bodies to the redirect target — a
+  // regression from native Fetch, which strips credential headers cross-origin
+  // and rewrites methods per the WHATWG spec. Semantics implemented here:
+  //   - cross-origin hop: Authorization / Cookie / Proxy-Authorization are
+  //     stripped (same-origin hops preserve them);
+  //   - 303: method becomes GET, body dropped (any original method);
+  //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
+  //   - 307/308: method and body are preserved.
+  const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
+  let reqHeaders = { ...headers };
+  let reqMethod = method;
+  let reqBody = body;
   let current = assertAllowedUrl(url, allowedHosts, what, { portsUnrestricted, strictLocal });
 
   // One budget for the whole logical request. `timeoutMs` alone is per-attempt
@@ -280,11 +296,11 @@ async function fetchWithRetry(
       const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
       try {
         res = await fetch(current.toString(), {
-          method,
-          body,
+          method: reqMethod,
+          body: reqBody,
           signal: controller.signal,
           redirect: 'manual',
-          headers: { Accept: 'application/json', Connection: 'close', ...headers },
+          headers: { Accept: 'application/json', Connection: 'close', ...reqHeaders },
         });
         // A 404 is the LUD-16 "not found" signal, but it is ALSO what a
         // transient proxy/CDN/WAF returns in front of a healthy LNURL server
@@ -323,8 +339,23 @@ async function fetchWithRetry(
       throw new Error(`Too many redirects (>${MAX_REDIRECTS}) fetching ${what}.`);
     }
     // Resolve relative Location headers against the current hop, then re-check.
-    const next = new URL(res.headers.get('location'), current).toString();
-    current = assertAllowedUrl(next, allowedHosts, `${what} redirect target`, { portsUnrestricted, strictLocal });
+    const nextUrl = new URL(res.headers.get('location'), current);
+    // Origin-aware credential handling: a cross-origin hop never carries the
+    // caller's credential headers forward (stripped for this and later hops).
+    if (nextUrl.origin !== current.origin) {
+      reqHeaders = Object.fromEntries(
+        Object.entries(reqHeaders).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
+      );
+    }
+    // WHATWG Fetch method semantics on redirect.
+    if (res.status === 303 || ((res.status === 301 || res.status === 302) && reqMethod === 'POST')) {
+      reqMethod = 'GET';
+      reqBody = undefined;
+    }
+    current = assertAllowedUrl(nextUrl.toString(), allowedHosts, `${what} redirect target`, {
+      portsUnrestricted,
+      strictLocal,
+    });
   }
 }
 
