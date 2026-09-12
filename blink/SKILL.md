@@ -915,7 +915,7 @@ blink resolve-receiver alice@blink.sv
 
 # 2. Mint an invoice via public LNURL-pay — no API key, no seed
 blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
-# → First JSON: {"event": "invoice_created", "accountType": "spark", "paymentRequest": "lnbc...", "verifyUrl": "https://...", ...}
+# → First JSON: {"event": "invoice_created", "accountType": "lnaddress", "paymentRequest": "lnbc...", "verifyUrl": "https://...", ...}
 # Generate QR from paymentRequest (blink qr works on any BOLT-11) and send to the payer
 
 # 3. If verifyUrl was present (and --no-verify was not passed), wait for the second JSON:

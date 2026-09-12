@@ -240,7 +240,10 @@ the wallet kind, full stop. Whether a Lightning address is registered is the
 address"). The probe exists because recovery fails silently inside the SDK —
 observed live 2026-09-12: blink.sv management endpoints 404'd while a
 registered address existed, and `get` reported a false `registered: false`
-(a payment to the address settled fine). `spark-lnaddress get` exits 1 on
+(a payment to the address settled fine). The probe proves the service is
+REACHABLE — necessary, not sufficient, for the recovery route having run
+(they are distinct service operations; the definitive fix is the server-side
+pubkey→address lookup requested in blink-lnurl-server#43). `spark-lnaddress get` exits 1 on
 `registered: "unknown"` so an unverifiable answer never masquerades as a
 verified negative. (`create-invoice-lnaddress` / `resolve-receiver` still
 classify a _receiver_ as `type: 'lnaddress'` when Spark-backed — a receiver

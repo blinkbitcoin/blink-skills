@@ -487,6 +487,16 @@ function lnurlDomainFor(network) {
  * throws, the service is unreachable and any "not registered" answer is
  * unverified.
  *
+ * Epistemic limit (deliberate): the probe proves the LNURL SERVICE is
+ * reachable — a necessary, not sufficient, condition for the SDK's
+ * identity-keyed recovery route having run. They are distinct service
+ * operations, and a deployment could serve availability checks while the
+ * recovery route is broken (the reverse of the observed outage). The
+ * definitive client-side fix is a server-side pubkey→address lookup
+ * (blink-lnurl-server#43); until then, 'verified' means "service reachable",
+ * which is the strongest claim available without it.
+ *
+ *
  * @param {object} sdk  connected SDK instance
  * @returns {Promise<{ healthy: boolean, error: string|null }>}
  */

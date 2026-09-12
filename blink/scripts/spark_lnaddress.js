@@ -24,8 +24,9 @@
  * register: claims the username on the wallet's pubkey. Server rules we
  * mirror client-side: one username per pubkey per domain (a new registration
  * REPLACES the wallet's previous one); usernames are 3-50 chars [a-z0-9_]
- * with at least one letter, lowercased; phone identifiers are not supported
- * for Spark. No funds move — this is a public-identity choice.
+ * with at least one letter, lowercase-only (uppercase input is REJECTED
+ * client-side, never silently normalized); phone identifiers are not
+ * supported for Spark. No funds move — this is a public-identity choice.
  *
  * delete: removes the address (reversible by re-registering, subject to
  * availability).

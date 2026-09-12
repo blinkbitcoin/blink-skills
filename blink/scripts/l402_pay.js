@@ -222,12 +222,15 @@ function parseArgs(argv) {
       }
       maxAmount = n;
     } else if (arg === '--wait' && i + 1 < argv.length) {
-      const n = parseInt(argv[++i], 10);
-      if (isNaN(n) || n < 0) {
-        console.error('Error: --wait must be a non-negative integer (seconds; 0 disables settlement polling)');
+      // Full-string integer validation: parseInt's prefix parsing would
+      // silently accept '0.5' as 0 (disabling the settlement poll entirely),
+      // '10seconds' as 10, and '1e2' as 1.
+      const raw = argv[++i];
+      if (!/^\d+$/.test(raw)) {
+        console.error('Error: --wait must be a non-negative whole number of seconds (0 disables settlement polling)');
         process.exit(1);
       }
-      waitSeconds = n;
+      waitSeconds = Number(raw);
     } else if (arg === '--dry-run') {
       dryRun = true;
     } else if (arg === '--no-store') {
@@ -798,9 +801,13 @@ async function main() {
       spark = await payInvoiceViaSpark(challenge.invoice, {
         network: process.env.SPARK_NETWORK || 'mainnet',
         waitSeconds: args.waitSeconds,
-        pollIntervalMs: process.env.BLINK_SPARK_POLL_INTERVAL_MS
-          ? Number(process.env.BLINK_SPARK_POLL_INTERVAL_MS)
-          : 3000,
+        // Debug/CI knob for the settlement poll cadence. Validated here and
+        // clamped again inside payInvoiceViaSpark: a zero/negative/NaN value
+        // must never become a non-terminating hot loop.
+        pollIntervalMs: (() => {
+          const raw = Number(process.env.BLINK_SPARK_POLL_INTERVAL_MS);
+          return process.env.BLINK_SPARK_POLL_INTERVAL_MS !== undefined && Number.isFinite(raw) && raw > 0 ? raw : 3000;
+        })(),
       });
     } catch (e) {
       if (e.stage === 'dispatch') {

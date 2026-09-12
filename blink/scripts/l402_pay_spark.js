@@ -22,6 +22,27 @@
 const { connect, feeFromPrepare, safeErrorDetail } = require('./_spark_sdk');
 
 /**
+ * Race a promise against a wall-clock timeout. The underlying promise is NOT
+ * cancelled (the SDK exposes no abort mechanism) — the race only bounds how
+ * long the caller waits on it. The timer is always cleared so it can never
+ * hold the event loop open past the race.
+ *
+ * @param {Promise} promise
+ * @param {number} ms  non-negative budget
+ * @param {string} label  for the timeout error message
+ * @returns {Promise}
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Wrap a pre-dispatch rejection (connect / prepareSendPayment) in an owned
  * Error carrying the original value as `cause`. These are third-party Promise
  * boundaries: a rejection value of null/undefined (or anything non-object)
@@ -80,7 +101,14 @@ function decodePaymentResult(result) {
  *   casing) become 'SUCCESS'/'PENDING'/'FAILURE'; unknown statuses pass
  *   through raw. Callers must branch on these values only.
  */
-async function payInvoiceViaSpark(invoice, { network, waitSeconds = 60, pollIntervalMs = 3000 } = {}) {
+async function payInvoiceViaSpark(invoice, { network, waitSeconds = 60, pollIntervalMs } = {}) {
+  // Defensive clamp: a non-finite or non-positive interval would make the
+  // settlement loop a non-terminating hot loop (0: the deadline is only
+  // checked between iterations that never yield; negative/NaN: same class).
+  // The caller validates its env-provided value, but this function is
+  // exported — clamp at the boundary regardless of who calls it.
+  const interval =
+    pollIntervalMs !== undefined && Number.isFinite(pollIntervalMs) && pollIntervalMs > 0 ? pollIntervalMs : 3000;
   let sdk;
   let disconnect;
   try {
@@ -141,23 +169,32 @@ async function payInvoiceViaSpark(invoice, { network, waitSeconds = 60, pollInte
     // Poll getPayment until the payment reaches a terminal state or the wait
     // budget is spent — the preimage (the L402 token material) only appears
     // in htlcDetails once the HTLC reaches preimageShared.
+    //
+    // The deadline is ABSOLUTE wall-clock (Date.now()), and every ingredient
+    // is bounded by the REMAINING time: the sleep, and each getPayment
+    // refresh (raced against the remaining budget — the SDK exposes no
+    // request timeout, and an unbounded await would let one stalled refresh
+    // outlive --wait indefinitely). Expiry returns the last-known PENDING
+    // result so the caller's fail-closed accounting and retry warning run.
     let { payment, status, preimage } = decoded;
     const deadlineMs = Math.max(0, Number(waitSeconds) || 0) * 1000;
-    let waitedMs = 0;
-    while (status === 'PENDING' && deadlineMs > 0 && waitedMs < deadlineMs) {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, deadlineMs - waitedMs)));
-      waitedMs += pollIntervalMs;
+    const deadline = Date.now() + deadlineMs;
+    while (status === 'PENDING' && deadlineMs > 0 && Date.now() < deadline) {
+      const remainingBeforeSleep = deadline - Date.now();
+      await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remainingBeforeSleep)));
       const paymentId = payment && payment.id;
       if (!paymentId) break; // nothing to refresh — surface the PENDING truth
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       try {
-        const refreshed = await sdk.getPayment({ paymentId });
+        const refreshed = await withTimeout(sdk.getPayment({ paymentId }), remaining, 'getPayment refresh');
         decoded = decodePaymentResult(refreshed);
         payment = decoded.payment;
         status = decoded.status;
         preimage = decoded.preimage;
       } catch {
-        // Transient query failure — keep polling; the payment itself is
-        // unaffected and the final state is re-read on the next tick.
+        // Transient query failure or a bounded refresh timeout — keep
+        // polling until the deadline; the payment itself is unaffected.
       }
     }
 

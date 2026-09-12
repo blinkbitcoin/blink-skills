@@ -1891,3 +1891,73 @@ describe('_spark_sdk.assertStorageAvailable', () => {
     );
   });
 });
+
+// ── _spark_sdk.probeLnLookupHealthy (the REAL export — CLI tests only ever
+// exercise fixture mirrors; this is the direct coverage) ─────────────────────
+
+describe('_spark_sdk.probeLnLookupHealthy', () => {
+  const { probeLnLookupHealthy } = require('../blink/scripts/_spark_sdk');
+
+  it('reports healthy when the service answers a benign lookup', async () => {
+    let seenUsername = null;
+    const result = await probeLnLookupHealthy({
+      async checkLightningAddressAvailable(req) {
+        seenUsername = req.username;
+        return false; // taken/unavailable is irrelevant — an ANSWER is the point
+      },
+    });
+    assert.deepEqual(result, { healthy: true, error: null });
+    // The probe username must be a valid, unclaimable-by-collision name:
+    // zz-prefix (no reserved payment prefix), letters + digits, 12 chars.
+    assert.match(seenUsername, /^zz[0-9]{10}$/);
+  });
+
+  it('reports unhealthy with the error detail when the lookup throws (404 case)', async () => {
+    const result = await probeLnLookupHealthy({
+      async checkLightningAddressAvailable() {
+        throw new Error('network request failed with status 404');
+      },
+    });
+    assert.equal(result.healthy, false);
+    assert.match(result.error, /status 404/);
+  });
+
+  it('survives a rejecting non-Error value', async () => {
+    const result = await probeLnLookupHealthy({
+      async checkLightningAddressAvailable() {
+        throw 'plain string rejection'; // eslint-disable-line no-throw-literal
+      },
+    });
+    assert.equal(result.healthy, false);
+    assert.ok(typeof result.error === 'string' && result.error.length > 0);
+  });
+});
+
+// ── SKILL.md output examples contract ────────────────────────────────────────
+// Review round 1 (PR #15, HIGH): a bulk doc edit changed the create-invoice-
+// lnaddress walkthrough example to a value the command cannot emit. This pins
+// the machine-facing examples to the producers' contracts.
+
+describe('SKILL.md output examples contract', () => {
+  const fs = require('node:fs');
+  const pathMod = require('node:path');
+  const skill = fs.readFileSync(pathMod.join(__dirname, '..', 'blink', 'SKILL.md'), 'utf8');
+
+  it('the create-invoice-lnaddress walkthrough keeps the RECEIVER vocabulary (accountType "lnaddress")', () => {
+    const m = skill.match(/create-invoice-lnaddress[^\n]*\n\s*# → First JSON: (\{[^\n]+\})/);
+    assert.ok(m, 'the walkthrough example line must exist');
+    const example = JSON.parse(m[1].replace(/,\s*\.\.\.\s*}/, '}'));
+    assert.equal(example.accountType, 'lnaddress', 'receiver classification, unchanged by the v2.4.0 relabel');
+  });
+
+  it('spark-balance / spark-transactions example blocks carry accountType "spark"', () => {
+    for (const section of ['spark-balance:', 'spark-transactions:']) {
+      const idx = skill.indexOf(section);
+      assert.ok(idx > 0, `section ${section} must exist`);
+      const block = skill.slice(idx, idx + 400);
+      const m = block.match(/"accountType": "([a-z]+)"/);
+      assert.ok(m, `an accountType example must follow ${section}`);
+      assert.equal(m[1], 'spark', `${section} outputs are wallet-kind labeled`);
+    }
+  });
+});
