@@ -565,7 +565,7 @@ Lists recent Spark account payments from SDK-local history: `--limit` (default 2
 blink spark-subscribe [--timeout <seconds>] [--network mainnet|regtest]
 ```
 
-Streams live Spark wallet events as NDJSON (one JSON line per event). `--timeout` stops after N seconds (default: 300, 0 = run until interrupted). Non-custodial counterpart of `subscribe-updates`.
+Streams live Spark wallet events as NDJSON (one JSON line per event). `--timeout` stops after N seconds (default: 300, 0 = run until interrupted). Non-custodial counterpart of `subscribe-updates`. Since Breez SDK 0.25.0 the event stream can also surface `unilateralExitStateChanged` (wallet unilateral-exit state transitions) — watch for it if you rely on exit tooling; it is informational only and not yet interpreted by any skill command.
 
 > All `spark-*` commands require `SPARK_MNEMONIC` + `BREEZ_API_KEY` and Node 22+. Network defaults to mainnet; `SPARK_NETWORK` env var or `--network` flag overrides. See the Environment section above and [non-custodial](references/non-custodial.md) for getting a Breez key and installing the optional SDK dependencies.
 
