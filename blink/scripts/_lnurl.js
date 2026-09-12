@@ -93,16 +93,28 @@ function isPrivateAddress(hostname) {
  * @param {string} [what]  Label for the error message, e.g. "callback URL".
  * @returns {URL}
  */
-function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL') {
+/**
+ * Construct a URL-policy refusal. Tagged with code URL_POLICY so callers can
+ * distinguish a deterministic security decision (abort the whole flow — the
+ * target is hostile or out of policy) from a transient network failure
+ * (graceful fallback is fine).
+ */
+function policyError(message) {
+  const err = new Error(message);
+  err.code = 'URL_POLICY';
+  return err;
+}
+
+function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   let url;
   try {
     url = new URL(String(rawUrl));
   } catch {
-    throw new Error(`Refusing to fetch an unparseable ${what}: ${rawUrl}`);
+    throw policyError(`Refusing to fetch an unparseable ${what}: ${rawUrl}`);
   }
 
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
+    throw policyError(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
   }
 
   const host = url.hostname.toLowerCase();
@@ -118,26 +130,37 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL') {
   const explicitlyAllowed = allowed ? allowed.has(host) : false;
 
   if (allowed && !explicitlyAllowed) {
-    throw new Error(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
+    throw policyError(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
   }
 
   // Plaintext is tolerable only for a local host the caller deliberately
   // permitted (regtest / dev), never for one merely reached via a redirect.
   if (url.protocol === 'http:' && !(isLocal && (explicitlyAllowed || !allowed))) {
-    throw new Error(`Refusing to fetch ${what} over plaintext http from '${host}'; https is required.`);
+    throw policyError(`Refusing to fetch ${what} over plaintext http from '${host}'; https is required.`);
   }
 
   // Applies even with the allowlist disabled: opting out of the host allowlist
-  // is not opting in to internal network access.
+  // is not opting in to internal network access. Private IP LITERALS are
+  // always refused. Local NAMES (localhost et al.) are additionally refused by
+  // callers that pass strictLocal (the L402 flows: with no allowlist
+  // configured, 'http://localhost:6379/' must not sail through on a hostname
+  // technicality) — the LNURL flows keep their documented opt-out behavior of
+  // permitting plaintext localhost for regtest/dev when no allowlist is set.
   if (isPrivateAddress(host) && !explicitlyAllowed) {
-    throw new Error(`Refusing to fetch ${what} from private address '${host}'.`);
+    throw policyError(`Refusing to fetch ${what} from private address '${host}'.`);
+  }
+  if (opts.strictLocal && LOCAL_HOSTS.has(host) && !explicitlyAllowed) {
+    throw policyError(`Refusing to fetch ${what} from local host '${host}' (not allowlisted).`);
   }
 
   // A non-standard port on an allowed host is still a different service. The
   // allowlist names hosts, so anything but the default port is refused unless
-  // the caller listed `host:port` explicitly.
-  if (allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
-    throw new Error(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
+  // the caller listed `host:port` explicitly. L402 callers opt out
+  // (portsUnrestricted): L402 services routinely live on arbitrary ports, and
+  // the L402 allowlist is a PAYMENT policy list, not a network-access list —
+  // private-address and redirect re-validation still apply regardless.
+  if (!opts.portsUnrestricted && allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
+    throw policyError(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
   }
 
   return url;
@@ -228,11 +251,31 @@ async function fetchWithRetry(
     allowedHosts = null,
     what = 'URL',
     retryOn404 = false,
+    method = 'GET',
+    body = undefined,
+    portsUnrestricted = false,
+    strictLocal = false,
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
   // faults, so they must escape the retry loop instead of being swallowed.
-  let current = assertAllowedUrl(url, allowedHosts, what);
+  // Mutable per-hop request state — redirects are origin- and status-aware
+  // (review round 1, PR #20). The manual loop previously re-sent the caller's
+  // exact headers/method/body on EVERY hop, so a late cross-origin redirect on
+  // an L402 request forwarded `Authorization: L402 <macaroon>:<preimage>` (a
+  // reusable bearer credential) and POST bodies to the redirect target — a
+  // regression from native Fetch, which strips credential headers cross-origin
+  // and rewrites methods per the WHATWG spec. Semantics implemented here:
+  //   - cross-origin hop: Authorization / Cookie / Proxy-Authorization are
+  //     stripped (same-origin hops preserve them);
+  //   - 303: method becomes GET, body dropped (any original method);
+  //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
+  //   - 307/308: method and body are preserved.
+  const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
+  let reqHeaders = { ...headers };
+  let reqMethod = method;
+  let reqBody = body;
+  let current = assertAllowedUrl(url, allowedHosts, what, { portsUnrestricted, strictLocal });
 
   // One budget for the whole logical request. `timeoutMs` alone is per-attempt
   // and `retries` resets on every redirect, so without this a slow but
@@ -253,9 +296,11 @@ async function fetchWithRetry(
       const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
       try {
         res = await fetch(current.toString(), {
+          method: reqMethod,
+          body: reqBody,
           signal: controller.signal,
           redirect: 'manual',
-          headers: { Accept: 'application/json', Connection: 'close', ...headers },
+          headers: { Accept: 'application/json', Connection: 'close', ...reqHeaders },
         });
         // A 404 is the LUD-16 "not found" signal, but it is ALSO what a
         // transient proxy/CDN/WAF returns in front of a healthy LNURL server
@@ -283,7 +328,7 @@ async function fetchWithRetry(
 
     if (!res) {
       throw new Error(
-        `LNURL request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
+        `${what} request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
       );
     }
 
@@ -294,8 +339,23 @@ async function fetchWithRetry(
       throw new Error(`Too many redirects (>${MAX_REDIRECTS}) fetching ${what}.`);
     }
     // Resolve relative Location headers against the current hop, then re-check.
-    const next = new URL(res.headers.get('location'), current).toString();
-    current = assertAllowedUrl(next, allowedHosts, `${what} redirect target`);
+    const nextUrl = new URL(res.headers.get('location'), current);
+    // Origin-aware credential handling: a cross-origin hop never carries the
+    // caller's credential headers forward (stripped for this and later hops).
+    if (nextUrl.origin !== current.origin) {
+      reqHeaders = Object.fromEntries(
+        Object.entries(reqHeaders).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
+      );
+    }
+    // WHATWG Fetch method semantics on redirect.
+    if (res.status === 303 || ((res.status === 301 || res.status === 302) && reqMethod === 'POST')) {
+      reqMethod = 'GET';
+      reqBody = undefined;
+    }
+    current = assertAllowedUrl(nextUrl.toString(), allowedHosts, `${what} redirect target`, {
+      portsUnrestricted,
+      strictLocal,
+    });
   }
 }
 

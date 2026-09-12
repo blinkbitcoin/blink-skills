@@ -668,11 +668,16 @@ commands.transactions = {
     first: { type: 'string', default: '20' },
     after: { type: 'string' },
     wallet: { type: 'string', short: 'w' },
+    'include-preimage': { type: 'boolean', default: false },
   },
   optMeta: {
     first: { description: 'Number of transactions to return (1-100)', valueName: 'n' },
     after: { description: 'Pagination cursor from a previous response', valueName: 'cursor' },
     wallet: { description: 'Filter to BTC or USD wallet', valueName: 'currency' },
+    'include-preimage': {
+      description:
+        'Include settlement preimages in the output. Preimages are reusable L402 bearer credentials — pass this only when you deliberately need proof-of-payment export.',
+    },
   },
   examples: [
     'blink transactions',
@@ -686,6 +691,7 @@ commands.transactions = {
     if (first) argv.push('--first', String(first));
     if (opts.after) argv.push('--after', opts.after);
     if (opts.wallet) argv.push('--wallet', opts.wallet);
+    if (opts['include-preimage']) argv.push('--include-preimage');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'transactions.js'));
     await main();

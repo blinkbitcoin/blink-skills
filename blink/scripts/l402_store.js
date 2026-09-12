@@ -27,6 +27,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
 const path = require('node:path');
 const os = require('node:os');
 
@@ -45,6 +46,11 @@ const STORE_FILE = path.join(STORE_DIR, 'l402-tokens.json');
  */
 function readStore() {
   try {
+    ensureSecureStateDir(STORE_DIR); // one-time migration: 0644 -> 0600
+  } catch {
+    // Best-effort hardening on read.
+  }
+  try {
     const content = fs.readFileSync(STORE_FILE, 'utf8');
     return JSON.parse(content);
   } catch {
@@ -58,9 +64,11 @@ function readStore() {
  * @param {object} store
  */
 function writeStore(store) {
+  // The token store holds macaroons + preimages — a reusable bearer
+  // credential pair (audit: previously umask-dependent 0644). Atomic, 0600,
+  // symlink-refusing (mirrors l402-root-key and the Spark state dir).
   try {
-    fs.mkdirSync(STORE_DIR, { recursive: true });
-    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), 'utf8');
+    writeSecureFileAtomic(STORE_FILE, JSON.stringify(store, null, 2));
   } catch (err) {
     throw new Error(`Failed to write token store: ${err.message}`);
   }

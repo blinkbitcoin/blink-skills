@@ -81,7 +81,7 @@ const TRANSACTIONS_QUERY = `
 `;
 
 function parseArgs(argv) {
-  const args = { first: 20, after: null, wallet: null };
+  const args = { first: 20, after: null, wallet: null, includePreimage: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--first' && argv[i + 1]) {
       args.first = parseInt(argv[++i], 10);
@@ -89,6 +89,8 @@ function parseArgs(argv) {
       if (args.first > 100) args.first = 100;
     } else if (argv[i] === '--after' && argv[i + 1]) {
       args.after = argv[++i];
+    } else if (argv[i] === '--include-preimage') {
+      args.includePreimage = true;
     } else if (argv[i] === '--wallet' && argv[i + 1]) {
       args.wallet = argv[++i].toUpperCase();
       if (args.wallet !== 'BTC' && args.wallet !== 'USD') {
@@ -166,7 +168,12 @@ async function main() {
       if (tx.settlementVia.transactionHash) {
         result.onchainTxHash = tx.settlementVia.transactionHash;
       }
-      if (tx.settlementVia.preImage) {
+      // SECURITY (audit + field-test cross-reference): preimages are
+      // reusable L402 BEARER CREDENTIALS — 3 of 4 cached L402 tokens had
+      // their preimages recoverable verbatim from this read-only listing.
+      // Suppressed unless --include-preimage is passed deliberately;
+      // paymentHash (the non-secret correlator) is always present.
+      if (args.includePreimage && tx.settlementVia.preImage) {
         result.preImage = tx.settlementVia.preImage;
       }
     }

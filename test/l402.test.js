@@ -2426,3 +2426,385 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
   });
 });
+
+// ── Security-audit fixes (v2.6.1) ─────────────────────────────────────────────
+
+const { assertAllowedUrl, fetchWithRetry } = require(path.join(scriptsDir, '_lnurl'));
+const { writeSecureFileAtomic, ensureSecureStateDir } = require(path.join(scriptsDir, '_secure_files'));
+const { getAllowHosts } = require(path.join(scriptsDir, '_budget'));
+
+describe('security: L402 SSRF guard (audit fix 1)', () => {
+  it('refuses private/loopback/metadata targets even with NO allowlist configured', () => {
+    for (const bad of [
+      'http://127.0.0.1:8080/x',
+      'http://localhost:6379/x',
+      'http://169.254.169.254/latest/meta-data',
+      'http://10.0.0.5/internal',
+      'http://192.168.1.10/admin',
+      'http://[::ffff:169.254.169.254]/metadata', // IPv4-mapped IPv6 (hex re-serialisation)
+      'file:///etc/passwd', // unsupported scheme
+    ]) {
+      assert.throws(
+        () => assertAllowedUrl(bad, null, 'test', { strictLocal: true }),
+        (e) => e.code === 'URL_POLICY',
+        bad,
+      );
+    }
+  });
+
+  it('permits an explicitly allowlisted local host (regtest/dev pattern)', () => {
+    const url = assertAllowedUrl('http://127.0.0.1:8080/x', new Set(['127.0.0.1']), 'test', {
+      portsUnrestricted: true,
+    });
+    assert.equal(url.hostname, '127.0.0.1');
+  });
+
+  it('public https passes with no allowlist; policy errors are tagged URL_POLICY', () => {
+    const url = assertAllowedUrl('https://api.example.com/resource', null, 'test');
+    assert.equal(url.hostname, 'api.example.com');
+  });
+
+  it('a redirect to a private target is refused per hop (manual redirects)', async () => {
+    const hops = [{ status: 302, location: 'http://169.254.169.254/latest' }];
+    let calls = 0;
+    const origFetch = global.fetch;
+    global.fetch = async () => {
+      const hop = hops[calls++];
+      return {
+        status: hop.status,
+        headers: { get: (n) => (n === 'location' ? hop.location : null) },
+      };
+    };
+    try {
+      await assert.rejects(
+        () =>
+          fetchWithRetry('https://public.example/start', {
+            allowedHosts: null,
+            what: 'redirect probe',
+            retries: 0,
+          }),
+        (e) => e.code === 'URL_POLICY' && /169\.254\.169\.254/.test(e.message),
+      );
+      assert.equal(calls, 1, 'the redirect was followed manually exactly once');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('a CROSS-ORIGIN redirect strips credential headers (Authorization/Cookie/Proxy-Authorization)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'secret-body',
+        headers: {
+          Authorization: 'L402 mac:pre',
+          Cookie: 'session=1',
+          'Proxy-Authorization': 'Basic x',
+          'X-Custom': 'keep',
+        },
+        retries: 0,
+        what: 'cred probe',
+      });
+      assert.equal(seen.length, 2);
+      assert.equal(seen[0].headers.Authorization, 'L402 mac:pre', 'first hop carries the credential');
+      const second = seen[1].headers;
+      assert.equal(second.Authorization, undefined, 'Authorization stripped cross-origin (round-1 HIGH defect)');
+      assert.equal(second.Cookie, undefined, 'Cookie stripped');
+      assert.equal(second['Proxy-Authorization'], undefined, 'Proxy-Authorization stripped');
+      assert.equal(second['X-Custom'], 'keep', 'non-credential headers forwarded');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('a SAME-ORIGIN redirect preserves credential headers and body', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://first.example/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        headers: { Authorization: 'L402 mac:pre' },
+        retries: 0,
+        what: 'same-origin probe',
+      });
+      assert.equal(seen[1].headers.Authorization, 'L402 mac:pre', 'same-origin hop keeps credentials');
+      // 302 + POST -> GET per Fetch spec (body dropped), header preserved.
+      assert.equal(seen[1].method, 'GET');
+      assert.equal(seen[1].body, undefined);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('POST + 307 preserves method AND body (cross-origin still strips credentials)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...opts.headers } });
+      if (seen.length === 1) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        headers: { Authorization: 'L402 mac:pre' },
+        retries: 0,
+        what: '307 probe',
+      });
+      assert.equal(seen[1].method, 'POST', '307 preserves the method');
+      assert.equal(seen[1].body, 'payload', '307 preserves the body');
+      assert.equal(seen[1].headers.Authorization, undefined, 'cross-origin still strips credentials');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('303 rewrites ANY method to GET (body dropped)', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ method: opts.method, body: opts.body });
+      if (seen.length === 1) {
+        return { status: 303, headers: { get: (n) => (n === 'location' ? '/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'DELETE',
+        body: 'x',
+        retries: 0,
+        what: '303 probe',
+      });
+      assert.equal(seen[1].method, 'GET', '303 forces GET even for DELETE');
+      assert.equal(seen[1].body, undefined);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('getAllowHosts: configured allowlist -> Set; unconfigured -> null', async () => {
+    const os = require('node:os');
+    const fsMod = require('node:fs');
+    const pathMod = require('node:path');
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-allowhosts-'));
+    const savedHome = os.homedir;
+    os.homedir = () => tmp;
+    const budgetPath = require.resolve(path.join(scriptsDir, '_budget'));
+    const savedBudget = require.cache[budgetPath];
+    delete require.cache[budgetPath]; // BLINK_DIR binds at module load — rebind to tmp HOME
+    const { getAllowHosts: freshGetAllowHosts } = require(budgetPath);
+    try {
+      assert.equal(freshGetAllowHosts(), null, 'no budget config -> null (guard: public-only, no private)');
+      fsMod.mkdirSync(pathMod.join(tmp, '.blink'), { recursive: true });
+      fsMod.writeFileSync(
+        pathMod.join(tmp, '.blink', 'budget.json'),
+        JSON.stringify({ hourlyLimitSats: null, dailyLimitSats: 1000, allowlist: ['Example.COM', '127.0.0.1'] }),
+      );
+      const hosts = freshGetAllowHosts();
+      assert.ok(hosts instanceof Set);
+      assert.deepEqual([...hosts].sort(), ['127.0.0.1', 'example.com'], 'entries lowercased');
+    } finally {
+      if (savedBudget) require.cache[budgetPath] = savedBudget;
+      else delete require.cache[budgetPath];
+      os.homedir = savedHome;
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('security: secure state files (audit fix 2)', () => {
+  const os = require('node:os');
+  const fsMod = require('node:fs');
+  const pathMod = require('node:path');
+
+  it('writes 0600 atomically in a 0700 dir; migrates pre-existing 0644 files', () => {
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-perms-'));
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true }); // loose dir, default mode
+      // A legacy world-readable state file (the audit's live finding).
+      const legacy = pathMod.join(dir, 'l402-tokens.json');
+      fsMod.writeFileSync(legacy, '{"old": 1}', { mode: 0o644 });
+      fsMod.chmodSync(legacy, 0o644);
+
+      writeSecureFileAtomic(pathMod.join(dir, 'budget.json'), '{}');
+      ensureSecureStateDir(dir); // migration pass
+
+      const dirMode = fsMod.statSync(dir).mode & 0o777;
+      assert.equal(dirMode, 0o700, 'dir tightened to 0700');
+      assert.equal(fsMod.statSync(legacy).mode & 0o777, 0o600, 'legacy 0644 token store migrated to 0600');
+      assert.equal(fsMod.statSync(pathMod.join(dir, 'budget.json')).mode & 0o777, 0o600, 'new file 0600');
+      assert.ok(!fsMod.existsSync(pathMod.join(dir, 'budget.json.' + process.pid + '.tmp')), 'no temp residue');
+    } finally {
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to write through a symlink', () => {
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-symlink-'));
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const realTarget = pathMod.join(tmp, 'evil.json');
+      fsMod.writeFileSync(realTarget, '');
+      const link = pathMod.join(dir, 'l402-tokens.json');
+      fsMod.symlinkSync(realTarget, link);
+      assert.throws(() => writeSecureFileAtomic(link, '{}'), /symlink/);
+    } finally {
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('security: auth endpoint validation (audit fix 3)', () => {
+  const clientPath = path.resolve(scriptsDir, '_blink_client.js');
+
+  function freshClient() {
+    delete require.cache[require.resolve(clientPath)];
+    return require(clientPath);
+  }
+
+  it('https Blink hosts pass; staging workflow unaffected', () => {
+    const saved = {
+      api: process.env.BLINK_API_URL,
+      ws: process.env.BLINK_WS_URL,
+      opt: process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST,
+    };
+    try {
+      process.env.BLINK_API_URL = 'https://api.staging.blink.sv/graphql';
+      delete process.env.BLINK_WS_URL;
+      delete process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST;
+      const client = freshClient();
+      assert.equal(client.getApiUrl(), 'https://api.staging.blink.sv/graphql');
+      const ws = new URL(client.getWsUrl());
+      assert.equal(ws.protocol, 'wss:', 'no https->ws downgrade — staging gets wss');
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it('http API override refused (even Blink hosts); ws:// refused for non-local', () => {
+    const saved = {
+      api: process.env.BLINK_API_URL,
+      ws: process.env.BLINK_WS_URL,
+      opt: process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST,
+    };
+    try {
+      delete process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST;
+      process.env.BLINK_API_URL = 'http://api.blink.sv/graphql';
+      assert.throws(() => freshClient().getApiUrl(), /must use https/);
+
+      process.env.BLINK_WS_URL = 'ws://api.blink.sv/ws';
+      assert.throws(() => freshClient().getWsUrl(), /must use wss/);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it('non-Blink host refused without opt-in; localhost http allowed (regtest); opt-in unlocks custom host', () => {
+    const saved = {
+      api: process.env.BLINK_API_URL,
+      ws: process.env.BLINK_WS_URL,
+      opt: process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST,
+    };
+    try {
+      delete process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST;
+      process.env.BLINK_API_URL = 'https://evil.example/graphql';
+      assert.throws(() => freshClient().getApiUrl(), /BLINK_ALLOW_CUSTOM_AUTH_HOST/);
+
+      process.env.BLINK_API_URL = 'http://127.0.0.1:4000/graphql';
+      assert.equal(freshClient().getApiUrl(), 'http://127.0.0.1:4000/graphql', 'local regtest endpoint allowed');
+
+      process.env.BLINK_API_URL = 'https://proxy.myorg.dev/graphql';
+      process.env.BLINK_ALLOW_CUSTOM_AUTH_HOST = '1';
+      assert.equal(freshClient().getApiUrl(), 'https://proxy.myorg.dev/graphql', 'explicit opt-in unlocks it');
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});
+
+describe('security: preimage suppression in transactions (audit fix 4)', () => {
+  const txScript = path.join(scriptsDir, 'transactions.js');
+
+  function runWithTx(settlementVia, extraArgs = []) {
+    return new Promise((resolve) => {
+      const { execFile } = require('node:child_process');
+      const origEnv = { ...process.env };
+      // The child replaces the client's graphqlRequest with a stub, so no
+      // network is touched; BLINK_API_KEY just satisfies the credential gate.
+      execFile(
+        process.execPath,
+        [
+          '-e',
+          `
+          const path = require('path');
+          const clientPath = ${JSON.stringify(path.resolve(scriptsDir, '_blink_client.js'))};
+          const client = require(clientPath);
+          client.graphqlRequest = async () => ({
+            me: {
+              defaultAccount: {
+                transactions: {
+                  edges: [
+                    { node: { id: 't1', direction: 'SEND', status: 'SUCCESS', settlementAmount: 5, settlementCurrency: 'BTC', settlementDisplayAmount: 5, settlementDisplayCurrency: 'BTC', settlementFee: 0, initiationVia: { paymentHash: 'aa' }, settlementVia: ${JSON.stringify(settlementVia)} } },
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          });
+          process.argv = ['node', 'transactions.js', ...${JSON.stringify(extraArgs)}];
+          Promise.resolve(require(${JSON.stringify(txScript)}).main())
+            .then(() => process.exit(0))
+            .catch((e) => { console.error(e.message); process.exit(1); });
+        `,
+        ],
+        { env: { ...origEnv, BLINK_API_KEY: 'k' } },
+        (err, stdout) => resolve({ err, stdout: String(stdout) }),
+      );
+    });
+  }
+
+  it('preImage is suppressed by default and present with --include-preimage', async () => {
+    const via = { preImage: 'f'.repeat(64) };
+    const suppressed = await runWithTx(via);
+    assert.ok(!suppressed.err, suppressed.err && suppressed.err.message);
+    const j1 = JSON.parse(suppressed.stdout);
+    assert.equal(j1.transactions[0].preImage, undefined, 'bearer credential suppressed by default');
+    assert.equal(j1.transactions[0].paymentHash, 'aa', 'non-secret correlator always present');
+
+    const included = await runWithTx(via, ['--include-preimage']);
+    const j2 = JSON.parse(included.stdout);
+    assert.equal(j2.transactions[0].preImage, 'f'.repeat(64), 'deliberate export includes it');
+  });
+});
