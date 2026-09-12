@@ -55,7 +55,9 @@ function loadSdkModule() {
   console.warn = noop;
   console.error = noop;
   try {
-    return require(SPARK_PACKAGE);
+    const mod = require(SPARK_PACKAGE);
+    silenceSdkLogger(mod);
+    return mod;
   } catch (err) {
     // Restore before throwing so the error is actually visible.
     console.log = saved.log;
@@ -72,6 +74,28 @@ function loadSdkModule() {
     console.log = saved.log;
     console.warn = saved.warn;
     console.error = saved.error;
+  }
+}
+
+/**
+ * Route every SDK log entry to a noop sink. Post-init SDK chatter — notably
+ * "Skipping redundant payment event: …" replayed on stdout after recent
+ * payment activity (observed live, field tests 2/3: spark_balance and
+ * spark_send emitted SDK lines into stdout, breaking the all-JSON contract
+ * for any consumer piping the output) — flows through the SDK's own logger
+ * (initLogging), so a noop logger silences it at the source. The require()
+ * muzzle above only covers load-time noise, which predates the logger.
+ * Best-effort: older SDK builds without initLogging are left as-is.
+ * @param {object} mod  the loaded SDK module
+ */
+function silenceSdkLogger(mod) {
+  try {
+    if (mod && typeof mod.initLogging === 'function') {
+      // Fire-and-forget: initLogging is async; failures must never break loading.
+      Promise.resolve(mod.initLogging({ log: () => {} })).catch(() => {});
+    }
+  } catch {
+    // Never let log silencing interfere with SDK availability.
   }
 }
 
@@ -651,6 +675,13 @@ async function waitForStableBalance(sdk, { maxWaitMs = 5000, intervalMs = 1000 }
 /**
  * Normalize a single Payment record from listPayments() defensively across
  * SDK versions.
+ *
+ * Token payments (method 'token' / details.type 'token') carry amounts in
+ * TOKEN BASE UNITS, not sats — funnelling them into amountSats mislabels a
+ * $0.999 USDB receive as "999,001 sats" (~$770 at 1293 sats/$; observed in
+ * live field test 3). Token rows therefore emit amountSats/feeSats: null and
+ * carry the base-unit amount as a precision string plus token metadata,
+ * mirroring the tokenBalances shape (balance string + decimals + formatted).
  * @param {object} p
  * @returns {object}
  */
@@ -666,13 +697,39 @@ function normalizePayment(p) {
   else if (has(p.feesSats)) fee = p.feesSats;
   else if (has(p.feeSats)) fee = p.feeSats;
 
-  return {
+  const base = {
     id: p.id || p.paymentHash || p.txId || null,
     type: p.paymentType || p.type || null, // "send" | "receive"
     status: p.status || null,
+    timestamp: has(p.timestamp) ? Number(p.timestamp) : null,
+  };
+
+  const details = p.details && typeof p.details === 'object' ? p.details : null;
+  if (p.method === 'token' || (details && details.type === 'token')) {
+    const meta = (details && details.metadata && typeof details.metadata === 'object' && details.metadata) || {};
+    const decimals = has(meta.decimals) ? meta.decimals : null;
+    return {
+      ...base,
+      asset: 'token',
+      amountSats: null,
+      feeSats: null,
+      amountBaseUnits: has(amount) ? String(amount) : null,
+      feeBaseUnits: has(fee) ? String(fee) : null,
+      amountFormatted: has(amount) && decimals !== null ? formatTokenAmount(amount, decimals) : null,
+      token: {
+        ticker: meta.ticker || null,
+        name: meta.name || null,
+        decimals,
+        identifier: meta.identifier || meta.tokenIdentifier || null,
+      },
+    };
+  }
+
+  return {
+    ...base,
+    asset: 'btc',
     amountSats: has(amount) ? Number(amount) : null,
     feeSats: has(fee) ? Number(fee) : null,
-    timestamp: has(p.timestamp) ? Number(p.timestamp) : null,
   };
 }
 

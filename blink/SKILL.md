@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.4.0
+version: 2.5.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.4.0'
+    version: '2.5.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -147,7 +147,7 @@ These rules are mandatory for any AI agent using this skill:
    - **Non-custodial seed is sacred.** `SPARK_MNEMONIC` grants full spend authority over a self-custodial account. Never log, echo, display, transmit, or write it. It is read only from the environment variable, never from files.
 2. **Dry-run first.** For swaps, always run with `--dry-run` before executing for real unless the user explicitly says to skip it.
 3. **Check balance before sending.** Always run `balance` before any payment or swap to verify sufficient funds.
-4. **Probe fees before paying.** Run `fee-probe` before `pay-invoice` to show the user the fee cost.
+4. **Probe fees before paying.** Run `fee-probe` before `pay-invoice` to show the user the fee cost. Note: probing an invoice your OWN wallet issued fails with `CANT_PAY_SELF` (the probe runs a real prepare) — classify ownership with `resolve-receiver` first, and probe with the wallet that will actually pay.
 5. **Use minimum scopes.** Only request Write-scoped API keys when send operations are actually needed.
 6. **Never log or display the API key.** Treat `BLINK_API_KEY` as a secret. Do not echo it, include it in messages, or write it to files.
 7. **Prefer staging for testing.** When the user is testing or learning, suggest setting `BLINK_API_URL` to the staging endpoint.
@@ -535,6 +535,10 @@ Subject to the same budget controls as the custodial pay commands: configured li
 
 **Token mode** (USDB and other BTKN tokens): `--token` sends tokens to a Spark address or Spark invoice; the amount is decimal token units (`10.5` USDB) resolved via the token's decimals, or raw base units with `--base-units` (`10500000` = 10.5 USDB at 6 decimals). `--from-btc` pays a token send by converting BTC on the fly — the **sats side of the conversion estimate is budget-enforced**, an absent/zero/unusable estimate refuses to dispatch unless `--force` is passed, and outcome-unknown post-dispatch errors keep the reservation fail-closed (only an explicit terminal `failed` releases it). `--from-token` pays a BOLT-11 invoice by converting tokens: the **invoice's BTC amount is authoritative** — a supplied amount that mismatches the invoice is rejected before dispatch (dry-runs included), and outputs emit the authoritative amount. No sats leave the wallet on `--from-token`, so the sats budget does not apply (tokens are spent). `--slippage-bps` caps conversion slippage (default 50 bps; failed conversions auto-refund per the SDK). Plain token sends are outside the sats budget by design. The `conversionEstimate` in the prepare output (`amountIn` source asset → `amountOut` target asset, `fee`) is the quote — dry-run or `spark-fee-probe` to see it without sending.
 
+**Live-tested conversion facts (field test 3):** the minimum conversion is **800 sats** per `--from-btc` leg — budget ≥1000 sats per leg (sub-minimum amounts abort with `Amount … is less than minimum required 800`). Conversion spreads are tight (~0.1–0.12% round-trip vs ~1.7% on custodial cent-granularity swaps — token decimals, not fee schedules). Two SDK constraints: a **token-only send to your own invoice is refused** (`Self payment not allowed`) — a `--from-btc` conversion to the same invoice works (conversions are not transfers), so single-wallet token testing uses conversions, and a genuine wallet→wallet token transfer needs a second wallet. Receiving via BOLT-11 (an app-minted USD Lightning invoice) credits USDB server-side with spark sats unchanged.
+
+In `spark-transactions` output, token rows carry `asset: "token"` with `amountBaseUnits` (precision string), `amountFormatted`, and `token` metadata — `amountSats` is `null` on token rows (base units are not sats; a $0.999 USDB receive is `999001` base units, never "999,001 sats"). BTC rows carry `asset: "btc"` and the usual `amountSats`/`feeSats`.
+
 > **AGENT:** This command spends self-custodial funds irreversibly. Probe the fee (`spark-fee-probe` or `--dry-run`) first, then confirm the amount and destination with the user before executing.
 
 ### Spark Fee Probe
@@ -831,15 +835,29 @@ Second JSON (when payment resolves):
 {
   "accountType": "spark",
   "network": "mainnet",
-  "count": 1,
+  "count": 2,
   "transactions": [
     {
       "id": "abc123",
       "type": "receive",
       "status": "COMPLETED",
+      "asset": "btc",
       "amountSats": 1000,
       "feeSats": 0,
       "timestamp": 1740000000
+    },
+    {
+      "id": "07bc5d3e:0",
+      "type": "receive",
+      "status": "COMPLETED",
+      "asset": "token",
+      "amountSats": null,
+      "feeSats": null,
+      "amountBaseUnits": "999001",
+      "feeBaseUnits": "0",
+      "amountFormatted": "0.999001",
+      "token": { "ticker": "USDB", "name": "USD Beacon", "decimals": 6, "identifier": "btkn1..." },
+      "timestamp": 1740000060
     }
   ],
   "pageInfo": { "hasNextPage": false, "limit": 20, "offset": 0 }

@@ -428,6 +428,38 @@ describe('CLI: spark commands return instead of hanging', () => {
     assert.equal(JSON.parse(stdout).count, 1);
   });
 
+  // Field test 3 (live): the wallet's real USDB receive surfaced as
+  // amountSats: 999001 — a $0.999 receive presented as ~$770 of sats.
+  // End-to-end through the CLI: token rows must carry base units + metadata.
+  it('spark-transactions renders token rows in base units, never sats (FT3 defect)', async () => {
+    const payments = JSON.stringify([
+      {
+        id: '07bc5d3e:0',
+        paymentType: 'receive',
+        status: 'completed',
+        amount: '999001',
+        fees: '0',
+        timestamp: 1710000000,
+        method: 'token',
+        details: {
+          type: 'token',
+          metadata: { ticker: 'USDB', decimals: 6, name: 'USD Beacon', identifier: 'btkn1xgrvjwey5' },
+        },
+      },
+    ]);
+    const { code, stdout } = await runCli(['spark-transactions'], { env: { SPARK_STUB_PAYMENTS: payments } });
+    assert.equal(code, 0);
+    const j = JSON.parse(stdout);
+    assert.equal(j.count, 1);
+    const row = j.transactions[0];
+    assert.equal(row.asset, 'token');
+    assert.equal(row.amountSats, null, 'a $0.999 USDB receive must never appear as 999,001 sats');
+    assert.equal(row.amountBaseUnits, '999001');
+    assert.equal(row.amountFormatted, '0.999001');
+    assert.equal(row.token.ticker, 'USDB');
+    assert.equal(row.token.decimals, 6);
+  });
+
   it('spark-subscribe honours its timeout and exits', async () => {
     const { code, stdout, killed } = await runCli(['spark-subscribe', '--timeout', '1']);
     assert.ok(!killed, 'subscribe must exit on its own timeout');

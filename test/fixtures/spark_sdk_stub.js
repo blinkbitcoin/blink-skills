@@ -391,14 +391,43 @@ const stub = {
     const info = await sdk.getInfo({ ensureSynced: true });
     return { balanceSats: Number(info.balanceSats), stable: true };
   },
-  normalizePayment: (p) => ({
-    id: p.id || null,
-    type: p.paymentType || null,
-    status: p.status || null,
-    amountSats: p.amount === undefined ? null : Number(p.amount),
-    feeSats: p.fees === undefined ? null : Number(p.fees),
-    timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
-  }),
+  // Mirror of the real _spark_sdk.normalizePayment — token rows carry BASE
+  // UNITS (amountSats must be null for them; a $0.999 USDB receive is NOT
+  // "999,001 sats"). Mirrors the production token shape incl. amountFormatted.
+  normalizePayment: (p) => {
+    const details = p.details && typeof p.details === 'object' ? p.details : null;
+    const base = {
+      id: p.id || null,
+      type: p.paymentType || p.type || null,
+      status: p.status || null,
+      timestamp: p.timestamp === undefined ? null : Number(p.timestamp),
+    };
+    if (p.method === 'token' || (details && details.type === 'token')) {
+      const meta = (details && details.metadata) || {};
+      const decimals = meta.decimals === undefined ? null : meta.decimals;
+      return {
+        ...base,
+        asset: 'token',
+        amountSats: null,
+        feeSats: null,
+        amountBaseUnits: p.amount === undefined ? null : String(p.amount),
+        feeBaseUnits: p.fees === undefined ? null : String(p.fees),
+        amountFormatted: p.amount !== undefined && decimals !== null ? formatTokenAmount(p.amount, decimals) : null,
+        token: {
+          ticker: meta.ticker || null,
+          name: meta.name || null,
+          decimals,
+          identifier: meta.identifier || meta.tokenIdentifier || null,
+        },
+      };
+    }
+    return {
+      ...base,
+      asset: 'btc',
+      amountSats: p.amount === undefined ? null : Number(p.amount),
+      feeSats: p.fees === undefined ? null : Number(p.fees),
+    };
+  },
 };
 
 const realLoad = Module._load;

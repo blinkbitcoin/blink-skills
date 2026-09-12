@@ -390,6 +390,56 @@ describe('_spark_sdk.normalizePayment', () => {
     const p = spark.normalizePayment({ amount: 200n });
     assert.equal(p.feeSats, null);
     assert.equal(p.amountSats, 200);
+    assert.equal(p.asset, 'btc');
+  });
+
+  // Field test 3 (live): the SDK hands over method/details with everything
+  // needed, but the old funnel put 999,001 BASE UNITS into amountSats —
+  // presenting a $0.999 USDB receive as ~$770 worth of sats.
+  it('token payments carry base units + metadata, NEVER amountSats (FT3 defect)', () => {
+    const p = spark.normalizePayment({
+      id: '07bc5d3e:0',
+      paymentType: 'receive',
+      status: 'completed',
+      amount: '999001',
+      fees: '0',
+      method: 'token',
+      details: {
+        type: 'token',
+        metadata: { ticker: 'USDB', decimals: 6, name: 'USD Beacon', identifier: 'btkn1xgrvjwey5' },
+      },
+    });
+    assert.equal(p.asset, 'token');
+    assert.equal(p.amountSats, null, 'a token amount must never pose as sats');
+    assert.equal(p.feeSats, null);
+    assert.equal(p.amountBaseUnits, '999001', 'precision string, not Number-lossy');
+    assert.equal(p.feeBaseUnits, '0');
+    assert.equal(p.amountFormatted, '0.999001');
+    assert.deepEqual(p.token, {
+      ticker: 'USDB',
+      name: 'USD Beacon',
+      decimals: 6,
+      identifier: 'btkn1xgrvjwey5',
+    });
+  });
+
+  it('a token row without decimals omits amountFormatted but still nulls amountSats', () => {
+    const p = spark.normalizePayment({ method: 'token', amount: 42n, details: { type: 'token', metadata: {} } });
+    assert.equal(p.asset, 'token');
+    assert.equal(p.amountSats, null);
+    assert.equal(p.amountBaseUnits, '42');
+    assert.equal(p.amountFormatted, null);
+    assert.equal(p.token.decimals, null);
+  });
+
+  it('details.type token alone (no method field) is also classified as a token row', () => {
+    const p = spark.normalizePayment({
+      amount: 5n,
+      details: { type: 'token', metadata: { ticker: 'USDB', decimals: 6 } },
+    });
+    assert.equal(p.asset, 'token');
+    assert.equal(p.amountSats, null);
+    assert.equal(p.amountFormatted, '0.000005');
   });
 });
 
