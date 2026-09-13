@@ -24,6 +24,7 @@ const os = require('node:os');
 // ── Paths ────────────────────────────────────────────────────────────────────
 
 const BLINK_DIR = path.join(os.homedir(), '.blink');
+const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
 const CONFIG_FILE = path.join(BLINK_DIR, 'budget.json');
 const LOG_FILE = path.join(BLINK_DIR, 'spending-log.json');
 
@@ -81,6 +82,11 @@ function validateConfigObject(parsed) {
 }
 
 function readConfigFile() {
+  try {
+    ensureSecureStateDir(BLINK_DIR); // one-time migration of 0644-era state
+  } catch {
+    // Best-effort hardening — a read-only HOME must not break budget reads.
+  }
   let content;
   try {
     content = fs.readFileSync(CONFIG_FILE, 'utf8');
@@ -179,10 +185,8 @@ function writeConfig(config) {
   // Writers and readers share one schema: refuse to persist state the reader
   // would reject (e.g. an unsafe-integer limit rounded by a permissive parse).
   validateConfigObject(config);
-  fs.mkdirSync(BLINK_DIR, { recursive: true });
-  const tmp = `${CONFIG_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf8');
-  fs.renameSync(tmp, CONFIG_FILE);
+  ensureSecureStateDir(BLINK_DIR);
+  writeSecureFileAtomic(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 // ── Spending log I/O ─────────────────────────────────────────────────────────
@@ -233,7 +237,7 @@ function sleepSync(ms) {
  * @throws {Error} code BUDGET_LOCK_TIMEOUT.
  */
 function acquireLogLock() {
-  fs.mkdirSync(BLINK_DIR, { recursive: true });
+  ensureSecureStateDir(BLINK_DIR);
   const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const deadline = Date.now() + lockTiming.acquireTimeoutMs;
   for (;;) {
@@ -467,10 +471,8 @@ function writeLog(entries) {
   for (const [i, entry] of pruned.entries()) {
     validateLogEntry(entry, i, seenIds);
   }
-  fs.mkdirSync(BLINK_DIR, { recursive: true });
-  const tmp = `${LOG_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(pruned, null, 2), 'utf8');
-  fs.renameSync(tmp, LOG_FILE);
+  ensureSecureStateDir(BLINK_DIR);
+  writeSecureFileAtomic(LOG_FILE, JSON.stringify(pruned, null, 2));
 }
 
 // ── Budget check ─────────────────────────────────────────────────────────────
@@ -645,6 +647,20 @@ function getStatus(opts = {}) {
  * @param {boolean} [opts.requireConfigured=true]  Deny when allowlist is empty.
  * @returns {{ allowed: boolean, reason?: string, allowlist: string[] }}
  */
+/**
+ * The configured L402 domain allowlist as a Set for the URL-policy guard
+ * (entries may be `host` or `host:port`), or null when no allowlist is
+ * configured — in which case the guard still enforces private-address and
+ * scheme rules (opting out of the allowlist is not opting in to internal
+ * network access).
+ *
+ * @returns {Set<string>|null}
+ */
+function getAllowHosts() {
+  const config = getConfig();
+  return config.allowlist.length > 0 ? new Set(config.allowlist.map((d) => d.toLowerCase())) : null;
+}
+
 function checkDomainAllowed(domain, opts = {}) {
   const requireConfigured = opts.requireConfigured !== false;
   const config = getConfig();
@@ -959,6 +975,7 @@ module.exports = {
 
   // Config
   getConfig,
+  getAllowHosts,
   readConfigFile,
   writeConfig,
 

@@ -58,7 +58,19 @@ const {
 
 const { saveToken, getToken } = require('./l402_store');
 
-const { reserveBudget, checkBudget, checkDomainAllowed, settleSpend, releaseSpend } = require('./_budget');
+const {
+  reserveBudget,
+  checkBudget,
+  checkDomainAllowed,
+  settleSpend,
+  releaseSpend,
+  getAllowHosts,
+} = require('./_budget');
+// The URL-policy guard shared with the LNURL flows: private/loopback/link-local
+// address rejection (incl. IPv4-mapped IPv6), manual redirects re-validated
+// per hop, hop limit, and the budget allowlist when configured (audit FT:
+// these scripts previously used bare fetch with redirect:'follow').
+const { fetchWithRetry, assertAllowedUrl } = require('./_lnurl');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -280,14 +292,20 @@ function parseArgs(argv) {
  * @param {number} [timeoutMs=15000]
  * @returns {Promise<Response>}
  */
-async function fetchWithTimeout(url, options, timeoutMs = 15_000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts = null) {
+  // Guarded fetch: every hop of every redirect is re-validated by
+  // assertAllowedUrl inside fetchWithRetry (manual redirects). Retries stay 0
+  // here — the original wrapper was single-attempt, and blind retries of a
+  // timed-out POST could double-pay a non-idempotent request.
+  return fetchWithRetry(url, {
+    timeoutMs,
+    retries: 0,
+    allowedHosts,
+    what: 'L402 resource',
+    portsUnrestricted: true,
+    strictLocal: true,
+    ...options,
+  });
 }
 
 /**
@@ -310,22 +328,27 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000) {
  * @returns {Promise<string>}  The canonical URL (post-redirect), or the
  *                             original URL if resolution fails.
  */
-async function resolveCanonicalUrl(url, timeoutMs = 10_000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function resolveCanonicalUrl(url, timeoutMs = 10_000, allowedHosts = null) {
+  // Policy first, synchronously: a refused target must abort the whole flow,
+  // never fall back to fetching it anyway.
+  assertAllowedUrl(url, allowedHosts, 'L402 URL', { portsUnrestricted: true, strictLocal: true });
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       method: 'HEAD',
-      redirect: 'follow',
-      signal: controller.signal,
+      timeoutMs,
+      retries: 1,
+      allowedHosts,
+      what: 'L402 URL',
+      portsUnrestricted: true,
+      strictLocal: true,
     });
-    // res.url is the final URL after all redirects; fall back to input if empty.
+    // res.url is the final URL after the (manually re-validated) redirects;
+    // fall back to input if empty.
     return res.url || url;
-  } catch {
+  } catch (err) {
+    if (err && err.code === 'URL_POLICY') throw err; // a redirect went hostile
     // Network error, timeout, or server that rejects HEAD — degrade gracefully.
     return url;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -371,7 +394,7 @@ function extractStoreKey(url) {
  * @param {Response} res
  * @returns {Promise<{ invoice: string, macaroon: string, format: string } | null>}
  */
-async function resolveL402Challenge(res) {
+async function resolveL402Challenge(res, allowedHosts = null) {
   // Try Lightning Labs format (WWW-Authenticate header)
   const wwwAuth = res.headers.get('www-authenticate') || '';
   const lightningLabs = parseLightningLabsHeader(wwwAuth);
@@ -398,7 +421,7 @@ async function resolveL402Challenge(res) {
   if (!l402proto.paymentRequestUrl) return null;
 
   console.error(`Fetching payment request from: ${l402proto.paymentRequestUrl}`);
-  const fetched = await fetchL402ProtocolInvoice(l402proto.paymentRequestUrl);
+  const fetched = await fetchL402ProtocolInvoice(l402proto.paymentRequestUrl, undefined, allowedHosts);
   if (!fetched) return null;
 
   // For l402-protocol format, the "macaroon" is the token returned after payment.
@@ -471,13 +494,48 @@ async function main() {
     process.exit(1);
   }
 
-  // ── Resolve canonical URL (follow any HTTP redirects) ──
+  // ── URL policy (pre-flight, before ANY outbound request) ──
+  // Security-audit fix: the domain gate used to run ~200 lines AFTER the
+  // first network request (canonicalization + challenge probe), so an agent
+  // handed a hostile URL probed it before any policy check. Non-dry-run now
+  // refuses on the SUPPLIED URL's domain before a single byte leaves the
+  // machine; the canonical-domain gate below still catches cross-domain
+  // redirects at payment time. All fetches (including the server-supplied
+  // l402-protocol payment_request_url) route through the shared SSRF guard.
+  const allowHosts = getAllowHosts();
+  if (!args.dryRun) {
+    // requireConfigured:false — an UNCONFIGURED allowlist leaves probing open
+    // (the documented free-resource discovery mode; still SSRF-guarded, and
+    // payment below remains fail-closed), but WHEN a policy exists it now
+    // gates every outbound request, not only the payment itself.
+    const preflight = checkDomainAllowed(extractDomain(args.url), { requireConfigured: false });
+    if (!preflight.allowed) {
+      console.log(
+        JSON.stringify(
+          {
+            event: 'l402_domain_blocked',
+            url: args.url,
+            domain: extractDomain(args.url),
+            allowlist: preflight.allowlist,
+            message:
+              preflight.reason ||
+              `Domain "${extractDomain(args.url)}" is not in the L402 allowlist. Add with: blink budget allowlist add ${extractDomain(args.url)}`,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exit(1);
+    }
+  }
+
+  // ── Resolve canonical URL (follow any HTTP redirects — guarded) ──
   // This must happen before the token cache lookup and before any fetch so
   // that: (a) the cache key is the canonical domain, and (b) the L402
   // Authorization header is not stripped by fetch when following redirects
   // from a non-canonical URL (WHATWG Fetch spec forbids forwarding
   // Authorization across cross-host redirects).
-  const canonicalUrl = await resolveCanonicalUrl(args.url);
+  const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
   }
@@ -497,11 +555,16 @@ async function main() {
       console.error('Retrying request with cached token...');
 
       const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
-      const res = await fetchWithTimeout(canonicalUrl, {
-        method: args.method,
-        headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
-        ...(args.body ? { body: args.body } : {}),
-      });
+      const res = await fetchWithTimeout(
+        canonicalUrl,
+        {
+          method: args.method,
+          headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
+          ...(args.body ? { body: args.body } : {}),
+        },
+        15_000,
+        allowHosts,
+      );
 
       const body = await res.text();
       let data;
@@ -554,7 +617,7 @@ async function main() {
     ...(args.body ? { body: args.body } : {}),
   };
 
-  const initialRes = await fetchWithTimeout(canonicalUrl, reqOptions);
+  const initialRes = await fetchWithTimeout(canonicalUrl, reqOptions, 15_000, allowHosts);
 
   if (initialRes.status === 200) {
     const body = await initialRes.text();
@@ -599,7 +662,7 @@ async function main() {
   console.error('402 Payment Required — parsing L402 challenge...');
 
   // ── Resolve challenge ──
-  const challenge = await resolveL402Challenge(initialRes);
+  const challenge = await resolveL402Challenge(initialRes, allowHosts);
   if (!challenge) {
     throw new Error('Could not parse L402 challenge from 402 response. Try l402_discover.js for diagnostics.');
   }
@@ -1053,15 +1116,20 @@ async function main() {
   console.error('Retrying request with L402 authorization...');
   const authHeader = `L402 ${macaroon}:${preimage}`;
 
-  const retryRes = await fetchWithTimeout(canonicalUrl, {
-    method: args.method,
-    headers: {
-      Accept: 'application/json',
-      Authorization: authHeader,
-      ...args.headers,
+  const retryRes = await fetchWithTimeout(
+    canonicalUrl,
+    {
+      method: args.method,
+      headers: {
+        Accept: 'application/json',
+        Authorization: authHeader,
+        ...args.headers,
+      },
+      ...(args.body ? { body: args.body } : {}),
     },
-    ...(args.body ? { body: args.body } : {}),
-  });
+    15_000,
+    allowHosts,
+  );
 
   const retryBody = await retryRes.text();
   let retryData;

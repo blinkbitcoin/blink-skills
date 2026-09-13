@@ -992,6 +992,13 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     const { address, port } = server.address();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-cli-l402-'));
     fs.mkdirSync(path.join(home, '.blink'), { recursive: true });
+    // Security-audit fix: the domain allowlist now gates ALL non-dry-run
+    // l402-pay outbound requests (pre-flight), not only payments — cached-token
+    // reuse to a host that was never allowlisted is refused like any other.
+    fs.writeFileSync(
+      path.join(home, '.blink', 'budget.json'),
+      JSON.stringify({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] }),
+    );
     const store = {};
     // extractStoreKey = hostname + pathname (no port)
     store[`127.0.0.1/resource`] = {
