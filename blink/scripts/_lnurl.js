@@ -243,21 +243,31 @@ function lnurlpMetadataUrl(username, domain) {
  * @returns {Promise<Response>}
  */
 /**
- * Credential-bearing request headers — stripped on cross-origin redirect hops
- * (in-chain) and withheld when pre-flight canonicalization crossed origins
- * (see the l402 scripts). Case-insensitive matching on keys.
+ * The single cross-origin header policy (review round 1, PR #21): when a
+ * request's target origin changed — via pre-flight canonicalization (the l402
+ * scripts) or a redirect hop (fetchWithRetry, below) — the operator-supplied
+ * header set is withheld ENTIRELY, not filtered. Enumerating "credential-like"
+ * custom names (X-API-Key, x-auth-token, …) cannot be complete: --header is
+ * explicitly arbitrary, so anything the operator attached to origin A must not
+ * silently reach origin B. Internally controlled headers (Accept, Connection)
+ * are reconstructed by the fetch call sites and are not part of this set.
+ *
+ * @param {string} suppliedUrl   the originally requested URL
+ * @param {string} resolvedUrl   the canonical / post-redirect URL
+ * @param {object} headers       operator-supplied headers
+ * @returns {{ headers: object, withheld: string[] }} the (possibly emptied)
+ *   header set plus the names that were withheld
  */
-const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
-
-/**
- * Return a copy of `headers` without credential-bearing entries.
- * @param {object} headers
- * @returns {object}
- */
-function stripCredentialHeaders(headers) {
-  return Object.fromEntries(
-    Object.entries(headers || {}).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
-  );
+function withholdHeadersIfCrossOrigin(suppliedUrl, resolvedUrl, headers) {
+  const supplied = Object.entries(headers || {});
+  try {
+    if (new URL(resolvedUrl).origin === new URL(suppliedUrl).origin) {
+      return { headers: { ...headers }, withheld: [] };
+    }
+  } catch {
+    // Unparseable input: treat as cross-origin (fail-closed for headers).
+  }
+  return { headers: {}, withheld: supplied.map(([k]) => k) };
 }
 
 async function fetchWithRetry(
@@ -278,14 +288,14 @@ async function fetchWithRetry(
   // Guard failures are deterministic policy decisions, not transient network
   // faults, so they must escape the retry loop instead of being swallowed.
   // Mutable per-hop request state — redirects are origin- and status-aware
-  // (review round 1, PR #20). The manual loop previously re-sent the caller's
-  // exact headers/method/body on EVERY hop, so a late cross-origin redirect on
-  // an L402 request forwarded `Authorization: L402 <macaroon>:<preimage>` (a
-  // reusable bearer credential) and POST bodies to the redirect target — a
-  // regression from native Fetch, which strips credential headers cross-origin
-  // and rewrites methods per the WHATWG spec. Semantics implemented here:
-  //   - cross-origin hop: Authorization / Cookie / Proxy-Authorization are
-  //     stripped (same-origin hops preserve them);
+  // (review round 1, PR #20, hardened in PR #21). The manual loop previously
+  // re-sent the caller's exact headers/method/body on EVERY hop, so a late
+  // cross-origin redirect on an L402 request forwarded `Authorization: L402
+  // <macaroon>:<preimage>` (a reusable bearer credential) and POST bodies to
+  // the redirect target. Semantics implemented here:
+  //   - cross-origin hop: the ENTIRE caller header set is withheld (custom
+  //     credential names cannot be enumerated — see
+  //     withholdHeadersIfCrossOrigin; same-origin hops preserve them);
   //   - 303: method becomes GET, body dropped (any original method);
   //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
   //   - 307/308: method and body are preserved.
@@ -363,12 +373,13 @@ async function fetchWithRetry(
     }
     // Resolve relative Location headers against the current hop, then re-check.
     const nextUrl = new URL(res.headers.get('location'), current);
-    // Origin-aware credential handling: a cross-origin hop never carries the
-    // caller's credential headers forward (stripped for this and later hops).
+    // Origin-aware header policy: a cross-origin hop withholds the ENTIRE
+    // caller-supplied header set (not just Fetch-defined credential names —
+    // enumerating custom credential-like names is impossible; see
+    // withholdHeadersIfCrossOrigin). Only the internally reconstructed
+    // Accept/Connection defaults continue.
     if (nextUrl.origin !== current.origin) {
-      reqHeaders = Object.fromEntries(
-        Object.entries(reqHeaders).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
-      );
+      reqHeaders = {};
     }
     // WHATWG Fetch method semantics on redirect (review round 2): a 303
     // rewrites to GET only when the method is NEITHER GET NOR HEAD (HEAD is
@@ -1079,7 +1090,7 @@ module.exports = {
   LOCAL_HOSTS,
   isPrivateAddress,
   assertAllowedUrl,
-  stripCredentialHeaders,
+  withholdHeadersIfCrossOrigin,
   isLnurlNotFoundReason,
   bech32Decode,
   convertBits,

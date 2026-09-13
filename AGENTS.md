@@ -24,7 +24,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 1. `package.json` (1×)
 2. `package-lock.json` — the **root pair only** (top-level + `packages[""]`). Beware deps that coincidentally share the version number (`pg-types`, `tar-stream` sat at 2.2.0 once) — never bump those.
 3. `blink/SKILL.md` frontmatter (2×: `version:` and `oa.version:`-style entry)
-4. `README.md`: ClawHub reference (`blink-wallet@X.Y.Z`) + **both** test-count mentions (line ~13 and ~258)
+4. `README.md`: **both** test-count mentions (line ~13 and ~258). The ClawHub reference is deliberately VERSION-NEUTRAL (PR #21 review) — never hard-code a version there; the registry lag makes any pinned claim false until post-merge publication, and it re-falsifies on the next bump
 
 ## Release ritual (in order — every step)
 

@@ -31,7 +31,7 @@
 // prober — but every fetch is SSRF-guarded: private/loopback/link-local
 // targets refused (unless the host appears in a configured budget allowlist),
 // redirects followed manually and re-validated per hop.
-const { fetchWithRetry, assertAllowedUrl, stripCredentialHeaders } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
 const { getAllowHosts } = require('./_budget');
 
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
@@ -307,21 +307,15 @@ async function main() {
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
-    // FT6 finding: withholds operator credential headers when pre-flight
-    // canonicalization crossed origins (the follow-up request is a fresh
-    // first hop — in-chain stripping never fires for it). See l402_pay.
-    try {
-      if (new URL(canonicalUrl).origin !== new URL(args.url).origin) {
-        const stripped = stripCredentialHeaders(args.headers);
-        if (Object.keys(stripped).length !== Object.keys(args.headers || {}).length) {
-          args.headers = stripped;
-          console.error(
-            'Warning: canonicalization crossed origins — operator-supplied credential headers are withheld from the request.',
-          );
-        }
-      }
-    } catch {
-      // URL parse failure — resolveCanonicalUrl already guarded the target.
+    // FT6 finding: the follow-up request after pre-flight canonicalization is
+    // a fresh first hop — the shared origin policy withholds the ENTIRE
+    // operator header set when origins differ (see l402_pay).
+    const originPolicy = withholdHeadersIfCrossOrigin(args.url, canonicalUrl, args.headers);
+    if (originPolicy.withheld.length > 0) {
+      args.headers = originPolicy.headers;
+      console.error(
+        `Warning: canonicalization crossed origins — ALL operator-supplied headers (${originPolicy.withheld.join(', ')}) are withheld from the request.`,
+      );
     }
   }
 

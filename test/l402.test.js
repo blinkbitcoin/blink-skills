@@ -2526,7 +2526,11 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
       );
       assert.equal(second.Cookie, undefined, 'Cookie stripped');
       assert.equal(second['Proxy-Authorization'], undefined, 'Proxy-Authorization stripped');
-      assert.equal(second['X-Custom'], 'keep', 'non-credential headers forwarded');
+      assert.equal(
+        second['X-Custom'],
+        undefined,
+        'PR #21 round 1: the ENTIRE caller header set is withheld cross-origin — custom names cannot be enumerated (only internal Accept/Connection defaults remain)',
+      );
     } finally {
       global.fetch = origFetch;
     }
@@ -2675,6 +2679,10 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
         'Authorization: Bearer INJECTED_SECRET',
         '--header',
         'X-Custom-Test: yes',
+        '--header',
+        'X-API-Key: sk-live-123',
+        '--header',
+        'x-auth-token: lowercase-mixed-case',
       ];
       const { main } = require(discoverPath);
       await main();
@@ -2690,10 +2698,79 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     const realRequest = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
     assert.ok(realRequest, 'the follow-up request reached the redirect target');
     assert.equal(realRequest.headers.Authorization, undefined, 'operator Authorization WITHHELD cross-origin (FT6)');
-    assert.equal(realRequest.headers['X-Custom-Test'], 'yes', 'non-credential operator headers pass through');
+    assert.equal(realRequest.headers['X-API-Key'], undefined, 'custom credential names withheld (round-1 HIGH)');
+    assert.equal(realRequest.headers['x-auth-token'], undefined, 'mixed-case spellings withheld');
+    assert.equal(
+      realRequest.headers['X-Custom-Test'],
+      undefined,
+      'round 1: ALL operator headers are withheld — custom names cannot be enumerated',
+    );
     assert.ok(
       errLines.some((l) => /withheld/.test(l)),
       'a loud warning names the withholding',
+    );
+  });
+
+  it('PAY-SIDE branch (review round 1): l402-pay withholds ALL operator headers after cross-origin canonicalization', async () => {
+    // The pay-side origin-policy block had no direct coverage; this drives
+    // l402_pay main() (--dry-run — no budget/payment machinery) with a mocked
+    // fetch whose canonicalization HEAD redirects cross-origin.
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('attacker.example')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://friend.example/api' : null) },
+        };
+      }
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (n) => (n === 'www-authenticate' ? 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0xpay"' : null),
+        },
+        text: async () => '',
+      };
+    };
+    const payPath = path.join(scriptsDir, 'l402_pay.js');
+    const savedArgv = process.argv;
+    const errLines = [];
+    const origErr = console.error;
+    const origLog = console.log;
+    console.error = (...a) => errLines.push(a.join(' '));
+    console.log = () => {};
+    try {
+      process.argv = [
+        'node',
+        'l402_pay.js',
+        'https://attacker.example/api',
+        '--dry-run',
+        '--no-store',
+        '--header',
+        'X-API-Key: sk-live-pay',
+        '--header',
+        'Authorization: Bearer PAY_SECRET',
+      ];
+      const { main } = require(payPath);
+      await main();
+    } catch {
+      // dry-run output shape is not under test here
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      console.log = origLog;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(payPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+    assert.ok(realRequest, 'the dry-run probe reached the canonical origin');
+    assert.equal(realRequest.headers['X-API-Key'], undefined, 'custom credential withheld on the pay side');
+    assert.equal(realRequest.headers.Authorization, undefined, 'standard credential withheld on the pay side');
+    assert.ok(
+      errLines.some((l) => /withheld/.test(l)),
+      'the withholding warning fires on the pay side',
     );
   });
 
@@ -2796,6 +2873,50 @@ describe('security: secure state files (audit fix 2)', () => {
       assert.equal(fsMod.statSync(legacy).mode & 0o777, 0o600, 'legacy 0644 token store migrated to 0600');
       assert.equal(fsMod.statSync(pathMod.join(dir, 'budget.json')).mode & 0o777, 0o600, 'new file 0600');
       assert.ok(!fsMod.existsSync(pathMod.join(dir, 'budget.json.' + process.pid + '.tmp')), 'no temp residue');
+    } finally {
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('subdir migration failure branches: symlink skipped, non-directory skipped, real errors propagate', () => {
+    const os = require('node:os');
+    const fsMod = require('node:fs');
+    const pathMod = require('node:path');
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-subdir-'));
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+      // spark as a SYMLINK -> skipped silently (readers/writers must refuse it)
+      const realDir = pathMod.join(tmp, 'elsewhere');
+      fsMod.mkdirSync(realDir, { recursive: true });
+      fsMod.symlinkSync(realDir, pathMod.join(dir, 'spark'));
+
+      // A clean dir requires a fresh module (the migration is once-per-process)
+      const sfPath = require.resolve(path.join(scriptsDir, '_secure_files'));
+      const saved = require.cache[sfPath];
+      delete require.cache[sfPath];
+      const fresh = require(sfPath);
+      try {
+        fresh.ensureSecureStateDir(dir); // must not throw on the symlinked subdir
+      } finally {
+        if (saved) require.cache[sfPath] = saved;
+        else delete require.cache[sfPath];
+      }
+
+      // Non-directory entry named spark -> also skipped
+      fsMod.rmSync(pathMod.join(dir, 'spark'));
+      fsMod.writeFileSync(pathMod.join(dir, 'spark'), 'not a dir', { mode: 0o600 });
+      delete require.cache[sfPath];
+      const fresh2 = require(sfPath);
+      try {
+        fresh2.ensureSecureStateDir(dir); // must not throw / not chmod a file as dir
+        const st = fsMod.lstatSync(pathMod.join(dir, 'spark'));
+        assert.ok(st.isFile(), 'the file entry was left as a file (skipped, not chmodded)');
+      } finally {
+        if (saved) require.cache[sfPath] = saved;
+        else delete require.cache[sfPath];
+      }
     } finally {
       fsMod.rmSync(tmp, { recursive: true, force: true });
     }
