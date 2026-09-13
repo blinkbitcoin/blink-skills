@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.6.1
+version: 2.6.2
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.6.1'
+    version: '2.6.2'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -518,6 +518,8 @@ Manages the self-custodial wallet's registered **`user@blink.sv`** Lightning add
 - `delete` — removes the address (reversible by re-registering, subject to availability).
 
 `spark-info` also reports the recovered `lightningAddress`, a `lnAddressStatus` (`registered` | `none` = verified negative | `unverified` = service unreachable — null then means "cannot know", not "no address"), and the pinned `lnurlDomain`. Since v2.4.0 spark outputs carry `accountType: 'spark'` (the wallet kind); whether a Lightning address is registered is the `lightningAddress` / `lnAddressStatus` pair, never the accountType. (`create-invoice-lnaddress` and `resolve-receiver` still classify a _receiver_ as `type: 'lnaddress'` when an address is Spark-backed — a different field, a different vocabulary.)
+
+> **Never compose a three-state field into another command via shell substitution.** `lnAddressStatus: "unverified"` / `registered: "unknown"` mean the address is UNKNOWN — a shell `$(… lightningAddress …)` yields an empty string that downstream commands resolve against a DEFAULT, not against your wallet. Live near-miss (FT6): an empty address composed into `create-invoice-lnaddress` resolved as `none@blink.sv` — a real third-party custodial wallet. When the status is not `registered`, treat the address as absent; `resolve-receiver` your own known address first and verify the pubkey before paying.
 
 > **AGENT:** Confirm the username with the user before `register` — it is a public identity choice — and warn that registration replaces any previous address.
 

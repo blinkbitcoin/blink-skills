@@ -2637,6 +2637,106 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
+  it('FT6 pre-flight finding: canonicalization that crosses origins WITHHOLDS operator credential headers from the follow-up request', async () => {
+    // Hermes's two-server repro, as a unit: attacker.example 302s the HEAD to
+    // friend.example during canonicalization; the real probe below is a fresh
+    // first hop at friend.example — it must NOT carry the operator-supplied
+    // Authorization, while non-credential headers pass through.
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('attacker.example')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://friend.example/resource' : null) },
+        };
+      }
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (n) => (n === 'www-authenticate' ? 'L402 macaroon="M==", invoice="lnbc1000n1x"' : null),
+        },
+        text: async () => '',
+      };
+    };
+    const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+    const savedArgv = process.argv;
+    const errLines = [];
+    const origErr = console.error;
+    console.error = (...a) => errLines.push(a.join(' '));
+    try {
+      process.argv = [
+        'node',
+        'l402_discover.js',
+        'https://attacker.example/resource',
+        '--header',
+        'Authorization: Bearer INJECTED_SECRET',
+        '--header',
+        'X-Custom-Test: yes',
+      ];
+      const { main } = require(discoverPath);
+      await main();
+    } catch {
+      // main may exit non-zero on the 402 probe shape — the header assertions
+      // below are the point, not the exit code.
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(discoverPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+    assert.ok(realRequest, 'the follow-up request reached the redirect target');
+    assert.equal(realRequest.headers.Authorization, undefined, 'operator Authorization WITHHELD cross-origin (FT6)');
+    assert.equal(realRequest.headers['X-Custom-Test'], 'yes', 'non-credential operator headers pass through');
+    assert.ok(
+      errLines.some((l) => /withheld/.test(l)),
+      'a loud warning names the withholding',
+    );
+  });
+
+  it('same-origin canonicalization keeps operator credential headers', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('/start')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://same.example/canonical' : null) },
+        };
+      }
+      return { status: 402, url: String(url), headers: { get: () => null }, text: async () => '' };
+    };
+    const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+    const savedArgv = process.argv;
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+      process.argv = [
+        'node',
+        'l402_discover.js',
+        'https://same.example/start',
+        '--header',
+        'Authorization: Bearer MINE',
+      ];
+      const { main } = require(discoverPath);
+      await main();
+    } catch {
+      // exit code irrelevant here
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(discoverPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('/canonical') && s.method !== 'HEAD');
+    assert.ok(realRequest);
+    assert.equal(realRequest.headers.Authorization, 'Bearer MINE', 'same-origin hop keeps operator credentials');
+  });
+
   it('getAllowHosts: configured allowlist -> Set; unconfigured -> null', async () => {
     const os = require('node:os');
     const fsMod = require('node:fs');
@@ -2681,12 +2781,18 @@ describe('security: secure state files (audit fix 2)', () => {
       const legacy = pathMod.join(dir, 'l402-tokens.json');
       fsMod.writeFileSync(legacy, '{"old": 1}', { mode: 0o644 });
       fsMod.chmodSync(legacy, 0o644);
+      // FT6: a pre-existing 0775 spark/ subdir (SDK wallet state) exists
+      // BEFORE the first migration pass, as in real installs.
+      const sparkDir = pathMod.join(dir, 'spark');
+      fsMod.mkdirSync(sparkDir, { recursive: true });
+      fsMod.chmodSync(sparkDir, 0o775);
 
       writeSecureFileAtomic(pathMod.join(dir, 'budget.json'), '{}');
       ensureSecureStateDir(dir); // migration pass
 
       const dirMode = fsMod.statSync(dir).mode & 0o777;
       assert.equal(dirMode, 0o700, 'dir tightened to 0700');
+      assert.equal(fsMod.statSync(sparkDir).mode & 0o777, 0o700, 'spark/ subdir tightened to 0700 (FT6)');
       assert.equal(fsMod.statSync(legacy).mode & 0o777, 0o600, 'legacy 0644 token store migrated to 0600');
       assert.equal(fsMod.statSync(pathMod.join(dir, 'budget.json')).mode & 0o777, 0o600, 'new file 0600');
       assert.ok(!fsMod.existsSync(pathMod.join(dir, 'budget.json.' + process.pid + '.tmp')), 'no temp residue');

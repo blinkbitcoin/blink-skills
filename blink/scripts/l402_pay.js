@@ -70,7 +70,7 @@ const {
 // address rejection (incl. IPv4-mapped IPv6), manual redirects re-validated
 // per hop, hop limit, and the budget allowlist when configured (audit FT:
 // these scripts previously used bare fetch with redirect:'follow').
-const { fetchWithRetry, assertAllowedUrl } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, stripCredentialHeaders } = require('./_lnurl');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -538,6 +538,26 @@ async function main() {
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
+    // FT6 finding (MEDIUM): canonicalization consumes the redirect chain with
+    // a bare HEAD; every subsequent request below is then issued DIRECTLY at
+    // the canonical URL as a fresh first hop — the in-chain cross-origin
+    // credential stripping never sees that transition, so operator-supplied
+    // credential headers would reach whichever origin the redirect named.
+    // Withhold them when origins differ. (The cached L402 Authorization is
+    // keyed to the canonical store key — earned at that origin — and stays.)
+    try {
+      if (new URL(canonicalUrl).origin !== new URL(args.url).origin) {
+        const stripped = stripCredentialHeaders(args.headers);
+        if (Object.keys(stripped).length !== Object.keys(args.headers || {}).length) {
+          args.headers = stripped;
+          console.error(
+            'Warning: canonicalization crossed origins — operator-supplied credential headers are withheld from the request.',
+          );
+        }
+      }
+    } catch {
+      // URL parse failure — resolveCanonicalUrl already guarded the target.
+    }
   }
 
   const domain = extractDomain(canonicalUrl);

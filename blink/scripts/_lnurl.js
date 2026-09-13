@@ -242,6 +242,24 @@ function lnurlpMetadataUrl(username, domain) {
  * @param {string} [opts.what]  Label used in guard error messages.
  * @returns {Promise<Response>}
  */
+/**
+ * Credential-bearing request headers — stripped on cross-origin redirect hops
+ * (in-chain) and withheld when pre-flight canonicalization crossed origins
+ * (see the l402 scripts). Case-insensitive matching on keys.
+ */
+const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
+
+/**
+ * Return a copy of `headers` without credential-bearing entries.
+ * @param {object} headers
+ * @returns {object}
+ */
+function stripCredentialHeaders(headers) {
+  return Object.fromEntries(
+    Object.entries(headers || {}).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
+  );
+}
+
 async function fetchWithRetry(
   url,
   {
@@ -271,7 +289,8 @@ async function fetchWithRetry(
   //   - 303: method becomes GET, body dropped (any original method);
   //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
   //   - 307/308: method and body are preserved.
-  const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
+  // (CREDENTIAL_HEADERS lives at module scope — the L402 scripts reuse it for
+  // their pre-flight canonicalization origin check.)
   // Headers that describe the request BODY — native Fetch removes them when a
   // redirect rewrite drops the body (a redirected GET must not advertise a
   // Content-Type for a body it no longer carries).
@@ -1060,6 +1079,7 @@ module.exports = {
   LOCAL_HOSTS,
   isPrivateAddress,
   assertAllowedUrl,
+  stripCredentialHeaders,
   isLnurlNotFoundReason,
   bech32Decode,
   convertBits,

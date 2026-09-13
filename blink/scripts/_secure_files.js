@@ -24,6 +24,11 @@ const path = require('node:path');
 /** State files that must be 0600 whenever they exist. */
 const SECURE_FILE_NAMES = ['l402-tokens.json', 'l402-root-key', 'budget.json', 'spending-log.json'];
 
+/** State subdirectories that must be 0700 whenever they exist (FT6: the
+ * pre-existing ~/.blink/spark — SDK wallet state keyed by seed hash — was
+ * left 0775 by older installs while its parent was tightened). */
+const SECURE_SUBDIR_NAMES = ['spark'];
+
 const migratedDirs = new Set();
 
 /**
@@ -68,6 +73,16 @@ function migrateSecureFiles(dir) {
       const st = fs.lstatSync(file);
       if (st.isSymbolicLink()) continue; // readers/writers must refuse it themselves
       if (st.isFile()) fs.chmodSync(file, 0o600);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+  for (const name of SECURE_SUBDIR_NAMES) {
+    const sub = path.join(dir, name);
+    try {
+      const st = fs.lstatSync(sub);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) fs.chmodSync(sub, 0o700);
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
     }
@@ -119,4 +134,5 @@ module.exports = {
   ensureSecureStateDir,
   writeSecureFileAtomic,
   SECURE_FILE_NAMES,
+  SECURE_SUBDIR_NAMES,
 };
