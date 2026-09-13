@@ -2929,6 +2929,126 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
+  it('E2E through the wrapper: l402_pay.main() rejects an in-chain cross-origin 307 carrying an operator body (review round 4)', async () => {
+    // Same-origin canonicalization (no pre-flight trigger); the INITIAL
+    // request is answered by a cross-origin 307 — the wrapper's derived
+    // operatorBody flag must drive the in-chain URL_POLICY refusal through
+    // the real main() path (initial/cached-token/post-payment all share it).
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body });
+      if (String(url).includes('api.example/start')) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://other.example/api' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    const payPath = path.join(scriptsDir, 'l402_pay.js');
+    const savedArgv = process.argv;
+    const origErr = console.error;
+    const origLog = console.log;
+    console.error = () => {};
+    console.log = () => {};
+    let threw = null;
+    try {
+      process.argv = [
+        'node',
+        'l402_pay.js',
+        'https://api.example/start',
+        '--dry-run',
+        '--no-store',
+        '--method',
+        'POST',
+        '--body',
+        '{"operator": "payload"}',
+      ];
+      const { main } = require(payPath);
+      await main();
+    } catch (e) {
+      threw = e;
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      console.log = origLog;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(payPath)];
+    }
+    assert.ok(threw, 'main() rejects');
+    assert.equal(threw.code, 'URL_POLICY', 'machine-readable policy code from the in-chain refusal');
+    assert.match(threw.message, /operator-supplied request body/);
+    const forwarded = seen.find((s) => s.url.includes('other.example') && s.method !== 'HEAD');
+    assert.equal(
+      forwarded,
+      undefined,
+      'no body-carrying request dispatched to the redirect target through the real path',
+    );
+  });
+
+  it('cross-origin POST 301/302/303 rewrites DROP the body — no refusal, continues as GET (no over-blocking)', async () => {
+    for (const status of [301, 302, 303]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+        }
+        return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+      };
+      try {
+        const res = await fetchWithRetry('https://first.example/start', {
+          method: 'POST',
+          body: 'operator-payload',
+          operatorBody: true,
+          retries: 0,
+          what: 'rewrite probe',
+        });
+        assert.equal(res.status, 200, `${status}: the request completes`);
+        assert.equal(seen[1].method, 'GET', `${status}: WHATWG rewrite to GET`);
+        assert.equal(seen[1].body, undefined, `${status}: the body is dropped, so nothing to refuse`);
+      } finally {
+        global.fetch = origFetch;
+      }
+    }
+  });
+
+  it('same-origin 307 with an operator body proceeds with the body intact', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body });
+      if (seen.length === 1) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://first.example/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'operator-payload',
+        operatorBody: true,
+        retries: 0,
+        what: 'same-origin operator body probe',
+      });
+      assert.equal(seen[1].method, 'POST');
+      assert.equal(seen[1].body, 'operator-payload', 'same-origin: the operator body legitimately continues');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('withholdHeadersIfCrossOrigin: malformed URLs are fail-closed (crossOrigin, headers emptied)', async () => {
+    const { withholdHeadersIfCrossOrigin } = require(path.join(scriptsDir, '_lnurl.js'));
+    const r = withholdHeadersIfCrossOrigin('not a url at all', 'https://ok.example/x', { Authorization: 'x' });
+    assert.equal(r.crossOrigin, true, 'unparseable input treated as cross-origin');
+    assert.deepEqual(r.headers, {}, 'headers emptied (fail-closed)');
+    assert.deepEqual(r.withheld, ['Authorization']);
+    // Both parseable, same origin -> untouched
+    const same = withholdHeadersIfCrossOrigin('https://a.example/x', 'https://a.example/y', { Authorization: 'x' });
+    assert.equal(same.crossOrigin, false);
+    assert.deepEqual(same.headers, { Authorization: 'x' });
+  });
+
   it('same-origin canonicalization keeps operator credential headers', async () => {
     const seen = [];
     const origFetch = global.fetch;
