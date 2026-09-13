@@ -15,8 +15,8 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Testing
 
-- `npm test` on the default Node 20: 740 pass + 8 Node-22-gated skips. Full verification requires a Node 22 run: **748/748, 0 skipped**. Always do both before releasing.
-- Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (Module._load interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
+- `npm test` must run on BOTH Node versions before releasing: the default Node shows the Node-22-gated skips (a handful of tests skip below Node 22), and the Node 22 run must show **all tests passing, 0 skipped**. Do not hard-code counts here — they drift every release.
+- Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (`Module._load` interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests that are Node-22-gated; the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
 ## Version bumps — the exact spots
@@ -24,7 +24,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 1. `package.json` (1×)
 2. `package-lock.json` — the **root pair only** (top-level + `packages[""]`). Beware deps that coincidentally share the version number (`pg-types`, `tar-stream` sat at 2.2.0 once) — never bump those.
 3. `blink/SKILL.md` frontmatter (2×: `version:` and `oa.version:`-style entry)
-4. `README.md`: ClawHub reference (`blink-wallet@X.Y.Z`) + **both** test-count mentions (line ~13 and ~258)
+4. `README.md`: **both** test-count mentions (line ~13 and ~258). The ClawHub reference is deliberately VERSION-NEUTRAL (PR #21 review) — never hard-code a version there; the registry lag makes any pinned claim false until post-merge publication, and it re-falsifies on the next bump
 
 ## Release ritual (in order — every step)
 
@@ -46,7 +46,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
    - Publish returns `pending-publication`: the version goes through ClawHub's security scan before the registry serves it. `clawhub skill verify` fails while the current published version is not scan-clean.
    - This skill inherently trips two scan heuristics: `suspicious.env_credential_access` (reads `BLINK_API_KEY` + network send — the skill IS an API client) and `suspicious.insecure_tls_verification` (the `--no-verify` flag whose DEFAULT is verify-on). Both are by-design; do NOT contort the code to satisfy the scanner.
    - Retrieve evidence: `clawhub scan download blink-wallet --version X.Y.Z` (writes a ZIP to cwd — delete it, don't commit).
-6. **Verify the registry**: `https://clawhub.ai/api/v1/skills/blink-wallet?ownerHandle=pretyflaco` must report the new `version`, and `clawhub inspect blink-wallet@X.Y.Z` must resolve. The README's `blink-wallet@X.Y.Z` claim is only true after this step — skipping it recreates the PR #17 review finding. If the scan leaves the version pending (suspicious heuristics), the claim stays false until moderation clears — surface this to the user immediately rather than waiting.
+6. **Verify the registry**: `https://clawhub.ai/api/v1/skills/blink-wallet?ownerHandle=pretyflaco` must report the new `version`, and `clawhub inspect blink-wallet@X.Y.Z` must resolve. The README's ClawHub reference is deliberately version-neutral (see the version-bump list) — but the registry actually serving the new version is still a release gate. If the scan leaves the version pending (suspicious heuristics), surface it to the user immediately rather than waiting.
 
 ## Multi-model review loop
 

@@ -24,6 +24,11 @@ const path = require('node:path');
 /** State files that must be 0600 whenever they exist. */
 const SECURE_FILE_NAMES = ['l402-tokens.json', 'l402-root-key', 'budget.json', 'spending-log.json'];
 
+/** State subdirectories that must be 0700 whenever they exist (FT6: the
+ * pre-existing ~/.blink/spark — SDK wallet state keyed by seed hash — was
+ * left 0775 by older installs while its parent was tightened). */
+const SECURE_SUBDIR_NAMES = ['spark'];
+
 const migratedDirs = new Set();
 
 /**
@@ -61,7 +66,11 @@ function ensureSecureDir(dir) {
  */
 function migrateSecureFiles(dir) {
   if (migratedDirs.has(dir)) return;
-  migratedDirs.add(dir);
+  // NOTE: the dir is added to migratedDirs only AFTER both loops complete —
+  // marking it up front would let one transient failure (e.g. EACCES on the
+  // spark/ chmod) permanently disable hardening for the process, and the
+  // read-path callers deliberately swallow best-effort hardening errors
+  // (review round 2, PR #21).
   for (const name of SECURE_FILE_NAMES) {
     const file = path.join(dir, name);
     try {
@@ -72,6 +81,17 @@ function migrateSecureFiles(dir) {
       if (e.code !== 'ENOENT') throw e;
     }
   }
+  for (const name of SECURE_SUBDIR_NAMES) {
+    const sub = path.join(dir, name);
+    try {
+      const st = fs.lstatSync(sub);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) fs.chmodSync(sub, 0o700);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+  migratedDirs.add(dir);
 }
 
 /**
@@ -119,4 +139,5 @@ module.exports = {
   ensureSecureStateDir,
   writeSecureFileAtomic,
   SECURE_FILE_NAMES,
+  SECURE_SUBDIR_NAMES,
 };

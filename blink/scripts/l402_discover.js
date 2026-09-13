@@ -31,7 +31,7 @@
 // prober — but every fetch is SSRF-guarded: private/loopback/link-local
 // targets refused (unless the host appears in a configured budget allowlist),
 // redirects followed manually and re-validated per hop.
-const { fetchWithRetry, assertAllowedUrl } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
 const { getAllowHosts } = require('./_budget');
 
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
@@ -131,7 +131,10 @@ async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000, a
   try {
     const res = await fetchWithRetry(paymentRequestUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // Entity header: call-site-generated descriptor for the internal JSON
+      // body — survives cross-origin 307/308 with the body it describes
+      // (review round 2), unlike operator-supplied headers.
+      entityHeaders: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
       timeoutMs,
       retries: 0,
@@ -307,6 +310,16 @@ async function main() {
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
+    // FT6 finding: the follow-up request after pre-flight canonicalization is
+    // a fresh first hop — the shared origin policy withholds the ENTIRE
+    // operator header set when origins differ (see l402_pay).
+    const originPolicy = withholdHeadersIfCrossOrigin(args.url, canonicalUrl, args.headers);
+    if (originPolicy.withheld.length > 0) {
+      args.headers = originPolicy.headers;
+      console.error(
+        `Warning: canonicalization crossed origins — ALL operator-supplied headers (${originPolicy.withheld.join(', ')}) are withheld from the request.`,
+      );
+    }
   }
 
   let res;

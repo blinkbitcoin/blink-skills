@@ -2526,7 +2526,11 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
       );
       assert.equal(second.Cookie, undefined, 'Cookie stripped');
       assert.equal(second['Proxy-Authorization'], undefined, 'Proxy-Authorization stripped');
-      assert.equal(second['X-Custom'], 'keep', 'non-credential headers forwarded');
+      assert.equal(
+        second['X-Custom'],
+        undefined,
+        'PR #21 round 1: the ENTIRE caller header set is withheld cross-origin — custom names cannot be enumerated (only internal Accept/Connection defaults remain)',
+      );
     } finally {
       global.fetch = origFetch;
     }
@@ -2637,6 +2641,454 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
+  it('FT6 pre-flight finding: canonicalization that crosses origins WITHHOLDS operator credential headers from the follow-up request', async () => {
+    // Hermes's two-server repro, as a unit: attacker.example 302s the HEAD to
+    // friend.example during canonicalization; the real probe below is a fresh
+    // first hop at friend.example — it must NOT carry the operator-supplied
+    // Authorization, while non-credential headers pass through.
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('attacker.example')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://friend.example/resource' : null) },
+        };
+      }
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (n) => (n === 'www-authenticate' ? 'L402 macaroon="M==", invoice="lnbc1000n1x"' : null),
+        },
+        text: async () => '',
+      };
+    };
+    const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+    const savedArgv = process.argv;
+    const errLines = [];
+    const origErr = console.error;
+    console.error = (...a) => errLines.push(a.join(' '));
+    try {
+      process.argv = [
+        'node',
+        'l402_discover.js',
+        'https://attacker.example/resource',
+        '--header',
+        'Authorization: Bearer INJECTED_SECRET',
+        '--header',
+        'X-Custom-Test: yes',
+        '--header',
+        'X-API-Key: sk-live-123',
+        '--header',
+        'x-auth-token: lowercase-mixed-case',
+      ];
+      const { main } = require(discoverPath);
+      await main();
+    } catch {
+      // main may exit non-zero on the 402 probe shape — the header assertions
+      // below are the point, not the exit code.
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(discoverPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+    assert.ok(realRequest, 'the follow-up request reached the redirect target');
+    assert.equal(realRequest.headers.Authorization, undefined, 'operator Authorization WITHHELD cross-origin (FT6)');
+    assert.equal(realRequest.headers['X-API-Key'], undefined, 'custom credential names withheld (round-1 HIGH)');
+    assert.equal(realRequest.headers['x-auth-token'], undefined, 'mixed-case spellings withheld');
+    assert.equal(
+      realRequest.headers['X-Custom-Test'],
+      undefined,
+      'round 1: ALL operator headers are withheld — custom names cannot be enumerated',
+    );
+    assert.ok(
+      errLines.some((l) => /withheld/.test(l)),
+      'a loud warning names the withholding',
+    );
+  });
+
+  it('PAY-SIDE branch (review round 1): l402-pay withholds ALL operator headers after cross-origin canonicalization', async () => {
+    // The pay-side origin-policy block had no direct coverage; this drives
+    // l402_pay main() (--dry-run — no budget/payment machinery) with a mocked
+    // fetch whose canonicalization HEAD redirects cross-origin.
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('attacker.example')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://friend.example/api' : null) },
+        };
+      }
+      return {
+        status: 402,
+        url: String(url),
+        headers: {
+          get: (n) => (n === 'www-authenticate' ? 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0xpay"' : null),
+        },
+        text: async () => '',
+      };
+    };
+    const payPath = path.join(scriptsDir, 'l402_pay.js');
+    const savedArgv = process.argv;
+    const errLines = [];
+    const origErr = console.error;
+    const origLog = console.log;
+    console.error = (...a) => errLines.push(a.join(' '));
+    console.log = () => {};
+    try {
+      process.argv = [
+        'node',
+        'l402_pay.js',
+        'https://attacker.example/api',
+        '--dry-run',
+        '--no-store',
+        '--header',
+        'X-API-Key: sk-live-pay',
+        '--header',
+        'Authorization: Bearer PAY_SECRET',
+      ];
+      const { main } = require(payPath);
+      await main();
+    } catch {
+      // dry-run output shape is not under test here
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      console.log = origLog;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(payPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+    assert.ok(realRequest, 'the dry-run probe reached the canonical origin');
+    assert.equal(realRequest.headers['X-API-Key'], undefined, 'custom credential withheld on the pay side');
+    assert.equal(realRequest.headers.Authorization, undefined, 'standard credential withheld on the pay side');
+    assert.ok(
+      errLines.some((l) => /withheld/.test(l)),
+      'the withholding warning fires on the pay side',
+    );
+  });
+
+  it('cross-origin 307/308 PRESERVE the internal body WITH its entity Content-Type (production payment_request_url shape)', async () => {
+    // Review round 2: full header withholding previously dropped the
+    // call-site-generated Content-Type while 307/308 kept the body — the
+    // redirected endpoint received a body it could not interpret. Entity
+    // headers are modeled separately and survive WITH the body.
+    for (const status of [307, 308]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...(opts.headers || {}) } });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/pay' : null) } };
+        }
+        return {
+          status: 200,
+          ok: true,
+          url: String(url),
+          headers: { get: () => null },
+          json: async () => ({ invoice: 'lnbc1x' }),
+        };
+      };
+      try {
+        const { fetchL402ProtocolInvoice: fetchInvoice } = require(path.join(scriptsDir, 'l402_discover.js'));
+        const result = await fetchInvoice('https://first.example/pay', 15_000, null);
+        assert.ok(result && result.invoice === 'lnbc1x', 'the production helper parses the response');
+        assert.equal(seen.length, 2, status);
+        const hop2 = seen[1];
+        assert.equal(hop2.url, 'https://other.example/pay', status);
+        assert.equal(hop2.method, 'POST', `${status}: method preserved`);
+        assert.equal(hop2.body, '{}', 'the internal JSON body preserved');
+        assert.equal(
+          hop2.headers['Content-Type'],
+          'application/json',
+          `${status}: entity Content-Type travels WITH the body`,
+        );
+      } finally {
+        global.fetch = origFetch;
+        delete require.cache[require.resolve(path.join(scriptsDir, 'l402_discover.js'))];
+      }
+    }
+  });
+
+  it('entity headers vanish when a redirect rewrite drops the body', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ method: opts.method, body: opts.body, headers: { ...(opts.headers || {}) } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, url: String(url), headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        entityHeaders: { 'Content-Type': 'application/json' },
+        retries: 0,
+        what: 'entity rewrite probe',
+      });
+      assert.equal(seen[1].method, 'GET');
+      assert.equal(seen[1].body, undefined);
+      assert.equal(seen[1].headers['Content-Type'], undefined, 'no entity headers for a body that no longer exists');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('operator BODIES are refused across origins — pre-flight 301/302/303 (review round 3)', async () => {
+    // The reviewer's probe: a bare-HEAD canonicalization that lands
+    // cross-origin previously forwarded the ORIGINAL method + operator body
+    // straight to the final origin, bypassing POST-302->GET semantics.
+    for (const status of [301, 302, 303]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (String(url).includes('attacker.example')) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://friend.example/api' : null) } };
+        }
+        return { status: 402, url: String(url), headers: { get: () => null }, text: async () => '' };
+      };
+      const payPath = path.join(scriptsDir, 'l402_pay.js');
+      const savedArgv = process.argv;
+      const origErr = console.error;
+      const origLog = console.log;
+      console.error = () => {};
+      console.log = () => {};
+      let threw = null;
+      try {
+        process.argv = [
+          'node',
+          'l402_pay.js',
+          'https://attacker.example/api',
+          '--dry-run',
+          '--no-store',
+          '--method',
+          'POST',
+          '--body',
+          '{"secret": "operator-payload"}',
+        ];
+        const { main } = require(payPath);
+        await main();
+      } catch (e) {
+        threw = e;
+      } finally {
+        process.argv = savedArgv;
+        console.error = origErr;
+        console.log = origLog;
+        global.fetch = origFetch;
+        delete require.cache[require.resolve(payPath)];
+      }
+      assert.ok(threw, `${status}: the command refuses`);
+      assert.match(threw.message, /operator-supplied body/i, `${status}: the error names the operator body`);
+      assert.match(
+        threw.message,
+        /friend\.example/,
+        `${status}: the error names the final URL for explicit re-invocation`,
+      );
+      const forwarded = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+      assert.equal(forwarded, undefined, `${status}: zero body-carrying requests reach the redirect target`);
+    }
+  });
+
+  it('operator BODIES are refused across origins — in-chain 307/308 (review round 3)', async () => {
+    for (const status of [307, 308]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+        }
+        return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+      };
+      try {
+        await assert.rejects(
+          () =>
+            fetchWithRetry('https://first.example/start', {
+              method: 'POST',
+              body: 'operator-payload',
+              operatorBody: true,
+              retries: 0,
+              what: 'operator body probe',
+            }),
+          (e) => e.code === 'URL_POLICY' && /operator-supplied request body/i.test(e.message),
+          `${status}: policy refusal for the operator body`,
+        );
+        assert.equal(seen.length, 1, `${status}: hop 2 never dispatched`);
+      } finally {
+        global.fetch = origFetch;
+      }
+    }
+  });
+
+  it('E2E through the wrapper: l402_pay.main() rejects an in-chain cross-origin 307 carrying an operator body (review round 4)', async () => {
+    // Same-origin canonicalization (no pre-flight trigger); the INITIAL
+    // request is answered by a cross-origin 307 — the wrapper's derived
+    // operatorBody flag must drive the in-chain URL_POLICY refusal through
+    // the real main() path (initial/cached-token/post-payment all share it).
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body });
+      if (String(url).includes('api.example/start')) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://other.example/api' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    const payPath = path.join(scriptsDir, 'l402_pay.js');
+    const savedArgv = process.argv;
+    const origErr = console.error;
+    const origLog = console.log;
+    console.error = () => {};
+    console.log = () => {};
+    let threw = null;
+    try {
+      process.argv = [
+        'node',
+        'l402_pay.js',
+        'https://api.example/start',
+        '--dry-run',
+        '--no-store',
+        '--method',
+        'POST',
+        '--body',
+        '{"operator": "payload"}',
+      ];
+      const { main } = require(payPath);
+      await main();
+    } catch (e) {
+      threw = e;
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      console.log = origLog;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(payPath)];
+    }
+    assert.ok(threw, 'main() rejects');
+    assert.equal(threw.code, 'URL_POLICY', 'machine-readable policy code from the in-chain refusal');
+    assert.match(threw.message, /operator-supplied request body/);
+    const forwarded = seen.find((s) => s.url.includes('other.example') && s.method !== 'HEAD');
+    assert.equal(
+      forwarded,
+      undefined,
+      'no body-carrying request dispatched to the redirect target through the real path',
+    );
+  });
+
+  it('cross-origin POST 301/302/303 rewrites DROP the body — no refusal, continues as GET (no over-blocking)', async () => {
+    for (const status of [301, 302, 303]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+        }
+        return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+      };
+      try {
+        const res = await fetchWithRetry('https://first.example/start', {
+          method: 'POST',
+          body: 'operator-payload',
+          operatorBody: true,
+          retries: 0,
+          what: 'rewrite probe',
+        });
+        assert.equal(res.status, 200, `${status}: the request completes`);
+        assert.equal(seen[1].method, 'GET', `${status}: WHATWG rewrite to GET`);
+        assert.equal(seen[1].body, undefined, `${status}: the body is dropped, so nothing to refuse`);
+      } finally {
+        global.fetch = origFetch;
+      }
+    }
+  });
+
+  it('same-origin 307 with an operator body proceeds with the body intact', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, body: opts.body });
+      if (seen.length === 1) {
+        return { status: 307, headers: { get: (n) => (n === 'location' ? 'https://first.example/next' : null) } };
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'operator-payload',
+        operatorBody: true,
+        retries: 0,
+        what: 'same-origin operator body probe',
+      });
+      assert.equal(seen[1].method, 'POST');
+      assert.equal(seen[1].body, 'operator-payload', 'same-origin: the operator body legitimately continues');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('withholdHeadersIfCrossOrigin: malformed URLs are fail-closed (crossOrigin, headers emptied)', async () => {
+    const { withholdHeadersIfCrossOrigin } = require(path.join(scriptsDir, '_lnurl.js'));
+    const r = withholdHeadersIfCrossOrigin('not a url at all', 'https://ok.example/x', { Authorization: 'x' });
+    assert.equal(r.crossOrigin, true, 'unparseable input treated as cross-origin');
+    assert.deepEqual(r.headers, {}, 'headers emptied (fail-closed)');
+    assert.deepEqual(r.withheld, ['Authorization']);
+    // Both parseable, same origin -> untouched
+    const same = withholdHeadersIfCrossOrigin('https://a.example/x', 'https://a.example/y', { Authorization: 'x' });
+    assert.equal(same.crossOrigin, false);
+    assert.deepEqual(same.headers, { Authorization: 'x' });
+  });
+
+  it('same-origin canonicalization keeps operator credential headers', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ url: String(url), method: opts.method, headers: { ...(opts.headers || {}) } });
+      if (String(url).includes('/start')) {
+        return {
+          status: 302,
+          headers: { get: (n) => (n === 'location' ? 'https://same.example/canonical' : null) },
+        };
+      }
+      return { status: 402, url: String(url), headers: { get: () => null }, text: async () => '' };
+    };
+    const discoverPath = path.join(scriptsDir, 'l402_discover.js');
+    const savedArgv = process.argv;
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+      process.argv = [
+        'node',
+        'l402_discover.js',
+        'https://same.example/start',
+        '--header',
+        'Authorization: Bearer MINE',
+      ];
+      const { main } = require(discoverPath);
+      await main();
+    } catch {
+      // exit code irrelevant here
+    } finally {
+      process.argv = savedArgv;
+      console.error = origErr;
+      global.fetch = origFetch;
+      delete require.cache[require.resolve(discoverPath)];
+    }
+    const realRequest = seen.find((s) => s.url.includes('/canonical') && s.method !== 'HEAD');
+    assert.ok(realRequest);
+    assert.equal(realRequest.headers.Authorization, 'Bearer MINE', 'same-origin hop keeps operator credentials');
+  });
+
   it('getAllowHosts: configured allowlist -> Set; unconfigured -> null', async () => {
     const os = require('node:os');
     const fsMod = require('node:fs');
@@ -2681,15 +3133,110 @@ describe('security: secure state files (audit fix 2)', () => {
       const legacy = pathMod.join(dir, 'l402-tokens.json');
       fsMod.writeFileSync(legacy, '{"old": 1}', { mode: 0o644 });
       fsMod.chmodSync(legacy, 0o644);
+      // FT6: a pre-existing 0775 spark/ subdir (SDK wallet state) exists
+      // BEFORE the first migration pass, as in real installs.
+      const sparkDir = pathMod.join(dir, 'spark');
+      fsMod.mkdirSync(sparkDir, { recursive: true });
+      fsMod.chmodSync(sparkDir, 0o775);
 
       writeSecureFileAtomic(pathMod.join(dir, 'budget.json'), '{}');
       ensureSecureStateDir(dir); // migration pass
 
       const dirMode = fsMod.statSync(dir).mode & 0o777;
       assert.equal(dirMode, 0o700, 'dir tightened to 0700');
+      assert.equal(fsMod.statSync(sparkDir).mode & 0o777, 0o700, 'spark/ subdir tightened to 0700 (FT6)');
       assert.equal(fsMod.statSync(legacy).mode & 0o777, 0o600, 'legacy 0644 token store migrated to 0600');
       assert.equal(fsMod.statSync(pathMod.join(dir, 'budget.json')).mode & 0o777, 0o600, 'new file 0600');
       assert.ok(!fsMod.existsSync(pathMod.join(dir, 'budget.json.' + process.pid + '.tmp')), 'no temp residue');
+    } finally {
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('a TRANSIENT migration failure does not permanently disable hardening (injected EACCES, review round 2)', () => {
+    const os = require('node:os');
+    const fsMod = require('node:fs');
+    const pathMod = require('node:path');
+    const sfPath = require.resolve(path.join(scriptsDir, '_secure_files'));
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-retry-'));
+    const savedModule = require.cache[sfPath];
+    const realChmod = fsMod.chmodSync;
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const sparkDir = pathMod.join(dir, 'spark');
+      fsMod.mkdirSync(sparkDir, { recursive: true });
+      fsMod.chmodSync(sparkDir, 0o775);
+
+      // Fresh module: the once-per-process guard starts clean.
+      delete require.cache[sfPath];
+      const fresh = require(sfPath);
+
+      // Inject ONE synthetic EACCES on the spark/ chmod: the first call throws…
+      let injected = true;
+      fsMod.chmodSync = (p, ...rest) => {
+        if (injected && String(p) === sparkDir) {
+          injected = false;
+          const e = new Error(`EACCES: permission denied, chmod '${p}'`);
+          e.code = 'EACCES';
+          throw e;
+        }
+        return realChmod.call(fsMod, p, ...rest);
+      };
+      assert.throws(() => fresh.ensureSecureStateDir(dir), /EACCES/, 'the transient failure propagates');
+
+      // …the SECOND call (after the transient condition clears) must RETRY —
+      // not no-op on a prematurely-marked migration — and actually tighten.
+      fresh.ensureSecureStateDir(dir);
+      const mode = fsMod.statSync(sparkDir).mode & 0o777;
+      assert.equal(mode, 0o700, 'the retry ran and hardened spark/ (0775 -> 0700)');
+    } finally {
+      fsMod.chmodSync = realChmod;
+      if (savedModule) require.cache[sfPath] = savedModule;
+      else delete require.cache[sfPath];
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('subdir migration failure branches: symlink skipped, non-directory skipped, real errors propagate', () => {
+    const os = require('node:os');
+    const fsMod = require('node:fs');
+    const pathMod = require('node:path');
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-subdir-'));
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+      // spark as a SYMLINK -> skipped silently (readers/writers must refuse it)
+      const realDir = pathMod.join(tmp, 'elsewhere');
+      fsMod.mkdirSync(realDir, { recursive: true });
+      fsMod.symlinkSync(realDir, pathMod.join(dir, 'spark'));
+
+      // A clean dir requires a fresh module (the migration is once-per-process)
+      const sfPath = require.resolve(path.join(scriptsDir, '_secure_files'));
+      const saved = require.cache[sfPath];
+      delete require.cache[sfPath];
+      const fresh = require(sfPath);
+      try {
+        fresh.ensureSecureStateDir(dir); // must not throw on the symlinked subdir
+      } finally {
+        if (saved) require.cache[sfPath] = saved;
+        else delete require.cache[sfPath];
+      }
+
+      // Non-directory entry named spark -> also skipped
+      fsMod.rmSync(pathMod.join(dir, 'spark'));
+      fsMod.writeFileSync(pathMod.join(dir, 'spark'), 'not a dir', { mode: 0o600 });
+      delete require.cache[sfPath];
+      const fresh2 = require(sfPath);
+      try {
+        fresh2.ensureSecureStateDir(dir); // must not throw / not chmod a file as dir
+        const st = fsMod.lstatSync(pathMod.join(dir, 'spark'));
+        assert.ok(st.isFile(), 'the file entry was left as a file (skipped, not chmodded)');
+      } finally {
+        if (saved) require.cache[sfPath] = saved;
+        else delete require.cache[sfPath];
+      }
     } finally {
       fsMod.rmSync(tmp, { recursive: true, force: true });
     }

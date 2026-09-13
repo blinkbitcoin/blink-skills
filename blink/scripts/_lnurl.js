@@ -166,6 +166,35 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   return url;
 }
 
+/**
+ * The single cross-origin header policy (review round 1, PR #21): when a
+ * request's target origin changed — via pre-flight canonicalization (the l402
+ * scripts) or a redirect hop (fetchWithRetry, below) — the operator-supplied
+ * header set is withheld ENTIRELY, not filtered. Enumerating "credential-like"
+ * custom names (X-API-Key, x-auth-token, …) cannot be complete: --header is
+ * explicitly arbitrary, so anything the operator attached to origin A must not
+ * silently reach origin B. Internally controlled headers (Accept, Connection)
+ * are reconstructed by the fetch call sites and are not part of this set.
+ *
+ * @param {string} suppliedUrl   the originally requested URL
+ * @param {string} resolvedUrl   the canonical / post-redirect URL
+ * @param {object} headers       operator-supplied headers
+ * @returns {{ headers: object, withheld: string[], crossOrigin: boolean }} the
+ *   (possibly emptied) header set, the names withheld, and whether the origin
+ *   changed (callers gate BODY provenance on this independently of headers)
+ */
+function withholdHeadersIfCrossOrigin(suppliedUrl, resolvedUrl, headers) {
+  const supplied = Object.entries(headers || {});
+  try {
+    if (new URL(resolvedUrl).origin === new URL(suppliedUrl).origin) {
+      return { headers: { ...headers }, withheld: [], crossOrigin: false };
+    }
+  } catch {
+    // Unparseable input: treat as cross-origin (fail-closed for headers).
+  }
+  return { headers: {}, withheld: supplied.map(([k]) => k), crossOrigin: true };
+}
+
 // ── Lightning Address parsing ────────────────────────────────────────────────
 
 /**
@@ -240,6 +269,13 @@ function lnurlpMetadataUrl(username, domain) {
  * @param {Set<string>|string[]|null} [opts.allowedHosts]  Host allowlist applied
  *        to the initial URL and to every redirect target.
  * @param {string} [opts.what]  Label used in guard error messages.
+ * @param {object} [opts.entityHeaders]  Call-site-generated body-descriptive
+ *        headers (e.g. the internally produced Content-Type). Never withheld
+ *        cross-origin (not operator-supplied) and dropped automatically when
+ *        a redirect rewrite drops the body.
+ * @param {boolean} [opts.operatorBody]  True when `body` came from the
+ *        operator (--body). Such a body is NEVER forwarded across origins —
+ *        a cross-origin hop that would preserve it refuses with URL_POLICY.
  * @returns {Promise<Response>}
  */
 async function fetchWithRetry(
@@ -255,23 +291,24 @@ async function fetchWithRetry(
     body = undefined,
     portsUnrestricted = false,
     strictLocal = false,
+    entityHeaders = {},
+    operatorBody = false,
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
   // faults, so they must escape the retry loop instead of being swallowed.
   // Mutable per-hop request state — redirects are origin- and status-aware
-  // (review round 1, PR #20). The manual loop previously re-sent the caller's
-  // exact headers/method/body on EVERY hop, so a late cross-origin redirect on
-  // an L402 request forwarded `Authorization: L402 <macaroon>:<preimage>` (a
-  // reusable bearer credential) and POST bodies to the redirect target — a
-  // regression from native Fetch, which strips credential headers cross-origin
-  // and rewrites methods per the WHATWG spec. Semantics implemented here:
-  //   - cross-origin hop: Authorization / Cookie / Proxy-Authorization are
-  //     stripped (same-origin hops preserve them);
+  // (review round 1, PR #20, hardened in PR #21). The manual loop previously
+  // re-sent the caller's exact headers/method/body on EVERY hop, so a late
+  // cross-origin redirect on an L402 request forwarded `Authorization: L402
+  // <macaroon>:<preimage>` (a reusable bearer credential) and POST bodies to
+  // the redirect target. Semantics implemented here:
+  //   - cross-origin hop: the ENTIRE caller header set is withheld (custom
+  //     credential names cannot be enumerated — see
+  //     withholdHeadersIfCrossOrigin; same-origin hops preserve them);
   //   - 303: method becomes GET, body dropped (any original method);
   //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
   //   - 307/308: method and body are preserved.
-  const CREDENTIAL_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization']);
   // Headers that describe the request BODY — native Fetch removes them when a
   // redirect rewrite drops the body (a redirected GET must not advertise a
   // Content-Type for a body it no longer carries).
@@ -304,7 +341,20 @@ async function fetchWithRetry(
           body: reqBody,
           signal: controller.signal,
           redirect: 'manual',
-          headers: { Accept: 'application/json', Connection: 'close', ...reqHeaders },
+          headers: {
+            Accept: 'application/json',
+            Connection: 'close',
+            ...reqHeaders,
+            // Entity headers are CALL-SITE-GENERATED body descriptors (the
+            // internally produced Content-Type), distinct from operator
+            // headers by construction: they are never withheld cross-origin
+            // (they carry nothing operator-supplied) and vanish automatically
+            // whenever a rewrite drops the body — a redirected GET must not
+            // advertise headers for a body it no longer carries (review
+            // round 2, PR #21: a cross-origin 307/308 previously sent the
+            // internal JSON body WITHOUT its Content-Type).
+            ...(reqBody !== undefined ? entityHeaders : {}),
+          },
         });
         // A 404 is the LUD-16 "not found" signal, but it is ALSO what a
         // transient proxy/CDN/WAF returns in front of a healthy LNURL server
@@ -344,12 +394,14 @@ async function fetchWithRetry(
     }
     // Resolve relative Location headers against the current hop, then re-check.
     const nextUrl = new URL(res.headers.get('location'), current);
-    // Origin-aware credential handling: a cross-origin hop never carries the
-    // caller's credential headers forward (stripped for this and later hops).
-    if (nextUrl.origin !== current.origin) {
-      reqHeaders = Object.fromEntries(
-        Object.entries(reqHeaders).filter(([k]) => !CREDENTIAL_HEADERS.has(String(k).toLowerCase())),
-      );
+    // Origin-aware header policy: a cross-origin hop withholds the ENTIRE
+    // caller-supplied header set (not just Fetch-defined credential names —
+    // enumerating custom credential-like names is impossible; see
+    // withholdHeadersIfCrossOrigin). Only the internally reconstructed
+    // Accept/Connection defaults continue.
+    const crossedOrigins = nextUrl.origin !== current.origin;
+    if (crossedOrigins) {
+      reqHeaders = {};
     }
     // WHATWG Fetch method semantics on redirect (review round 2): a 303
     // rewrites to GET only when the method is NEITHER GET NOR HEAD (HEAD is
@@ -365,6 +417,20 @@ async function fetchWithRetry(
       reqBody = undefined;
       reqHeaders = Object.fromEntries(
         Object.entries(reqHeaders).filter(([k]) => !BODY_HEADERS.has(String(k).toLowerCase())),
+      );
+    }
+    // Body provenance policy (review round 3): an OPERATOR-supplied body
+    // (--body) is never forwarded across origins. Withholding its headers
+    // (above) while keeping the bytes is a disclosure in a form the operator
+    // never sanctioned — and a body-preserving 307/308 target would receive
+    // it without the Content-Type that describes it. Internal,
+    // call-site-generated redirect-safe bodies (entityHeaders path) are
+    // exempt by construction. Method rewrites above already dropped the body,
+    // so this fires only where the body would actually survive the hop.
+    if (crossedOrigins && operatorBody && reqBody !== undefined) {
+      throw policyError(
+        `Refusing to forward the operator-supplied request body across origins ` +
+          `(${current.origin} → ${nextUrl.origin}) — invoke the final URL explicitly if that is intended.`,
       );
     }
     current = assertAllowedUrl(nextUrl.toString(), allowedHosts, `${what} redirect target`, {
@@ -1060,6 +1126,7 @@ module.exports = {
   LOCAL_HOSTS,
   isPrivateAddress,
   assertAllowedUrl,
+  withholdHeadersIfCrossOrigin,
   isLnurlNotFoundReason,
   bech32Decode,
   convertBits,

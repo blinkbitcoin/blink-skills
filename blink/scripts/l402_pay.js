@@ -70,7 +70,7 @@ const {
 // address rejection (incl. IPv4-mapped IPv6), manual redirects re-validated
 // per hop, hop limit, and the budget allowlist when configured (audit FT:
 // these scripts previously used bare fetch with redirect:'follow').
-const { fetchWithRetry, assertAllowedUrl } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -296,7 +296,11 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts =
   // Guarded fetch: every hop of every redirect is re-validated by
   // assertAllowedUrl inside fetchWithRetry (manual redirects). Retries stay 0
   // here — the original wrapper was single-attempt, and blind retries of a
-  // timed-out POST could double-pay a non-idempotent request.
+  // timed-out POST could double-pay a non-idempotent request. Every body on
+  // the l402_pay paths is OPERATOR-supplied (args.body) — flagged so the
+  // redirect engine refuses to forward it across origins (the internal
+  // payment_request_url {} payload calls fetchWithRetry directly and is
+  // exempt as a call-site-generated body).
   return fetchWithRetry(url, {
     timeoutMs,
     retries: 0,
@@ -305,6 +309,10 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts =
     portsUnrestricted: true,
     strictLocal: true,
     ...options,
+    // Wrapper-owned provenance, derived AFTER the spread so no caller option
+    // can override it: every body on the l402_pay paths is operator-supplied
+    // (args.body) — the redirect engine refuses to forward it across origins.
+    operatorBody: options.body !== null && options.body !== undefined,
   });
 }
 
@@ -538,6 +546,37 @@ async function main() {
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
+    // FT6 finding (MEDIUM), review round 1: canonicalization consumes the
+    // redirect chain with a bare HEAD; every subsequent request below is then
+    // issued DIRECTLY at the canonical URL as a fresh first hop — the in-chain
+    // origin policy never sees that transition. The SHARED policy
+    // (withholdHeadersIfCrossOrigin) withholds the ENTIRE operator header set
+    // when origins differ: custom credential names (X-API-Key, …) cannot be
+    // enumerated. (The cached L402 Authorization is keyed to the canonical
+    // store key — earned at that origin — and is injected per-request, not
+    // part of the operator set.)
+    const originPolicy = withholdHeadersIfCrossOrigin(args.url, canonicalUrl, args.headers);
+    if (originPolicy.withheld.length > 0) {
+      args.headers = originPolicy.headers;
+      console.error(
+        `Warning: canonicalization crossed origins — ALL operator-supplied headers (${originPolicy.withheld.join(', ')}) are withheld from the request.`,
+      );
+    }
+    // Body provenance (review round 3): canonicalization consumes the
+    // redirect chain with a bare HEAD, which BYPASSES the method-rewrite
+    // semantics (a POST 302 would normally become GET) — sending the original
+    // method + operator body straight to the final origin would disclose the
+    // body in a form the corresponding real request would never produce.
+    // Refuse: the operator can re-invoke the final URL. (crossOrigin, not
+    // withheld.length — a body-only request has no headers to withhold.)
+    if (originPolicy.crossOrigin && args.body !== null && args.body !== undefined) {
+      const refusal = new Error(
+        `Canonicalization crossed origins (${args.url} → ${canonicalUrl}) and this request carries an ` +
+          `operator-supplied body — refusing to forward it. Invoke the final URL explicitly: ${canonicalUrl}`,
+      );
+      refusal.code = 'URL_POLICY'; // same machine-readable code as the in-chain refusal
+      throw refusal;
+    }
   }
 
   const domain = extractDomain(canonicalUrl);
