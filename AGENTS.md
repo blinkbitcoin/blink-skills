@@ -16,7 +16,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Testing
 
 - `npm test` on the default Node 20: 740 pass + 8 Node-22-gated skips. Full verification requires a Node 22 run: **748/748, 0 skipped**. Always do both before releasing.
-- Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (Module._load interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
+- Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (Module.\_load interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests that are Node-22-gated; the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
 ## Version bumps — the exact spots

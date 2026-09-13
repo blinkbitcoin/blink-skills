@@ -296,7 +296,11 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts =
   // Guarded fetch: every hop of every redirect is re-validated by
   // assertAllowedUrl inside fetchWithRetry (manual redirects). Retries stay 0
   // here — the original wrapper was single-attempt, and blind retries of a
-  // timed-out POST could double-pay a non-idempotent request.
+  // timed-out POST could double-pay a non-idempotent request. Every body on
+  // the l402_pay paths is OPERATOR-supplied (args.body) — flagged so the
+  // redirect engine refuses to forward it across origins (the internal
+  // payment_request_url {} payload calls fetchWithRetry directly and is
+  // exempt as a call-site-generated body).
   return fetchWithRetry(url, {
     timeoutMs,
     retries: 0,
@@ -304,6 +308,7 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts =
     what: 'L402 resource',
     portsUnrestricted: true,
     strictLocal: true,
+    operatorBody: options.body != null,
     ...options,
   });
 }
@@ -552,6 +557,19 @@ async function main() {
       args.headers = originPolicy.headers;
       console.error(
         `Warning: canonicalization crossed origins — ALL operator-supplied headers (${originPolicy.withheld.join(', ')}) are withheld from the request.`,
+      );
+    }
+    // Body provenance (review round 3): canonicalization consumes the
+    // redirect chain with a bare HEAD, which BYPASSES the method-rewrite
+    // semantics (a POST 302 would normally become GET) — sending the original
+    // method + operator body straight to the final origin would disclose the
+    // body in a form the corresponding real request would never produce.
+    // Refuse: the operator can re-invoke the final URL. (crossOrigin, not
+    // withheld.length — a body-only request has no headers to withhold.)
+    if (originPolicy.crossOrigin && args.body != null) {
+      throw new Error(
+        `Canonicalization crossed origins (${args.url} → ${canonicalUrl}) and this request carries an ` +
+          `operator-supplied body — refusing to forward it. Invoke the final URL explicitly: ${canonicalUrl}`,
       );
     }
   }

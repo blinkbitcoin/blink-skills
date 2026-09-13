@@ -179,19 +179,20 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
  * @param {string} suppliedUrl   the originally requested URL
  * @param {string} resolvedUrl   the canonical / post-redirect URL
  * @param {object} headers       operator-supplied headers
- * @returns {{ headers: object, withheld: string[] }} the (possibly emptied)
- *   header set plus the names that were withheld
+ * @returns {{ headers: object, withheld: string[], crossOrigin: boolean }} the
+ *   (possibly emptied) header set, the names withheld, and whether the origin
+ *   changed (callers gate BODY provenance on this independently of headers)
  */
 function withholdHeadersIfCrossOrigin(suppliedUrl, resolvedUrl, headers) {
   const supplied = Object.entries(headers || {});
   try {
     if (new URL(resolvedUrl).origin === new URL(suppliedUrl).origin) {
-      return { headers: { ...headers }, withheld: [] };
+      return { headers: { ...headers }, withheld: [], crossOrigin: false };
     }
   } catch {
     // Unparseable input: treat as cross-origin (fail-closed for headers).
   }
-  return { headers: {}, withheld: supplied.map(([k]) => k) };
+  return { headers: {}, withheld: supplied.map(([k]) => k), crossOrigin: true };
 }
 
 // ── Lightning Address parsing ────────────────────────────────────────────────
@@ -272,6 +273,9 @@ function lnurlpMetadataUrl(username, domain) {
  *        headers (e.g. the internally produced Content-Type). Never withheld
  *        cross-origin (not operator-supplied) and dropped automatically when
  *        a redirect rewrite drops the body.
+ * @param {boolean} [opts.operatorBody]  True when `body` came from the
+ *        operator (--body). Such a body is NEVER forwarded across origins —
+ *        a cross-origin hop that would preserve it refuses with URL_POLICY.
  * @returns {Promise<Response>}
  */
 async function fetchWithRetry(
@@ -288,6 +292,7 @@ async function fetchWithRetry(
     portsUnrestricted = false,
     strictLocal = false,
     entityHeaders = {},
+    operatorBody = false,
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
@@ -394,7 +399,8 @@ async function fetchWithRetry(
     // enumerating custom credential-like names is impossible; see
     // withholdHeadersIfCrossOrigin). Only the internally reconstructed
     // Accept/Connection defaults continue.
-    if (nextUrl.origin !== current.origin) {
+    const crossedOrigins = nextUrl.origin !== current.origin;
+    if (crossedOrigins) {
       reqHeaders = {};
     }
     // WHATWG Fetch method semantics on redirect (review round 2): a 303
@@ -411,6 +417,20 @@ async function fetchWithRetry(
       reqBody = undefined;
       reqHeaders = Object.fromEntries(
         Object.entries(reqHeaders).filter(([k]) => !BODY_HEADERS.has(String(k).toLowerCase())),
+      );
+    }
+    // Body provenance policy (review round 3): an OPERATOR-supplied body
+    // (--body) is never forwarded across origins. Withholding its headers
+    // (above) while keeping the bytes is a disclosure in a form the operator
+    // never sanctioned — and a body-preserving 307/308 target would receive
+    // it without the Content-Type that describes it. Internal,
+    // call-site-generated redirect-safe bodies (entityHeaders path) are
+    // exempt by construction. Method rewrites above already dropped the body,
+    // so this fires only where the body would actually survive the hop.
+    if (crossedOrigins && operatorBody && reqBody !== undefined) {
+      throw policyError(
+        `Refusing to forward the operator-supplied request body across origins ` +
+          `(${current.origin} → ${nextUrl.origin}) — invoke the final URL explicitly if that is intended.`,
       );
     }
     current = assertAllowedUrl(nextUrl.toString(), allowedHosts, `${what} redirect target`, {

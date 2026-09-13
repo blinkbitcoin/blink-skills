@@ -2842,6 +2842,93 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     }
   });
 
+  it('operator BODIES are refused across origins — pre-flight 301/302/303 (review round 3)', async () => {
+    // The reviewer's probe: a bare-HEAD canonicalization that lands
+    // cross-origin previously forwarded the ORIGINAL method + operator body
+    // straight to the final origin, bypassing POST-302->GET semantics.
+    for (const status of [301, 302, 303]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (String(url).includes('attacker.example')) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://friend.example/api' : null) } };
+        }
+        return { status: 402, url: String(url), headers: { get: () => null }, text: async () => '' };
+      };
+      const payPath = path.join(scriptsDir, 'l402_pay.js');
+      const savedArgv = process.argv;
+      const origErr = console.error;
+      const origLog = console.log;
+      console.error = () => {};
+      console.log = () => {};
+      let threw = null;
+      try {
+        process.argv = [
+          'node',
+          'l402_pay.js',
+          'https://attacker.example/api',
+          '--dry-run',
+          '--no-store',
+          '--method',
+          'POST',
+          '--body',
+          '{"secret": "operator-payload"}',
+        ];
+        const { main } = require(payPath);
+        await main();
+      } catch (e) {
+        threw = e;
+      } finally {
+        process.argv = savedArgv;
+        console.error = origErr;
+        console.log = origLog;
+        global.fetch = origFetch;
+        delete require.cache[require.resolve(payPath)];
+      }
+      assert.ok(threw, `${status}: the command refuses`);
+      assert.match(threw.message, /operator-supplied body/i, `${status}: the error names the operator body`);
+      assert.match(
+        threw.message,
+        /friend\.example/,
+        `${status}: the error names the final URL for explicit re-invocation`,
+      );
+      const forwarded = seen.find((s) => s.url.includes('friend.example') && s.method !== 'HEAD');
+      assert.equal(forwarded, undefined, `${status}: zero body-carrying requests reach the redirect target`);
+    }
+  });
+
+  it('operator BODIES are refused across origins — in-chain 307/308 (review round 3)', async () => {
+    for (const status of [307, 308]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+        }
+        return { status: 200, headers: { get: () => null }, text: async () => 'ok' };
+      };
+      try {
+        await assert.rejects(
+          () =>
+            fetchWithRetry('https://first.example/start', {
+              method: 'POST',
+              body: 'operator-payload',
+              operatorBody: true,
+              retries: 0,
+              what: 'operator body probe',
+            }),
+          (e) => e.code === 'URL_POLICY' && /operator-supplied request body/i.test(e.message),
+          `${status}: policy refusal for the operator body`,
+        );
+        assert.equal(seen.length, 1, `${status}: hop 2 never dispatched`);
+      } finally {
+        global.fetch = origFetch;
+      }
+    }
+  });
+
   it('same-origin canonicalization keeps operator credential headers', async () => {
     const seen = [];
     const origFetch = global.fetch;
