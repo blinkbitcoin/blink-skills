@@ -66,7 +66,11 @@ function ensureSecureDir(dir) {
  */
 function migrateSecureFiles(dir) {
   if (migratedDirs.has(dir)) return;
-  migratedDirs.add(dir);
+  // NOTE: the dir is added to migratedDirs only AFTER both loops complete —
+  // marking it up front would let one transient failure (e.g. EACCES on the
+  // spark/ chmod) permanently disable hardening for the process, and the
+  // read-path callers deliberately swallow best-effort hardening errors
+  // (review round 2, PR #21).
   for (const name of SECURE_FILE_NAMES) {
     const file = path.join(dir, name);
     try {
@@ -87,6 +91,7 @@ function migrateSecureFiles(dir) {
       if (e.code !== 'ENOENT') throw e;
     }
   }
+  migratedDirs.add(dir);
 }
 
 /**

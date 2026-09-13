@@ -166,6 +166,34 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   return url;
 }
 
+/**
+ * The single cross-origin header policy (review round 1, PR #21): when a
+ * request's target origin changed — via pre-flight canonicalization (the l402
+ * scripts) or a redirect hop (fetchWithRetry, below) — the operator-supplied
+ * header set is withheld ENTIRELY, not filtered. Enumerating "credential-like"
+ * custom names (X-API-Key, x-auth-token, …) cannot be complete: --header is
+ * explicitly arbitrary, so anything the operator attached to origin A must not
+ * silently reach origin B. Internally controlled headers (Accept, Connection)
+ * are reconstructed by the fetch call sites and are not part of this set.
+ *
+ * @param {string} suppliedUrl   the originally requested URL
+ * @param {string} resolvedUrl   the canonical / post-redirect URL
+ * @param {object} headers       operator-supplied headers
+ * @returns {{ headers: object, withheld: string[] }} the (possibly emptied)
+ *   header set plus the names that were withheld
+ */
+function withholdHeadersIfCrossOrigin(suppliedUrl, resolvedUrl, headers) {
+  const supplied = Object.entries(headers || {});
+  try {
+    if (new URL(resolvedUrl).origin === new URL(suppliedUrl).origin) {
+      return { headers: { ...headers }, withheld: [] };
+    }
+  } catch {
+    // Unparseable input: treat as cross-origin (fail-closed for headers).
+  }
+  return { headers: {}, withheld: supplied.map(([k]) => k) };
+}
+
 // ── Lightning Address parsing ────────────────────────────────────────────────
 
 /**
@@ -240,36 +268,12 @@ function lnurlpMetadataUrl(username, domain) {
  * @param {Set<string>|string[]|null} [opts.allowedHosts]  Host allowlist applied
  *        to the initial URL and to every redirect target.
  * @param {string} [opts.what]  Label used in guard error messages.
+ * @param {object} [opts.entityHeaders]  Call-site-generated body-descriptive
+ *        headers (e.g. the internally produced Content-Type). Never withheld
+ *        cross-origin (not operator-supplied) and dropped automatically when
+ *        a redirect rewrite drops the body.
  * @returns {Promise<Response>}
  */
-/**
- * The single cross-origin header policy (review round 1, PR #21): when a
- * request's target origin changed — via pre-flight canonicalization (the l402
- * scripts) or a redirect hop (fetchWithRetry, below) — the operator-supplied
- * header set is withheld ENTIRELY, not filtered. Enumerating "credential-like"
- * custom names (X-API-Key, x-auth-token, …) cannot be complete: --header is
- * explicitly arbitrary, so anything the operator attached to origin A must not
- * silently reach origin B. Internally controlled headers (Accept, Connection)
- * are reconstructed by the fetch call sites and are not part of this set.
- *
- * @param {string} suppliedUrl   the originally requested URL
- * @param {string} resolvedUrl   the canonical / post-redirect URL
- * @param {object} headers       operator-supplied headers
- * @returns {{ headers: object, withheld: string[] }} the (possibly emptied)
- *   header set plus the names that were withheld
- */
-function withholdHeadersIfCrossOrigin(suppliedUrl, resolvedUrl, headers) {
-  const supplied = Object.entries(headers || {});
-  try {
-    if (new URL(resolvedUrl).origin === new URL(suppliedUrl).origin) {
-      return { headers: { ...headers }, withheld: [] };
-    }
-  } catch {
-    // Unparseable input: treat as cross-origin (fail-closed for headers).
-  }
-  return { headers: {}, withheld: supplied.map(([k]) => k) };
-}
-
 async function fetchWithRetry(
   url,
   {
@@ -283,6 +287,7 @@ async function fetchWithRetry(
     body = undefined,
     portsUnrestricted = false,
     strictLocal = false,
+    entityHeaders = {},
   } = {},
 ) {
   // Guard failures are deterministic policy decisions, not transient network
@@ -299,8 +304,6 @@ async function fetchWithRetry(
   //   - 303: method becomes GET, body dropped (any original method);
   //   - 301/302: POST becomes GET, body dropped (other methods unchanged);
   //   - 307/308: method and body are preserved.
-  // (CREDENTIAL_HEADERS lives at module scope — the L402 scripts reuse it for
-  // their pre-flight canonicalization origin check.)
   // Headers that describe the request BODY — native Fetch removes them when a
   // redirect rewrite drops the body (a redirected GET must not advertise a
   // Content-Type for a body it no longer carries).
@@ -333,7 +336,20 @@ async function fetchWithRetry(
           body: reqBody,
           signal: controller.signal,
           redirect: 'manual',
-          headers: { Accept: 'application/json', Connection: 'close', ...reqHeaders },
+          headers: {
+            Accept: 'application/json',
+            Connection: 'close',
+            ...reqHeaders,
+            // Entity headers are CALL-SITE-GENERATED body descriptors (the
+            // internally produced Content-Type), distinct from operator
+            // headers by construction: they are never withheld cross-origin
+            // (they carry nothing operator-supplied) and vanish automatically
+            // whenever a rewrite drops the body — a redirected GET must not
+            // advertise headers for a body it no longer carries (review
+            // round 2, PR #21: a cross-origin 307/308 previously sent the
+            // internal JSON body WITHOUT its Content-Type).
+            ...(reqBody !== undefined ? entityHeaders : {}),
+          },
         });
         // A 404 is the LUD-16 "not found" signal, but it is ALSO what a
         // transient proxy/CDN/WAF returns in front of a healthy LNURL server

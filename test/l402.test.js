@@ -2774,6 +2774,74 @@ describe('security: L402 SSRF guard (audit fix 1)', () => {
     );
   });
 
+  it('cross-origin 307/308 PRESERVE the internal body WITH its entity Content-Type (production payment_request_url shape)', async () => {
+    // Review round 2: full header withholding previously dropped the
+    // call-site-generated Content-Type while 307/308 kept the body — the
+    // redirected endpoint received a body it could not interpret. Entity
+    // headers are modeled separately and survive WITH the body.
+    for (const status of [307, 308]) {
+      const seen = [];
+      const origFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        seen.push({ url: String(url), method: opts.method, body: opts.body, headers: { ...(opts.headers || {}) } });
+        if (seen.length === 1) {
+          return { status, headers: { get: (n) => (n === 'location' ? 'https://other.example/pay' : null) } };
+        }
+        return {
+          status: 200,
+          ok: true,
+          url: String(url),
+          headers: { get: () => null },
+          json: async () => ({ invoice: 'lnbc1x' }),
+        };
+      };
+      try {
+        const { fetchL402ProtocolInvoice: fetchInvoice } = require(path.join(scriptsDir, 'l402_discover.js'));
+        const result = await fetchInvoice('https://first.example/pay', 15_000, null);
+        assert.ok(result && result.invoice === 'lnbc1x', 'the production helper parses the response');
+        assert.equal(seen.length, 2, status);
+        const hop2 = seen[1];
+        assert.equal(hop2.url, 'https://other.example/pay', status);
+        assert.equal(hop2.method, 'POST', `${status}: method preserved`);
+        assert.equal(hop2.body, '{}', 'the internal JSON body preserved');
+        assert.equal(
+          hop2.headers['Content-Type'],
+          'application/json',
+          `${status}: entity Content-Type travels WITH the body`,
+        );
+      } finally {
+        global.fetch = origFetch;
+        delete require.cache[require.resolve(path.join(scriptsDir, 'l402_discover.js'))];
+      }
+    }
+  });
+
+  it('entity headers vanish when a redirect rewrite drops the body', async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      seen.push({ method: opts.method, body: opts.body, headers: { ...(opts.headers || {}) } });
+      if (seen.length === 1) {
+        return { status: 302, headers: { get: (n) => (n === 'location' ? 'https://other.example/x' : null) } };
+      }
+      return { status: 200, url: String(url), headers: { get: () => null }, text: async () => 'ok' };
+    };
+    try {
+      await fetchWithRetry('https://first.example/start', {
+        method: 'POST',
+        body: 'payload',
+        entityHeaders: { 'Content-Type': 'application/json' },
+        retries: 0,
+        what: 'entity rewrite probe',
+      });
+      assert.equal(seen[1].method, 'GET');
+      assert.equal(seen[1].body, undefined);
+      assert.equal(seen[1].headers['Content-Type'], undefined, 'no entity headers for a body that no longer exists');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
   it('same-origin canonicalization keeps operator credential headers', async () => {
     const seen = [];
     const origFetch = global.fetch;
@@ -2874,6 +2942,51 @@ describe('security: secure state files (audit fix 2)', () => {
       assert.equal(fsMod.statSync(pathMod.join(dir, 'budget.json')).mode & 0o777, 0o600, 'new file 0600');
       assert.ok(!fsMod.existsSync(pathMod.join(dir, 'budget.json.' + process.pid + '.tmp')), 'no temp residue');
     } finally {
+      fsMod.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('a TRANSIENT migration failure does not permanently disable hardening (injected EACCES, review round 2)', () => {
+    const os = require('node:os');
+    const fsMod = require('node:fs');
+    const pathMod = require('node:path');
+    const sfPath = require.resolve(path.join(scriptsDir, '_secure_files'));
+    const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'l402-retry-'));
+    const savedModule = require.cache[sfPath];
+    const realChmod = fsMod.chmodSync;
+    try {
+      const dir = pathMod.join(tmp, 'state');
+      fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const sparkDir = pathMod.join(dir, 'spark');
+      fsMod.mkdirSync(sparkDir, { recursive: true });
+      fsMod.chmodSync(sparkDir, 0o775);
+
+      // Fresh module: the once-per-process guard starts clean.
+      delete require.cache[sfPath];
+      const fresh = require(sfPath);
+
+      // Inject ONE synthetic EACCES on the spark/ chmod: the first call throws…
+      let injected = true;
+      fsMod.chmodSync = (p, ...rest) => {
+        if (injected && String(p) === sparkDir) {
+          injected = false;
+          const e = new Error(`EACCES: permission denied, chmod '${p}'`);
+          e.code = 'EACCES';
+          throw e;
+        }
+        return realChmod.call(fsMod, p, ...rest);
+      };
+      assert.throws(() => fresh.ensureSecureStateDir(dir), /EACCES/, 'the transient failure propagates');
+
+      // …the SECOND call (after the transient condition clears) must RETRY —
+      // not no-op on a prematurely-marked migration — and actually tighten.
+      fresh.ensureSecureStateDir(dir);
+      const mode = fsMod.statSync(sparkDir).mode & 0o777;
+      assert.equal(mode, 0o700, 'the retry ran and hardened spark/ (0775 -> 0700)');
+    } finally {
+      fsMod.chmodSync = realChmod;
+      if (savedModule) require.cache[sfPath] = savedModule;
+      else delete require.cache[sfPath];
       fsMod.rmSync(tmp, { recursive: true, force: true });
     }
   });
