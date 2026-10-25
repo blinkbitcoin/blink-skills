@@ -10,7 +10,8 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Setup gotchas
 
-- Node lines: **24** = primary dev/release Node (nvm default, `.nvmrc`); **22** = the Spark floor, kept in the release matrix (system `/usr/bin/node`). The user-facing floor stays "Node 22+" for Spark — do not raise it to 24 (nothing needs 24; Node 22 is supported until ~Apr 2027). `engines` stays `>=18` because the custodial commands are documented as Node 18+, but nothing below 22 is tested (18/20 are EOL).
+- Node lines (release matrix = all three): **24** = primary dev/release Node (nvm default, `.nvmrc`); **22** = the Spark floor (system `/usr/bin/node`); **18** = the declared `engines` floor for the custodial commands (`~/.nvm/versions/node/v18.20.8/bin/node`). The user-facing Spark floor stays "Node 22+" — do not raise it to 24 (nothing needs 24; Node 22 is supported until ~Apr 2027). `engines` stays `>=18` because README/SKILL.md document custodial as Node 18+; the Node 18 run is what keeps that contract honest. Dropping it means raising `engines` AND updating those docs in one coordinated support-policy change (PR #22 review).
+- NEVER `npm install` under Node 18 — it would silently drop the Node-22-only optional deps. Run Node 18 tests against the tree installed under 22/24.
 - The Breez SDK requires **Node 22+**. npm under Node 20 **silently skips** the optional dependency (`engines` mismatch) leaving `node_modules/@breeztech` EMPTY — installs must run under Node 22+.
 - `better-sqlite3` is a native build compiled for ONE Node ABI (22 = 127, 24 = 137). Switching Node versions in the same tree breaks it (`ERR_DLOPEN_FAILED … NODE_MODULE_VERSION`) — `npm rebuild better-sqlite3` under the Node you are about to use, and verify by opening a database, not by exit code:
   `node -e "new (require('better-sqlite3'))(':memory:').prepare('select 1').get()"`
@@ -18,7 +19,10 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Testing
 
-- `npm test` must run on BOTH Node 24 (default `node`) and Node 22 (`/usr/bin/node --test test/*.test.js`) before releasing; both must show **all tests passing, 0 skipped**. A handful of tests are Node-22-gated and skip below 22 — that path is not exercised locally (no Node <22 installed). Do not hard-code counts here — they drift every release.
+- The suite must run on ALL THREE Node lines before releasing:
+  - Node 24 (`npm test`) and Node 22 (`/usr/bin/node --test test/*.test.js`): **all tests passing, 0 skipped**.
+  - Node 18 (`~/.nvm/versions/node/v18.20.8/bin/node --test test/*.test.js`): **0 failed**, and every skip must be a Node-22-gated one (reason `requires Node 22+`) — any other skip or a failure is a broken custodial contract. Check reasons, not counts: `… | grep -E '# SKIP' | grep -v 'requires Node 22+'` must print nothing. The `better-sqlite3` smoke check does not apply on 18 (Spark is unsupported there).
+  - Do not hard-code counts here — they drift every release.
 - Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (`Module._load` interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests that are Node-22-gated; the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
@@ -32,7 +36,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Release ritual (in order — every step)
 
 1. Merge the PR (squash + admin + delete branch).
-2. Verify main locally: full suite on **both** Node 24 and Node 22, the `better-sqlite3` smoke check (rebuild per Node, see Setup gotchas), lint, `format:check`, clean tree.
+2. Verify main locally: full suite on Node 24, 22, and 18 (see Testing), the `better-sqlite3` smoke check on 24 and 22 (rebuild per Node, see Setup gotchas), lint, `format:check`, clean tree.
 3. Tag `vX.Y.Z` at the merge commit, push the tag.
 4. GitHub release (`gh release create vX.Y.Z --latest`) with notes + stats table.
 5. **Publish to ClawHub from main** (clean provenance):
@@ -43,7 +47,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
      --source-repo blinkbitcoin/blink-skills --source-ref vX.Y.Z \
      --source-commit <merge-sha> --source-path blink --json
    ```
-   Dry-run first (`--dry-run --json`). CLI is installed at the nvm Node 24 bin (`~/.nvm/versions/node/v24.22.1/bin/clawhub`); auth persists (`clawhub whoami` → pretyflaco).
+   Dry-run first (`--dry-run --json`). CLI is installed at the nvm Node 24 bin (maintainer host: `~/.nvm/versions/node/v24.22.1/bin/clawhub`); auth persists (`clawhub whoami` → pretyflaco).
    ClawHub gotchas (learned publishing 2.6.0):
    - The topic `openclaw` is **reserved** by ClawHub — using it fails the publish (and rate-limits validation ~50s).
    - Publish returns `pending-publication`: the version goes through ClawHub's security scan before the registry serves it. `clawhub skill verify` fails while the current published version is not scan-clean.
