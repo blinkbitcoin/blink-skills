@@ -919,7 +919,9 @@ commands['l402-pay'] = {
     method: { type: 'string', default: 'GET' },
     header: { type: 'string', multiple: true },
     body: { type: 'string' },
-    'no-store': { type: 'boolean', default: false },
+    // Declared positive so `--no-store` works via allowNegative; a literal
+    // 'no-store' option is shadowed by it and silently dropped (PR #23 review).
+    store: { type: 'boolean', default: true },
     force: { type: 'boolean', default: false },
     probe: { type: 'boolean', default: false },
     spark: { type: 'boolean', default: false },
@@ -936,7 +938,7 @@ commands['l402-pay'] = {
     method: { description: 'HTTP method (default: GET)', valueName: 'method' },
     header: { description: 'Extra request header in key:value format (repeatable)', valueName: 'key:value' },
     body: { description: 'Request body for POST/PUT', valueName: 'string' },
-    'no-store': { description: 'Disable token cache for this request' },
+    store: { description: 'Cache L402 tokens (use --no-store to disable the token cache for this request)' },
     force: { description: 'Pay fresh even if a valid cached token exists (never bypasses budget/domain checks)' },
     probe: { description: 'Run fee probe before paying; adds feeProbe field to output' },
     spark: { description: 'Pay from the self-custodial (Spark) wallet via the Breez SDK' },
@@ -946,6 +948,7 @@ commands['l402-pay'] = {
     'blink l402-pay https://api.example.com/resource --max-amount 500',
     'blink l402-pay https://api.example.com/resource --max-amount 500 --probe',
     'blink l402-pay https://api.example.com/resource --force',
+    'blink l402-pay https://api.example.com/resource --no-store',
     'blink l402-pay https://api.example.com/resource --spark',
   ],
   action: async (pos, opts) => {
@@ -959,7 +962,7 @@ commands['l402-pay'] = {
       for (const h of headers) argv.push('--header', h);
     }
     if (opts.body) argv.push('--body', opts.body);
-    if (opts['no-store']) argv.push('--no-store');
+    if (!opts.store) argv.push('--no-store');
     if (opts.force) argv.push('--force');
     if (opts.probe) argv.push('--probe');
     if (opts.spark) argv.push('--spark');
@@ -1292,6 +1295,9 @@ async function main() {
     options: { ...cmd.options, help: { type: 'boolean', short: 'h' } },
     allowPositionals: true,
     // `--no-<opt>` support; needs Node 22.4.0+ — this is what sets engines >=22.4.0.
+    // NEVER declare an option literally named `no-*`: allowNegative shadows it
+    // (`--no-x` becomes x=false and the declared option stays false). Declare it
+    // positive with default true instead — see l402-pay `store` (PR #23 review).
     allowNegative: true,
     strict: true,
   };
