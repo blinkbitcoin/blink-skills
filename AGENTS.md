@@ -10,12 +10,15 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Setup gotchas
 
-- The Breez SDK requires **Node 22+**. npm under Node 20 **silently skips** the optional dependency (`engines` mismatch) leaving `node_modules/@breeztech` EMPTY — installs must run under Node 22 (`~/.nvm/versions/node/v22.23.2/bin`).
-- `better-sqlite3` is a native build: if tests/storage fail with binding errors, `npm rebuild better-sqlite3` under Node 22 and verify by opening a database, not by exit code.
+- Node lines: **24** = primary dev/release Node (nvm default, `.nvmrc`); **22** = the Spark floor, kept in the release matrix (system `/usr/bin/node`). The user-facing floor stays "Node 22+" for Spark — do not raise it to 24 (nothing needs 24; Node 22 is supported until ~Apr 2027). `engines` stays `>=18` because the custodial commands are documented as Node 18+, but nothing below 22 is tested (18/20 are EOL).
+- The Breez SDK requires **Node 22+**. npm under Node 20 **silently skips** the optional dependency (`engines` mismatch) leaving `node_modules/@breeztech` EMPTY — installs must run under Node 22+.
+- `better-sqlite3` is a native build compiled for ONE Node ABI (22 = 127, 24 = 137). Switching Node versions in the same tree breaks it (`ERR_DLOPEN_FAILED … NODE_MODULE_VERSION`) — `npm rebuild better-sqlite3` under the Node you are about to use, and verify by opening a database, not by exit code:
+  `node -e "new (require('better-sqlite3'))(':memory:').prepare('select 1').get()"`
+- The test suite **mocks** `better-sqlite3`, so a green run (even 0 skipped) does NOT prove the real binding loads. Run the smoke check above.
 
 ## Testing
 
-- `npm test` must run on BOTH Node versions before releasing: the default Node shows the Node-22-gated skips (a handful of tests skip below Node 22), and the Node 22 run must show **all tests passing, 0 skipped**. Do not hard-code counts here — they drift every release.
+- `npm test` must run on BOTH Node 24 (default `node`) and Node 22 (`/usr/bin/node --test test/*.test.js`) before releasing; both must show **all tests passing, 0 skipped**. A handful of tests are Node-22-gated and skip below 22 — that path is not exercised locally (no Node <22 installed). Do not hard-code counts here — they drift every release.
 - Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (`Module._load` interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests that are Node-22-gated; the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
@@ -29,7 +32,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Release ritual (in order — every step)
 
 1. Merge the PR (squash + admin + delete branch).
-2. Verify main locally: full suite on **both** Node versions, lint, `format:check`, clean tree.
+2. Verify main locally: full suite on **both** Node 24 and Node 22, the `better-sqlite3` smoke check (rebuild per Node, see Setup gotchas), lint, `format:check`, clean tree.
 3. Tag `vX.Y.Z` at the merge commit, push the tag.
 4. GitHub release (`gh release create vX.Y.Z --latest`) with notes + stats table.
 5. **Publish to ClawHub from main** (clean provenance):
@@ -40,7 +43,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
      --source-repo blinkbitcoin/blink-skills --source-ref vX.Y.Z \
      --source-commit <merge-sha> --source-path blink --json
    ```
-   Dry-run first (`--dry-run --json`). CLI is installed at the nvm node-20 bin; auth persists (`clawhub whoami` → pretyflaco).
+   Dry-run first (`--dry-run --json`). CLI is installed at the nvm Node 24 bin (`~/.nvm/versions/node/v24.22.1/bin/clawhub`); auth persists (`clawhub whoami` → pretyflaco).
    ClawHub gotchas (learned publishing 2.6.0):
    - The topic `openclaw` is **reserved** by ClawHub — using it fails the publish (and rate-limits validation ~50s).
    - Publish returns `pending-publication`: the version goes through ClawHub's security scan before the registry serves it. `clawhub skill verify` fails while the current published version is not scan-clean.
