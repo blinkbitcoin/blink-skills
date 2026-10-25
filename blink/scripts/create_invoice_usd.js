@@ -176,7 +176,7 @@ async function main() {
   // Graceful fallback when WebSocket is not available
   if (typeof WebSocket !== 'function') {
     console.error(
-      'Warning: WebSocket not available, skipping auto-subscribe. Run with node --experimental-websocket for auto-subscribe.',
+      'Warning: WebSocket not available, skipping auto-subscribe. Auto-subscribe requires Node.js 22+ (native WebSocket).',
     );
     return;
   }

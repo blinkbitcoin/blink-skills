@@ -1,12 +1,12 @@
 # Blink Lightning CLI
 
-Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
+Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 22+ built-ins only.
 
 35 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
 
 ## Highlights
 
-- **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
+- **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 22+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
 - **35 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
@@ -23,13 +23,13 @@ credentials you need differ.
 | ---------------------- | ------------------------- | ---------------------------------------------------------- |
 | **Who holds the keys** | Blink                     | **You** (a 12-word seed)                                   |
 | **You need**           | `BLINK_API_KEY`           | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
-| **Runtime deps**       | None (Node 18+ built-ins) | Two optional packages, **Node 22+**                        |
+| **Runtime deps**       | None (Node 22+ built-ins) | Two optional packages, **Node 22+**                        |
 | **Balance / history**  | Blink API                 | Local, via the Breez SDK (not on the Blink API)            |
 | **Receive**            | Blink API invoice         | Public LNURL-pay on `blink.sv` — **no credentials needed** |
 | **Send**               | Blink API                 | Signed locally by the SDK (not on the Blink API)           |
 
 **Custodial — benefits:** simplest setup (one API key, nothing to build); runs
-on Node 18+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
+on Node 22+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
 toolkit.
 **Limitations:** Blink holds the funds — you trust Blink's solvency and
 availability, and the API key is the only thing between an attacker and your

@@ -94,7 +94,7 @@ node subscribe_invoice.js <bolt11_invoice> --timeout 600
 ```
 
 Pros: Decouples creation from monitoring, configurable timeout.
-Cons: Requires Node 22+ (or Node 20+ with `--experimental-websocket`).
+Cons: Two separate commands to run and coordinate.
 
 ## Invoice Status Values
 
@@ -168,8 +168,6 @@ For USD invoices, set timeout to match or be shorter than the ~5 minute invoice 
 
 ## WebSocket Requirements
 
-- **Node 22+**: WebSocket is built-in, no flags needed
-- **Node 20-21**: Requires `--experimental-websocket` flag
-- **Node < 20**: Not supported for subscription features
+- **Node 22+** (the minimum for all commands): WebSocket is built-in, no flags needed
 
 Scripts that use WebSocket: `create_invoice.js`, `create_invoice_usd.js`, `subscribe_invoice.js`, `subscribe_updates.js`.

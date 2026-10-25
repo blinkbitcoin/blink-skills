@@ -12,7 +12,7 @@
  * Spending log persisted at ~/.blink/spending-log.json.
  * Entries older than 25 hours are auto-pruned on every write.
  *
- * Zero external dependencies — Node.js 18+ built-ins only.
+ * Zero external dependencies — Node.js 22+ built-ins only.
  */
 
 'use strict';

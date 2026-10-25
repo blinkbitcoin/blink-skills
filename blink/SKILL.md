@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.6.2
+version: 3.0.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.6.2'
+    version: '3.0.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -68,7 +68,7 @@ commands). Key concepts:
 
 ## Environment
 
-- Requires `bash` and Node.js 18+ (Node 22+ for the non-custodial `spark-*` commands, `l402-pay --spark`, and WebSocket subscriptions; Node 20+ can use `--experimental-websocket`).
+- Requires `bash` and Node.js 22+ (all commands, including the non-custodial `spark-*` commands, `l402-pay --spark`, and WebSocket subscriptions).
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
@@ -576,7 +576,7 @@ Streams live Spark wallet events as NDJSON (one JSON line per event). `--timeout
 
 ## Realtime Subscriptions
 
-Blink supports GraphQL subscriptions over WebSocket using the `graphql-transport-ws` protocol. Requires Node 22+ for native WebSocket, or Node 20+ with the `--experimental-websocket` flag.
+Blink supports GraphQL subscriptions over WebSocket using the `graphql-transport-ws` protocol. Uses the native WebSocket built into Node 22+ (no flags needed).
 
 ### Subscribe to Invoice Payment Status
 

@@ -19,7 +19,7 @@
  *   BLINK_L402_ALLOWED_DOMAINS override the config file at runtime.
  *
  * Output: JSON to stdout. Status messages to stderr.
- * Dependencies: None (Node.js 18+ built-ins only).
+ * Dependencies: None (Node.js 22+ built-ins only).
  */
 
 'use strict';

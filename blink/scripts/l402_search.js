@@ -22,7 +22,7 @@
  * No API key required — both directories have free browse APIs.
  *
  * Output: JSON to stdout. Status messages to stderr.
- * Dependencies: None (Node.js 18+ built-in fetch).
+ * Dependencies: None (Node.js 22+ built-in fetch).
  */
 
 'use strict';

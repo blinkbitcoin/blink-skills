@@ -755,7 +755,7 @@ commands['account-info'] = {
 };
 
 commands['subscribe-invoice'] = {
-  description: 'Watch a Lightning invoice for payment via WebSocket (requires Node 22+ or --experimental-websocket)',
+  description: 'Watch a Lightning invoice for payment via WebSocket (requires Node 22+)',
   args: [{ name: 'bolt11', required: true, description: 'BOLT-11 payment request string (lnbc...)' }],
   options: {
     timeout: { type: 'string', default: '300' },
