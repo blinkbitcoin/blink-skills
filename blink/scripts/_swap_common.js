@@ -9,7 +9,7 @@
  * License 2.0. Ported to blink-skill with modifications for v1.0.0 CLI
  * integration. See NOTICE file for full attribution.
  *
- * Zero external dependencies — Node.js 18+ built-ins only.
+ * Zero external dependencies — Node.js 22+ built-ins only.
  */
 
 const { graphqlRequest, CONVERSION_QUERY, MUTATION_TIMEOUT_MS, getAllWallets } = require('./_blink_client');

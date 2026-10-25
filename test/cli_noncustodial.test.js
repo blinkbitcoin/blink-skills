@@ -529,6 +529,50 @@ describe('CLI: options reach the underlying script', () => {
   });
 });
 
+// ── negated options (PR #23 review: the engines floor) ───────────────────────
+//
+// `--no-<opt>` relies on util.parseArgs({ allowNegative: true }), which only
+// exists from Node 22.4.0 — that is what sets `engines >=22.4.0`. On 22.0–22.3
+// strict parsing rejects these with "Unknown option". The non-numeric amount
+// makes each command fail in coercion, which runs AFTER parseArgs, so reaching
+// that error proves the negation parsed — with no network and no credentials.
+// This is the test that turns red if the suite is run below the floor.
+
+describe('CLI: documented negated options parse (Node 22.4+ floor)', () => {
+  for (const args of [
+    ['create-invoice', 'abc', '--no-subscribe'],
+    ['create-invoice-usd', 'abc', '--no-subscribe'],
+    ['create-invoice-lnaddress', 'user@blink.sv', 'abc', '--no-verify'],
+  ]) {
+    it(`${args[0]} accepts ${args[args.length - 1]}`, async () => {
+      const { code, stderr } = await runCli(args, { stub: false });
+      assert.doesNotMatch(stderr, /Unknown option/);
+      assert.match(stderr, /'amount' must be a positive integer/);
+      assert.equal(code, 1);
+    });
+  }
+
+  // The inverse hazard (PR #23 review, High): with allowNegative, an option
+  // DECLARED with a literal `no-` name is shadowed — `--no-x` parses as the
+  // negation of a phantom `x`, so the declared option silently stays false.
+  // Negatable options must be declared positive (`store`, default true) and
+  // documented as `--no-store`. Scans every command's real --help output.
+  it('no command declares a literal --no-* option (allowNegative would shadow it)', async () => {
+    const { stdout } = await runCli(['--help'], { stub: false });
+    const names = [...stdout.matchAll(/^ {2}([a-z][a-z0-9-]+) {2,}/gm)].map((m) => m[1]);
+    assert.ok(names.length >= 30, `expected the full command list, got ${names.length}`);
+    const offenders = [];
+    await Promise.all(
+      names.map(async (name) => {
+        const help = await runCli([name, '--help'], { stub: false });
+        assert.equal(help.code, 0, `${name} --help`);
+        for (const m of help.stdout.matchAll(/^ {2}(--no-[a-z0-9-]+)/gm)) offenders.push(`${name} ${m[1]}`);
+      }),
+    );
+    assert.deepEqual(offenders, []);
+  });
+});
+
 // ── exit codes (review finding #6) ───────────────────────────────────────────
 
 describe('CLI: spark-send exit code reflects payment outcome', () => {
@@ -1029,6 +1073,50 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     } finally {
       server.close();
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #23 review (High): a literal `'no-store'` option is shadowed by
+  // parseArgs({ allowNegative }) on Node 22.4+/20.16+ — it parsed as
+  // {store:false, 'no-store':false}, so the CLI silently dropped --no-store and
+  // cached the macaroon + preimage (a reusable bearer credential) despite the
+  // opt-out. Self-validating: the counterfactual run WITHOUT --no-store must
+  // persist the token, proving the absence check below can fail.
+  it('--no-store reaches l402_pay.js through the CLI and prevents token persistence', async () => {
+    const server = await startServer();
+    const { address, port } = server.address();
+    const pay = async (extra) => {
+      const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+      const result = await new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ['--require', stubPath, binPath, 'l402-pay', `http://${address}:${port}/resource`, '--spark', ...extra],
+          {
+            env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
+            timeout: 15000,
+            killSignal: 'SIGKILL',
+          },
+          (err, stdout) => resolve({ err, stdout }),
+        );
+      });
+      const storeFile = path.join(home, '.blink', 'l402-tokens.json');
+      const stored = fs.existsSync(storeFile) ? JSON.parse(fs.readFileSync(storeFile, 'utf8')) : null;
+      fs.rmSync(home, { recursive: true, force: true });
+      return { j: JSON.parse(result.stdout), stored };
+    };
+    try {
+      const control = await pay([]);
+      assert.equal(control.j.event, 'l402_paid');
+      assert.ok(
+        control.stored && control.stored['127.0.0.1/resource'],
+        'counterfactual: default run persists the token',
+      );
+
+      const optedOut = await pay(['--no-store']);
+      assert.equal(optedOut.j.event, 'l402_paid');
+      assert.equal(optedOut.stored, null, '--no-store must not write ~/.blink/l402-tokens.json');
+    } finally {
+      server.close();
     }
   });
 });

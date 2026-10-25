@@ -20,7 +20,7 @@
  * requests a BOLT-11 invoice from the callback, and (for LUD-21) polls the
  * `verify` URL to detect settlement. It contains NO Blink GraphQL logic.
  *
- * Zero external dependencies — Node.js 18+ built-ins only (native fetch).
+ * Zero external dependencies — Node.js 22+ built-ins only (native fetch).
  */
 
 const DEFAULT_LNURL_TIMEOUT_MS = 10_000;

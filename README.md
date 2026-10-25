@@ -1,16 +1,16 @@
 # Blink Lightning CLI
 
-Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 18+ built-ins only.
+Bitcoin Lightning wallet for the command line — zero required runtime npm dependencies, Node.js 22.4+ built-ins only.
 
 35 commands for custodial and self-custodial (Spark) wallet management, payments, invoices, swaps, L402 paywall operations (consumer + producer), service discovery, and budget controls. It's just a CLI — anything that can run a process and set an environment variable can use it: a shell, a cron job, a Python bot on a VPS, or an AI agent.
 
 ## Highlights
 
-- **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 18+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
+- **Zero required runtime dependencies** — custodial and credential-free commands use only Node.js 22.4+ built-ins (`node:crypto`, `node:fs`, `node:util`, etc.); two optional packages power the self-custodial `spark-*` commands and load only when one runs
 - **35 commands** — balance, payments, invoices, QR codes, swaps, non-custodial (Spark) accounts, L402 consumer + producer, service discovery, budget controls
 - **Custodial + self-custodial** — use a Blink custodial account, or hold your own keys in a Spark account via the Breez SDK
 - **L402 paywall toolkit** — create Lightning paywalls (producer) and pay them (consumer)
-- **777 tests**, 0 failing — `node:test` framework, no test library dependencies
+- **782 tests**, 0 failing — `node:test` framework, no test library dependencies
 - **JSON-first output** — structured JSON to stdout, status messages to stderr
 - **AI-agent native** — published on [ClawHub](https://clawhub.com) for OpenClaw/Hermes agents; equally usable by any script or bot
 
@@ -23,13 +23,13 @@ credentials you need differ.
 | ---------------------- | ------------------------- | ---------------------------------------------------------- |
 | **Who holds the keys** | Blink                     | **You** (a 12-word seed)                                   |
 | **You need**           | `BLINK_API_KEY`           | `SPARK_MNEMONIC` + `BREEZ_API_KEY`                         |
-| **Runtime deps**       | None (Node 18+ built-ins) | Two optional packages, **Node 22+**                        |
+| **Runtime deps**       | None (Node 22.4+ built-ins) | Two optional packages, **Node 22.4+**                        |
 | **Balance / history**  | Blink API                 | Local, via the Breez SDK (not on the Blink API)            |
 | **Receive**            | Blink API invoice         | Public LNURL-pay on `blink.sv` — **no credentials needed** |
 | **Send**               | Blink API                 | Signed locally by the SDK (not on the Blink API)           |
 
 **Custodial — benefits:** simplest setup (one API key, nothing to build); runs
-on Node 18+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
+on Node 22.4+; USD/Stablesats wallets and swaps; the full L402 producer/consumer
 toolkit.
 **Limitations:** Blink holds the funds — you trust Blink's solvency and
 availability, and the API key is the only thing between an attacker and your
@@ -41,7 +41,7 @@ address); send is signed locally with no server signer.
 **Limitations:** whoever has the seed has the funds — lose it and they're gone,
 leak it and they're stolen; funds are BTC plus BTKN tokens (USDB — send,
 receive, and sats<->token conversions; USD/Stablesats remains custodial-side);
-requires Node 22+ and a native module build; and the extra `BREEZ_API_KEY`.
+requires Node 22.4+ and a native module build; and the extra `BREEZ_API_KEY`.
 
 Both account types share the `blink.sv` Lightning-address domain — the account
 type is not encoded in the address. See
@@ -116,7 +116,7 @@ custodial or non-custodial; uses public LNURL-pay on `blink.sv`):
 | `blink create-invoice-lnaddress <addr> <sats> [memo]` | Receive to any Blink address via LNURL-pay + LUD-21 verify (no API key) |
 
 **Balance / send / history / events — require the account seed** via the Breez
-Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22+**). Set
+Spark SDK (optional dependency `@breeztech/breez-sdk-spark`, **Node 22.4+**). Set
 `SPARK_MNEMONIC` (12/24 BIP39 words — spend authority, keep secret) and
 `BREEZ_API_KEY`:
 
@@ -162,7 +162,7 @@ custodial command, and neither is loaded unless a `spark-*` command or `l402-pay
 npm install   # installs optionalDependencies by default
 ```
 
-- **`@breeztech/breez-sdk-spark`** (Node 22+) stores wallet state in SQLite via
+- **`@breeztech/breez-sdk-spark`** (Node 22.4+) stores wallet state in SQLite via
   **`better-sqlite3`, a native module that is compiled during install.** It
   needs `python3`, `make` and a C++ compiler (`build-essential` on Debian/Ubuntu,
   Xcode command line tools on macOS).
@@ -258,7 +258,7 @@ export BLINK_API_URL="https://api.staging.blink.sv/graphql"
 ## Testing
 
 ```bash
-npm test    # 777 tests, node:test framework, zero test dependencies
+npm test    # 782 tests, node:test framework, zero test dependencies
 ```
 
 ## Documentation

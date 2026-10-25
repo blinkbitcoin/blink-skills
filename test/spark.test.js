@@ -1733,7 +1733,6 @@ describe('_spark_sdk.connect() lnurlDomain wiring', () => {
   // canonicalization unit tests above run everywhere.
   it(
     'the SDK receives lnurlDomain blink.sv (mainnet) / staging.blink.sv (regtest)',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const saved = {
         home: os.homedir,
@@ -2046,7 +2045,6 @@ describe('suppressSdkStdoutNoise (pinned Node storage, review round 1)', () => {
 
   it(
     'a duplicate payment update leaks to stdout UNGUARDED and is silenced by the production guard',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       let storage;
       let dir;
@@ -2353,7 +2351,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'initLogging is awaited BEFORE connect; guard held until disconnect and restored exactly once',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
       const savedHome = os.homedir;
@@ -2387,7 +2384,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'guard restored when mod.connect() rejects',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
       const savedHome = os.homedir;
@@ -2415,7 +2411,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'guard restored when the SDK disconnect() rejects (cleanup finally)',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const tmpHome = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'spark-guard-'));
       const savedHome = os.homedir;
@@ -2447,7 +2442,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'NEVER-SETTLING disconnect: the public timeout returns but the guard STAYS installed; release only when the real disconnect settles',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const originalDebug = console.debug;
       let settleRealDisconnect;
@@ -2488,7 +2482,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'LATE-SETTLING disconnect: same guarantees when settlement arrives well after the timeout',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       const originalDebug = console.debug;
       let settleRealDisconnect;
@@ -2520,7 +2513,6 @@ describe('connect() stdout-guard lifecycle (SDK-package interception)', () => {
 
   it(
     'connect proceeds when the SDK has NO initLogging and when initLogging rejects',
-    { skip: parseInt(process.versions.node, 10) < 22 ? 'requires Node 22+' : false },
     async () => {
       // No initLogging at all — older SDK builds.
       let harness = installFakeSdk({ connectImpl: () => fakeSdkWith(async () => {}), withInitLogging: false });

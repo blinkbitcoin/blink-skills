@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 2.6.2
+version: 3.0.0
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '2.6.2'
+    version: '3.0.0'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -42,7 +42,7 @@ metadata:
       network: "outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands and l402-pay --spark; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient's address/callback hosts during SDK parse/prepare (before a budget rejection)"
       filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command or l402-pay --spark is used'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
-      notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands and l402-pay --spark: @breeztech/breez-sdk-spark (Node 22+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command or l402-pay --spark is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
+      notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands and l402-pay --spark: @breeztech/breez-sdk-spark (Node 22.4+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command or l402-pay --spark is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
 ---
 
 # Blink Skill
@@ -68,7 +68,7 @@ commands). Key concepts:
 
 ## Environment
 
-- Requires `bash` and Node.js 18+ (Node 22+ for the non-custodial `spark-*` commands, `l402-pay --spark`, and WebSocket subscriptions; Node 20+ can use `--experimental-websocket`).
+- Requires `bash` and Node.js 22.4+ (all commands, including the non-custodial `spark-*` commands, `l402-pay --spark`, and WebSocket subscriptions).
 - **Credentials depend on the command** — no single env var is required skill-wide:
   - **Credential-free** (no key, no seed): `resolve-receiver`, `create-invoice-lnaddress`. These use public LNURL-pay on `blink.sv`.
   - **Custodial commands** need `BLINK_API_KEY` with the appropriate scopes.
@@ -212,7 +212,7 @@ These rules are mandatory for any AI agent using this skill:
 
 - Resolve a `user@blink.sv` recipient with `blink resolve-receiver` (credential-free).
 - Receive with `blink create-invoice-lnaddress` (credential-free, works for both account types).
-- Balance / send / history / events need `SPARK_MNEMONIC` + `BREEZ_API_KEY` (Node 22+).
+- Balance / send / history / events need `SPARK_MNEMONIC` + `BREEZ_API_KEY` (Node 22.4+).
 - Probe fees with `spark-fee-probe` (or `spark-send --dry-run`) first; budget limits apply when configured.
 
 8. Apply safety constraints:
@@ -572,11 +572,11 @@ blink spark-subscribe [--timeout <seconds>] [--network mainnet|regtest]
 
 Streams live Spark wallet events as NDJSON (one JSON line per event). `--timeout` stops after N seconds (default: 300, 0 = run until interrupted). Non-custodial counterpart of `subscribe-updates`. Since Breez SDK 0.25.0 the event stream can also surface `unilateralExitStateChanged` (wallet unilateral-exit state transitions) — watch for it if you rely on exit tooling; it is informational only and not yet interpreted by any skill command.
 
-> All `spark-*` commands require `SPARK_MNEMONIC` + `BREEZ_API_KEY` and Node 22+. Network defaults to mainnet; `SPARK_NETWORK` env var or `--network` flag overrides. See the Environment section above and [non-custodial](references/non-custodial.md) for getting a Breez key and installing the optional SDK dependencies.
+> All `spark-*` commands require `SPARK_MNEMONIC` + `BREEZ_API_KEY` and Node 22.4+. Network defaults to mainnet; `SPARK_NETWORK` env var or `--network` flag overrides. See the Environment section above and [non-custodial](references/non-custodial.md) for getting a Breez key and installing the optional SDK dependencies.
 
 ## Realtime Subscriptions
 
-Blink supports GraphQL subscriptions over WebSocket using the `graphql-transport-ws` protocol. Requires Node 22+ for native WebSocket, or Node 20+ with the `--experimental-websocket` flag.
+Blink supports GraphQL subscriptions over WebSocket using the `graphql-transport-ws` protocol. Uses the native WebSocket built into Node 22.4+ (no flags needed).
 
 ### Subscribe to Invoice Payment Status
 
@@ -950,7 +950,7 @@ blink create-invoice-lnaddress alice@blink.sv 1000 "Coffee"
 ### Send from a non-custodial (Spark) account
 
 ```bash
-# Requires SPARK_MNEMONIC + BREEZ_API_KEY (Node 22+)
+# Requires SPARK_MNEMONIC + BREEZ_API_KEY (Node 22.4+)
 
 # 1. Probe the fee (nothing is sent)
 blink spark-fee-probe lnbc1000n1... 1000

@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Subscribe to Invoice Payment Status
  *
- * Usage: node --experimental-websocket subscribe_invoice.js <bolt11_invoice> [--timeout <seconds>]
+ * Usage: node subscribe_invoice.js <bolt11_invoice> [--timeout <seconds>]
  *
  * Watches a Lightning invoice via Blink's GraphQL WebSocket API and exits when
  * the invoice is PAID or EXPIRED. Status updates are printed to stderr, final
@@ -42,7 +42,7 @@ function parseArgs(argv) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.invoice) {
-    console.error('Usage: node --experimental-websocket subscribe_invoice.js <bolt11_invoice> [--timeout <seconds>]');
+    console.error('Usage: node subscribe_invoice.js <bolt11_invoice> [--timeout <seconds>]');
     process.exit(1);
   }
 

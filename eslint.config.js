@@ -21,12 +21,12 @@ module.exports = defineConfig([
         setInterval: 'readonly',
         clearInterval: 'readonly',
         URL: 'readonly',
-        // Node 18+ built-in fetch
+        // Node 22+ built-in fetch
         fetch: 'readonly',
         AbortController: 'readonly',
         AbortSignal: 'readonly',
         URLSearchParams: 'readonly',
-        // WebSocket (available with --experimental-websocket or Node 22+)
+        // WebSocket (built into Node 22+)
         WebSocket: 'readonly',
       },
     },

@@ -5,7 +5,7 @@
  * invoice normalisation, wallet resolution, and common arg-parsing logic
  * used by every script in blink/scripts/.
  *
- * Zero external dependencies — Node.js 18+ built-ins only.
+ * Zero external dependencies — Node.js 22+ built-ins only.
  */
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -621,7 +621,7 @@ function parseWalletArg(argv) {
 // ── WebSocket helpers ────────────────────────────────────────────────────────
 
 /**
- * Ensure WebSocket is available (Node 22+ built-in, or --experimental-websocket on Node 20+).
+ * Ensure WebSocket is available (built into Node 22+).
  * @returns {typeof WebSocket}
  */
 function requireWebSocket() {
@@ -629,17 +629,8 @@ function requireWebSocket() {
     const major = parseInt(process.versions.node.split('.')[0], 10);
     if (major >= 22) {
       throw new Error('WebSocket unavailable despite Node 22+. This is unexpected — check your Node.js build.');
-    } else if (major >= 20) {
-      throw new Error(
-        `WebSocket is not available on Node ${process.versions.node}. ` +
-          'Re-run with: node --experimental-websocket <script>',
-      );
-    } else {
-      throw new Error(
-        `WebSocket requires Node.js 20+ with --experimental-websocket or Node.js 22+ (native). ` +
-          `Current version: ${process.versions.node}`,
-      );
     }
+    throw new Error(`WebSocket requires Node.js 22+ (native). Current version: ${process.versions.node}`);
   }
   return WebSocket;
 }

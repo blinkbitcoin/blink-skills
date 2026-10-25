@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Subscribe to Account Updates (myUpdates)
  *
- * Usage: node --experimental-websocket subscribe_updates.js [--timeout <seconds>] [--max <count>]
+ * Usage: node subscribe_updates.js [--timeout <seconds>] [--max <count>]
  *
  * Streams account activity updates via Blink's GraphQL WebSocket API. Each
  * event is printed as a JSON line to stdout (NDJSON). Status messages go to

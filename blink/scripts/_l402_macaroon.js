@@ -25,7 +25,7 @@
  *   2. ~/.blink/l402-root-key file (hex, 32 bytes)
  *   3. Auto-generate, persist to ~/.blink/l402-root-key, warn to stderr
  *
- * Zero external dependencies — Node.js 18+ built-ins only.
+ * Zero external dependencies — Node.js 22+ built-ins only.
  */
 
 'use strict';
