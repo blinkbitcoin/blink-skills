@@ -84,7 +84,7 @@ A remote server's answer is checked against the request that produced it:
 ## Balance / send / history / events (require the seed)
 
 These operations need the account seed and run the Breez Spark SDK headless in
-Node (Node 22+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
+Node (Node 22.4+). Set `SPARK_MNEMONIC` and `BREEZ_API_KEY`.
 
 **Network selection:** all four `spark-*` commands default to Spark **mainnet**.
 Override with `SPARK_NETWORK=regtest` or a `--network mainnet|regtest` flag

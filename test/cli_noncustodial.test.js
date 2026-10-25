@@ -529,6 +529,30 @@ describe('CLI: options reach the underlying script', () => {
   });
 });
 
+// ── negated options (PR #23 review: the engines floor) ───────────────────────
+//
+// `--no-<opt>` relies on util.parseArgs({ allowNegative: true }), which only
+// exists from Node 22.4.0 — that is what sets `engines >=22.4.0`. On 22.0–22.3
+// strict parsing rejects these with "Unknown option". The non-numeric amount
+// makes each command fail in coercion, which runs AFTER parseArgs, so reaching
+// that error proves the negation parsed — with no network and no credentials.
+// This is the test that turns red if the suite is run below the floor.
+
+describe('CLI: documented negated options parse (Node 22.4+ floor)', () => {
+  for (const args of [
+    ['create-invoice', 'abc', '--no-subscribe'],
+    ['create-invoice-usd', 'abc', '--no-subscribe'],
+    ['create-invoice-lnaddress', 'user@blink.sv', 'abc', '--no-verify'],
+  ]) {
+    it(`${args[0]} accepts ${args[args.length - 1]}`, async () => {
+      const { code, stderr } = await runCli(args, { stub: false });
+      assert.doesNotMatch(stderr, /Unknown option/);
+      assert.match(stderr, /'amount' must be a positive integer/);
+      assert.equal(code, 1);
+    });
+  }
+});
+
 // ── exit codes (review finding #6) ───────────────────────────────────────────
 
 describe('CLI: spark-send exit code reflects payment outcome', () => {

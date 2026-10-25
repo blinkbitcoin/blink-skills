@@ -10,8 +10,8 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Setup gotchas
 
-- Support floor: **Node 22+ for every command** (`engines >=22`, since v3.0.0). Node 18/20 were dropped as one coordinated support-policy change (engines + README + SKILL.md + references), per the PR #22 review — any future floor move must be done the same way. The floor is declared, not hard-enforced: only the Spark and WebSocket paths check the version at runtime. Do not raise it to 24 (nothing needs 24; Node 22 is supported until ~Apr 2027).
-- Node lines (release matrix = all three): **24** = primary dev/release Node (nvm default, `.nvmrc`); **22** = the floor (system `/usr/bin/node`); **26** = Current, forward-compat, must pass (`~/.nvm/versions/node/v26.12.1/bin/node`). When 26 goes LTS, drop "Current" from its label; when 22 reaches EOL, move the floor as a coordinated change.
+- Support floor: **Node 22.4+ for every command** (`engines >=22.4.0`, since v3.0.0). The floor is a MINOR, not just a major: `bin/blink.js` uses `util.parseArgs({ allowNegative: true })` (added in 22.4.0) for every documented `--no-*` option — on 22.0–22.3 they fail with `Unknown option` (PR #23 review). Any new Node API means re-checking the floor against the API's "Added in" version; the floor leg below is the gate, and `test/cli_noncustodial.test.js` "negated options parse" is the regression test (verified red on 22.0.0). Node 18/20 were dropped as one coordinated support-policy change (engines + README + SKILL.md + references), per the PR #22 review — any future floor move must be done the same way. The floor is declared, not hard-enforced: only the Spark and WebSocket paths check the version at runtime. Do not raise it to 24 (nothing needs 24; Node 22 is supported until ~Apr 2027).
+- Node lines (release matrix = all three): **24** = primary dev/release Node (nvm default, `.nvmrc`); **22.4.0** = the EXACT floor (`~/.nvm/versions/node/v22.4.0/bin/node` — test the minimum itself, not the latest 22.x; system `/usr/bin/node` is 22.23.4 and does NOT count as the floor leg); **26** = Current, forward-compat, must pass (`~/.nvm/versions/node/v26.12.1/bin/node`). When 26 goes LTS, drop "Current" from its label; when 22 reaches EOL, move the floor as a coordinated change.
 - The Breez SDK requires **Node 22+**. npm under Node 20 **silently skips** the optional dependency (`engines` mismatch) leaving `node_modules/@breeztech` EMPTY — installs must run under Node 22+.
 - `better-sqlite3` is a native build compiled for ONE Node ABI (22 = 127, 24 = 137, 26 = 147). Switching Node versions in the same tree breaks it (`ERR_DLOPEN_FAILED … NODE_MODULE_VERSION`) — `npm rebuild better-sqlite3` under the Node you are about to use, and verify by opening a database, not by exit code:
   `node -e "new (require('better-sqlite3'))(':memory:').prepare('select 1').get()"`
@@ -19,7 +19,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 ## Testing
 
-- The suite must run on ALL THREE Node lines before releasing — Node 24 (`npm test`), Node 22 (`/usr/bin/node --test test/*.test.js`), Node 26 (`~/.nvm/versions/node/v26.12.1/bin/node --test test/*.test.js`): each must show **all tests passing, 0 skipped**, plus the `better-sqlite3` smoke check after rebuilding for that Node. Do not hard-code counts here — they drift every release.
+- The suite must run on ALL THREE Node lines before releasing — Node 24 (`npm test`), Node 22.4.0 (`~/.nvm/versions/node/v22.4.0/bin/node --test test/*.test.js`), Node 26 (`~/.nvm/versions/node/v26.12.1/bin/node --test test/*.test.js`): each must show **all tests passing, 0 skipped**, plus the `better-sqlite3` smoke check after rebuilding for that Node. Do not hard-code counts here — they drift every release.
 - Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (`Module._load` interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests (formerly Node-22-gated; the gates were removed with the v3.0.0 floor raise); the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
@@ -33,7 +33,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Release ritual (in order — every step)
 
 1. Merge the PR (squash + admin + delete branch).
-2. Verify main locally: full suite + `better-sqlite3` smoke check on Node 24, 22, and 26 (rebuild per Node — see Testing and Setup gotchas), lint, `format:check`, clean tree.
+2. Verify main locally: full suite + `better-sqlite3` smoke check on Node 24, 22.4.0, and 26 (rebuild per Node — see Testing and Setup gotchas), lint, `format:check`, clean tree.
 3. Tag `vX.Y.Z` at the merge commit, push the tag.
 4. GitHub release (`gh release create vX.Y.Z --latest`) with notes + stats table.
 5. **Publish to ClawHub from main** (clean provenance):

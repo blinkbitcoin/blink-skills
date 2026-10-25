@@ -168,6 +168,6 @@ For USD invoices, set timeout to match or be shorter than the ~5 minute invoice 
 
 ## WebSocket Requirements
 
-- **Node 22+** (the minimum for all commands): WebSocket is built-in, no flags needed
+- **Node 22.4+** (the minimum for all commands): WebSocket is built-in, no flags needed
 
 Scripts that use WebSocket: `create_invoice.js`, `create_invoice_usd.js`, `subscribe_invoice.js`, `subscribe_updates.js`.

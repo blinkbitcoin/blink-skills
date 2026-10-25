@@ -1291,6 +1291,7 @@ async function main() {
     args: cmdArgs,
     options: { ...cmd.options, help: { type: 'boolean', short: 'h' } },
     allowPositionals: true,
+    // `--no-<opt>` support; needs Node 22.4.0+ — this is what sets engines >=22.4.0.
     allowNegative: true,
     strict: true,
   };
