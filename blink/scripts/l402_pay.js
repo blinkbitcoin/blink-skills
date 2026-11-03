@@ -623,6 +623,37 @@ async function main() {
   // initialRes.url is the final hop of the guarded, per-hop-validated chain
   // (same mechanism as resolveCanonicalUrl); fall back if absent.
   const challengeUrl = initialRes.url || canonicalUrl;
+
+  // ── Replay exactly the request that was challenged ──
+  // PR #24 review round 2 (Medium): the credentialed retries go DIRECTLY to
+  // challengeUrl, bypassing the redirect walker — so they must reproduce the
+  // walker's WHATWG rewrites (301/302 POST→GET, 303 non-GET/HEAD→GET, body
+  // dropped) instead of re-sending the original --method/--body. A rewrite that
+  // DROPPED an operator body is refused before payment, on ANY origin: paying
+  // for — then authorizing — a body-less GET would silently be a different
+  // operation than the one requested, and a payment cannot be undone.
+  if (initialRes.bodyDropped) {
+    const refusal = new Error(
+      `The server redirected this ${String(args.method).toUpperCase()} to ${initialRes.effectiveMethod} ` +
+        `${challengeUrl} and the redirect dropped the operator-supplied body — refusing to pay for or ` +
+        `forward a different request than the one invoked. Invoke the issuing URL explicitly: ${challengeUrl}`,
+    );
+    refusal.code = 'URL_POLICY';
+    throw refusal;
+  }
+  const retryMethod = initialRes.effectiveMethod || args.method;
+  if (String(retryMethod).toUpperCase() !== String(args.method).toUpperCase()) {
+    console.error(
+      `Note: the redirect rewrote ${args.method} to ${retryMethod}; the challenged request is replayed as-is.`,
+    );
+  }
+  /** Both credentialed requests (cache reuse, paid retry): the challenged request + the bearer. */
+  const credentialedRequest = (authHeader) => ({
+    method: retryMethod,
+    headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
+    ...(args.body ? { body: args.body } : {}),
+  });
+
   if (challengeUrl !== canonicalUrl) {
     console.error(`L402 challenge issued by: ${challengeUrl}`);
     // The direct hop to challengeUrl bypasses the in-chain origin policy, so
@@ -669,16 +700,7 @@ async function main() {
       console.error('Retrying request with cached token...');
 
       const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
-      const res = await fetchWithTimeout(
-        challengeUrl,
-        {
-          method: args.method,
-          headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
-          ...(args.body ? { body: args.body } : {}),
-        },
-        15_000,
-        allowHosts,
-      );
+      const res = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
 
       const body = await res.text();
       let data;
@@ -1182,20 +1204,7 @@ async function main() {
   console.error('Retrying request with L402 authorization...');
   const authHeader = `L402 ${macaroon}:${preimage}`;
 
-  const retryRes = await fetchWithTimeout(
-    challengeUrl,
-    {
-      method: args.method,
-      headers: {
-        Accept: 'application/json',
-        Authorization: authHeader,
-        ...args.headers,
-      },
-      ...(args.body ? { body: args.body } : {}),
-    },
-    15_000,
-    allowHosts,
-  );
+  const retryRes = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
 
   const retryBody = await retryRes.text();
   let retryData;

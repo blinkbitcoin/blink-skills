@@ -1303,7 +1303,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     try {
       const res = await payViaRaw(home, a.port, ['--method', 'POST', '--body', '{"secret":1}']);
       assert.notEqual(res.code, 0);
-      assert.match(res.stdout + res.stderr, /URL_POLICY|refusing to forward/i);
+      assert.match(res.stdout + res.stderr, /URL_POLICY|refusing/i);
       assert.ok(!fs.existsSync(path.join(home, '.blink', 'l402-tokens.json')), 'no token stored');
       const logFile = path.join(home, '.blink', 'spending-log.json');
       const log = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];
@@ -1312,6 +1312,145 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     } finally {
       a.server.close();
       b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review round 2 (Medium): the direct credentialed retries rebuilt the
+  // request from the ORIGINAL --method/--body, discarding the redirect walker's
+  // WHATWG rewrites (301/302 POST→GET, 303 non-GET/HEAD→GET, body dropped).
+  // A same-origin POST /start → 302 → GET /resource got the 402, then the paid
+  // retry sent POST /resource WITH the body. The retry must repeat exactly the
+  // request that was challenged; a dropped operator body is refused pre-payment.
+
+  /**
+   * `/start`: HEAD → 200 (canonicalization stays here); any other method →
+   * `status` redirect to `/resource` on this server or on `targetPort`.
+   * `/resource`: records { method, body, auth } of every request; 402 without
+   * a credential, 200 with one.
+   */
+  function rewriteServer(status, targetPort = null) {
+    const hits = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          if (req.url === '/start') {
+            res.writeHead(req.method === 'HEAD' ? 200 : status, {
+              location: targetPort ? `http://127.0.0.1:${targetPort}/resource` : '/resource',
+            });
+            res.end();
+            return;
+          }
+          hits.push({ method: req.method, body, auth: req.headers.authorization || null });
+          if (req.headers.authorization) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end('{"ok":true}');
+            return;
+          }
+          res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+          res.end();
+        });
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, hits, port: server.address().port }));
+  }
+
+  function payStart(home, port, extra) {
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/start`, '--spark', ...extra],
+        {
+          env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
+          timeout: 15000,
+          killSignal: 'SIGKILL',
+        },
+        (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }),
+      );
+    });
+  }
+
+  const credentialed = (hits) => hits.filter((h) => h.auth).map(({ method, body }) => ({ method, body }));
+
+  function assertRefusedBeforePayment(home, res, hits) {
+    assert.notEqual(res.code, 0, 'must not succeed');
+    assert.match(res.stdout + res.stderr, /URL_POLICY|refusing/i);
+    assert.ok(!fs.existsSync(path.join(home, '.blink', 'l402-tokens.json')), 'no token stored');
+    const logFile = path.join(home, '.blink', 'spending-log.json');
+    const log = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];
+    assert.equal(log.length, 0, 'nothing paid');
+    assert.deepEqual(credentialed(hits), [], 'no credentialed request');
+  }
+
+  for (const [status, method] of [
+    [302, 'POST'],
+    [301, 'POST'],
+    [303, 'PUT'],
+  ]) {
+    it(`a same-origin ${status} that drops a ${method} --body is refused before payment`, async () => {
+      const s = await rewriteServer(status);
+      const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+      try {
+        const res = await payStart(home, s.port, ['--method', method, '--body', '{"secret":1}']);
+        assert.deepEqual(s.hits[0], { method: 'GET', body: '', auth: null }, 'the walker rewrote it to GET');
+        assertRefusedBeforePayment(home, res, s.hits);
+      } finally {
+        s.server.close();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('a body-less DELETE rewritten by a same-origin 303 is retried as GET — paid and on cache reuse', async () => {
+    const s = await rewriteServer(303);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const first = await payStart(home, s.port, ['--method', 'DELETE']);
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(JSON.parse(first.stdout).event, 'l402_paid');
+      const second = await payStart(home, s.port, ['--method', 'DELETE']);
+      assert.equal(JSON.parse(second.stdout).tokenReused, true);
+      assert.deepEqual(credentialed(s.hits), [
+        { method: 'GET', body: '' },
+        { method: 'GET', body: '' },
+      ]);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a body-less POST rewritten by a cross-origin 302 is retried at the issuer as GET', async () => {
+    const b = await rewriteServer(302);
+    const a = await rewriteServer(302, b.port);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, a.port, ['--method', 'POST']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      assert.deepEqual(a.hits, [], 'A only redirects; its /resource is never hit');
+      assert.deepEqual(credentialed(b.hits), [{ method: 'GET', body: '' }]);
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('control: a same-origin 307 preserves POST + body, and so does the credentialed retry', async () => {
+    const s = await rewriteServer(307);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--method', 'POST', '--body', '{"x":1}']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      assert.deepEqual(credentialed(s.hits), [{ method: 'POST', body: '{"x":1}' }]);
+    } finally {
+      s.server.close();
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
