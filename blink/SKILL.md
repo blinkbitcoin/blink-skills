@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.0
+version: 3.0.1
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.0'
+    version: '3.0.1'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -1223,16 +1223,18 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 
 ```bash
 blink l402-store list
-blink l402-store get <domain>
+blink l402-store get <url|key>
 blink l402-store clear [--expired]
 ```
 
 - `list` — show all cached tokens (masks preimage for security)
-- `get <domain>` — retrieve the full token for a specific domain
+- `get <url|key>` — retrieve the full token for a paid URL (normalized to its key) or a raw store key
 - `clear` — remove all cached tokens
 - `clear --expired` — remove only expired tokens
 
 Token cache location: `~/.blink/l402-tokens.json`
+
+**Origin isolation (v3.0.1):** tokens are keyed by the **origin** (scheme + host + port) + path of the URL that **actually issued the 402**, e.g. `https://api.example.com/v1/data`, and a cached token is only ever sent directly back to that URL. That is not necessarily the URL you passed: if a service redirects the request (even only for some methods, e.g. it answers `HEAD` itself but redirects `GET`), the token belongs to the redirect target, and `l402_paid` reports it as `challengeUrl`. Operator `--header`s are withheld from a different issuing origin, and a `--body` request whose 402 came from a different origin is refused (`URL_POLICY`) before paying. The credentialed retry repeats **exactly the request that received the 402** (same method, headers and body) with the L402 `Authorization` added, and is never rebuilt from your original flags. That includes HTTP redirect rewrites: 301/302 turn `POST` into `GET`, and 303 turns any non-`GET`/`HEAD` method into `GET`. It also covers header state along the chain: once a redirect leaves the origin, your `--header`s are dropped for the rest of the chain, even if it comes back, and a rewrite that drops the body also drops its `Content-Type`. An operator `--header Authorization` is never sent with the paid credential; the L402 token replaces it, with a warning on stderr. If such a rewrite **drops your `--body`**, the request is refused (`URL_POLICY`) before paying, on any origin, because the challenged request is no longer the one you invoked. Call the issuing URL directly instead. A 307/308 keeps the method and body, so those work as before. Each run first makes one credential-free request to learn which URL issues the challenge, so cache reuse costs one extra round trip. Before v3.0.1 the key was host + path, so a token could be replayed to a different service on another port of the same host, or from `https` to plaintext `http`. Entries written by older versions have no scheme; `list` flags them `legacy: true` and they are **never reused** (the next request pays fresh). Run `blink l402-store clear` to remove them.
 
 ### L402 Output Examples
 

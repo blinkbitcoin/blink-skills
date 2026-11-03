@@ -378,6 +378,49 @@ describe('l402_store token CRUD', () => {
     const token = storeModule.getToken('dup.example');
     assert.equal(token.macaroon, 'NEW');
   });
+
+  // ClawHub review (v3.0.0): the cache key was hostname + path — scheme and
+  // port were dropped, so a token earned at http://h:8080/x was replayed to
+  // http://h:9090/x and to http://h/x (plaintext). The key is now the URL's
+  // ORIGIN (scheme + host + port) + path.
+  describe('storeKeyFor (origin isolation)', () => {
+    const k = (u) => storeModule.storeKeyFor(u);
+
+    it('keys by origin + path', () => {
+      assert.equal(k('https://api.example.com/v1/btc'), 'https://api.example.com/v1/btc');
+    });
+
+    it('different schemes never share a key', () => {
+      assert.notEqual(k('http://api.example.com/x'), k('https://api.example.com/x'));
+    });
+
+    it('different ports never share a key', () => {
+      assert.notEqual(k('http://127.0.0.1:8080/x'), k('http://127.0.0.1:9090/x'));
+      assert.notEqual(k('https://h.example/x'), k('https://h.example:8443/x'));
+    });
+
+    it('normalizes default ports, host case, trailing slash; ignores query and fragment', () => {
+      const base = k('https://h.example/x');
+      for (const u of ['https://H.EXAMPLE:443/x', 'https://h.example/x/', 'https://h.example/x?a=1#f']) {
+        assert.equal(k(u), base, u);
+      }
+      assert.equal(k('http://h.example:80/'), 'http://h.example');
+      assert.equal(k('http://[::1]:8080/x'), 'http://[::1]:8080/x');
+    });
+
+    it('returns null for unparseable or non-http(s) URLs (never a raw-string key)', () => {
+      for (const u of ['not a url', '', 'ftp://h.example/x', 'file:///etc/passwd', 'h.example/x']) {
+        assert.equal(k(u), null, u);
+      }
+    });
+
+    it('listTokens flags pre-3.0.1 host+path entries as legacy (never reusable)', () => {
+      storeModule.saveToken('legacy.example/x', { macaroon: 'OLD', preimage: 'l'.repeat(64) });
+      storeModule.saveToken(k('https://new.example/x'), { macaroon: 'NEW', preimage: 'm'.repeat(64) });
+      const byKey = Object.fromEntries(storeModule.listTokens().map((t) => [t.domain, t.legacy]));
+      assert.deepEqual(byKey, { 'legacy.example/x': true, 'https://new.example/x': false });
+    });
+  });
 });
 
 // ── l402_pay dry-run (mocked fetch) ──────────────────────────────────────────
@@ -566,7 +609,7 @@ describe('l402_pay dry-run flow', () => {
       satoshis: 42,
       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
     };
-    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com': cachedEntry }));
+    fs.writeFileSync(storeFile, JSON.stringify({ 'https://api.example.com/resource': cachedEntry }));
 
     try {
       // Mock: server still returns 402 (dry-run should reach this, not the cache)
@@ -613,8 +656,8 @@ describe('l402_pay dry-run flow', () => {
       satoshis: 99,
       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
     };
-    // Store key is domain+path (not just domain) so cache lookup matches the request URL
-    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com/resource': cachedEntry }));
+    // Store key is origin + path (storeKeyFor) so the cache lookup matches the request URL
+    fs.writeFileSync(storeFile, JSON.stringify({ 'https://api.example.com/resource': cachedEntry }));
 
     try {
       // Mock: server returns 200 when Authorization header is present (cache reuse)
@@ -698,8 +741,8 @@ describe('l402_pay dry-run flow', () => {
       satoshis: 100,
       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
     };
-    // Store key is domain+path (not just domain) so cache lookup matches the request URL
-    fs.writeFileSync(storeFile, JSON.stringify({ 'api.example.com/resource': cachedEntry }));
+    // Store key is origin + path (storeKeyFor) so the cache lookup matches the request URL
+    fs.writeFileSync(storeFile, JSON.stringify({ 'https://api.example.com/resource': cachedEntry }));
 
     let exitCode = null;
     const originalExit = process.exit;
@@ -1678,7 +1721,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   it('cached-token reuse surfaces the cached invoiceMsats/budgetSats in the output', async () => {
     configureAutoPay();
     const storeModule = require(storePath);
-    storeModule.saveToken('paywall.example.com/resource', {
+    storeModule.saveToken('https://paywall.example.com/resource', {
       macaroon: 'TESTMAC==',
       preimage: 'p'.repeat(64),
       invoice: 'lnbc14000p1p0frac',
@@ -1686,13 +1729,18 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       invoiceMsats: 1400,
       budgetSats: 2,
     });
-    // The retry with the cached token returns 200.
-    global.fetch = async (url) => ({
-      status: 200,
-      url: String(url),
-      headers: { get: () => null },
-      text: async () => JSON.stringify({ ok: true }),
-    });
+    // A real L402 server: 402 without a credential (the uncredentialed request
+    // that establishes who issues the challenge — PR #24 review), 200 with the
+    // cached token.
+    global.fetch = async (url, opts) => {
+      const authed = Boolean(opts && opts.headers && opts.headers.Authorization);
+      return {
+        status: authed ? 200 : 402,
+        url: String(url),
+        headers: { get: (h) => (!authed && /www-authenticate/i.test(h) ? 'L402 macaroon="X", invoice="lnbc1"' : null) },
+        text: async () => JSON.stringify({ ok: authed }),
+      };
+    };
     const code = await runPay(['https://paywall.example.com/resource']);
     assert.equal(code, null);
     const out = output();

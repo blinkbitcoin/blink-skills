@@ -4,19 +4,22 @@
  *
  * Usage:
  *   node l402_store.js list
- *   node l402_store.js get <domain>
+ *   node l402_store.js get <url|key>
  *   node l402_store.js clear [--expired]
  *
  * Manages a local cache of L402 tokens at ~/.blink/l402-tokens.json.
- * Tokens are indexed by domain (hostname) and include the macaroon,
- * preimage, and optional expiration time.
+ * Tokens are keyed by ORIGIN (scheme + host + port) + path — see storeKeyFor —
+ * and include the macaroon, preimage, and optional expiration time.
  *
  * This cache is used by l402_pay.js to reuse valid tokens and avoid
- * re-paying for access already purchased.
+ * re-paying for access already purchased. A token is only ever sent back to
+ * the exact origin that earned it.
  *
  * Arguments (when used as CLI):
  *   list              - Show all cached tokens (masks preimage for safety).
- *   get <domain>      - Get the stored token for a specific domain.
+ *                       Pre-3.0.1 host+path entries are flagged legacy: true.
+ *   get <url|key>     - Get the stored token for a URL (normalized to its key)
+ *                       or a raw store key.
  *   clear [--expired] - Remove expired tokens (or all tokens without --expired).
  *
  * Dependencies: None (uses Node.js built-in fs/path/os)
@@ -74,6 +77,48 @@ function writeStore(store) {
   }
 }
 
+// ── Store keys ────────────────────────────────────────────────────────────────
+
+/**
+ * Build the token store key for a URL: ORIGIN (scheme + host + port) + path,
+ * no query/fragment, trailing slashes stripped.
+ *
+ * Origin isolation (ClawHub review of v3.0.0): the key was previously
+ * hostname + path, so a macaroon + preimage (a reusable bearer credential)
+ * paid for at http://h:8080/x was replayed to a DIFFERENT service at
+ * http://h:9090/x — and from https to plaintext http. Different paths on one
+ * origin may carry different challenges (price, caveats), so the path stays in
+ * the key too.
+ *
+ * Returns null — never a raw-string fallback — for anything that is not an
+ * http(s) URL: an unkeyable URL is neither cached nor reused.
+ *
+ * @param {string} url
+ * @returns {string | null}  e.g. "https://api.citrusrate.com/v1/btc"
+ */
+function storeKeyFor(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  return u.origin + u.pathname.replace(/\/+$/, '');
+}
+
+/**
+ * A pre-3.0.1 host+path key (no scheme). Its origin is unknowable, so it is
+ * never reused — storeKeyFor keys always start with a scheme and cannot collide
+ * with it. Kept on disk (listed with legacy: true) until the user clears it.
+ *
+ * @param {string} key
+ * @returns {boolean}
+ */
+function isLegacyKey(key) {
+  return !/^https?:\/\//.test(key);
+}
+
 // ── Token operations ──────────────────────────────────────────────────────────
 
 /**
@@ -128,6 +173,7 @@ function listTokens() {
     const expiresInMs = entry.expiresAt ? entry.expiresAt - now : null;
     return {
       domain,
+      legacy: isLegacyKey(domain),
       macaroon: entry.macaroon ? entry.macaroon.slice(0, 12) + '…' + entry.macaroon.slice(-6) : null,
       preimage: entry.preimage ? entry.preimage.slice(0, 8) + '…' : null,
       satoshis: entry.satoshis ?? null,
@@ -178,7 +224,7 @@ function main() {
   if (!command) {
     console.error('Usage:');
     console.error('  node l402_store.js list');
-    console.error('  node l402_store.js get <domain>');
+    console.error('  node l402_store.js get <url|key>');
     console.error('  node l402_store.js clear [--expired]');
     process.exit(1);
   }
@@ -195,20 +241,22 @@ function main() {
   }
 
   if (command === 'get') {
-    const domain = args[1];
+    // Accept a URL (normalized to its origin+path key) or a raw store key.
+    const domain = args[1] ? (storeKeyFor(args[1]) ?? args[1]) : args[1];
     if (!domain) {
-      console.error('Usage: node l402_store.js get <domain>');
+      console.error('Usage: node l402_store.js get <url|key>');
       process.exit(1);
     }
     const entry = getToken(domain);
     if (!entry) {
-      console.error(`No valid token found for domain: ${domain}`);
+      console.error(`No valid token found for: ${domain}`);
       console.log(JSON.stringify({ domain, found: false }, null, 2));
       process.exit(0);
     }
     const output = {
       domain,
       found: true,
+      legacy: isLegacyKey(domain),
       macaroon: entry.macaroon,
       preimage: entry.preimage,
       satoshis: entry.satoshis ?? null,
@@ -244,6 +292,8 @@ if (require.main === module) {
 module.exports = {
   saveToken,
   getToken,
+  storeKeyFor,
+  isLegacyKey,
   listTokens,
   clearTokens,
   STORE_FILE,

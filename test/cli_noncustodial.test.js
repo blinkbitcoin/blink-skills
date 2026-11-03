@@ -1044,8 +1044,8 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       JSON.stringify({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] }),
     );
     const store = {};
-    // extractStoreKey = hostname + pathname (no port)
-    store[`127.0.0.1/resource`] = {
+    // Store key = ORIGIN (scheme + host + port) + path — see storeKeyFor.
+    store[`http://127.0.0.1:${port}/resource`] = {
       macaroon: 'MAC',
       preimage: 'f'.repeat(64),
       invoice: 'lnbc1000u1p0x',
@@ -1108,7 +1108,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       const control = await pay([]);
       assert.equal(control.j.event, 'l402_paid');
       assert.ok(
-        control.stored && control.stored['127.0.0.1/resource'],
+        control.stored && control.stored[`http://${address}:${port}/resource`],
         'counterfactual: default run persists the token',
       );
 
@@ -1117,6 +1117,493 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.equal(optedOut.stored, null, '--no-store must not write ~/.blink/l402-tokens.json');
     } finally {
       server.close();
+    }
+  });
+
+  // ClawHub review of v3.0.0: the token cache did not preserve service-origin
+  // isolation. The key was hostname + path, so a macaroon + preimage paid for at
+  // http://127.0.0.1:A/resource was replayed (Authorization header) to an
+  // UNPAID service at http://127.0.0.1:B/resource — and likewise across
+  // schemes (https → plaintext http). Reproduced before the fix: service B
+  // received `L402 TESTMAC==:fff…` and served the request with tokenReused:true.
+
+  /** L402 server that records every Authorization header it receives. */
+  function recordingServer() {
+    const seen = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        seen.push(req.headers.authorization || null);
+        if (req.headers.authorization) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, seen, port: server.address().port }));
+  }
+
+  function payViaRaw(home, port, extra = []) {
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/resource`, '--spark', ...extra],
+        {
+          env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
+          timeout: 15000,
+          killSignal: 'SIGKILL',
+        },
+        (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }),
+      );
+    });
+  }
+
+  async function payVia(home, port, extra = []) {
+    return JSON.parse((await payViaRaw(home, port, extra)).stdout);
+  }
+
+  /**
+   * PR #24 review (High): a service that answers the credential-free HEAD
+   * canonicalization itself but redirects the REAL request elsewhere. `status`
+   * is the redirect code for non-HEAD methods. Records method + every header.
+   */
+  function headStaysRedirectsElsewhere(targetPort, status = 302) {
+    const seen = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        seen.push({ method: req.method, headers: req.headers });
+        if (req.method === 'HEAD') {
+          res.writeHead(200);
+          res.end();
+          return;
+        }
+        res.writeHead(status, { location: `http://127.0.0.1:${targetPort}/resource` });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, seen, port: server.address().port }));
+  }
+
+  it('a token paid at one origin is never sent to another origin (different port, same host+path)', async () => {
+    const a = await recordingServer();
+    const b = await recordingServer();
+    const home = seededHome({ dailyLimitSats: 400000, allowlist: ['127.0.0.1'] });
+    try {
+      const paidA = await payVia(home, a.port);
+      assert.equal(paidA.tokenReused, false);
+
+      // Control (self-validation): the SAME origin reuses the token, so the
+      // cache works and the cross-origin assertion below can actually fail.
+      const reuseA = await payVia(home, a.port);
+      assert.equal(reuseA.tokenReused, true, 'same-origin reuse must still work');
+
+      const atB = await payVia(home, b.port);
+      assert.equal(atB.tokenReused, false, 'origin B must not reuse origin A’s token');
+      assert.equal(atB.event, 'l402_paid', 'origin B is paid for fresh');
+      // B's first credentialed request comes only AFTER its own payment: the
+      // first two requests (canonicalization HEAD + initial request) carry no
+      // Authorization at all.
+      assert.deepEqual(b.seen.slice(0, 2), [null, null], 'A’s credential must never reach B');
+
+      const keys = Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8')));
+      assert.deepEqual(
+        keys.sort(),
+        [`http://127.0.0.1:${a.port}/resource`, `http://127.0.0.1:${b.port}/resource`].sort(),
+      );
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review (High): the cache key and paid-retry target came from the
+  // credential-free HEAD canonicalization, but the REAL request can follow a
+  // different, method-dependent redirect. A answered HEAD itself, redirected
+  // GET to B; B issued the 402. Before the fix: B's macaroon + preimage were
+  // stored under A's key and the paid retry went to A FIRST — A received B's
+  // credential before cross-origin header stripping could act, on every run.
+  // The credential owner is the URL that actually issued the challenge.
+  it('a token is bound to the origin that issued the 402, not the HEAD canonical URL (method-dependent redirect)', async () => {
+    const b = await recordingServer();
+    const a = await headStaysRedirectsElsewhere(b.port);
+    const home = seededHome({ dailyLimitSats: 400000, allowlist: ['127.0.0.1'] });
+    const aAuth = () => a.seen.filter((r) => r.headers.authorization).length;
+    try {
+      const first = await payVia(home, a.port);
+      assert.equal(first.event, 'l402_paid');
+      assert.equal(first.tokenReused, false);
+      assert.equal(aAuth(), 0, 'A must never receive the credential B issued');
+      assert.equal(first.challengeUrl, `http://127.0.0.1:${b.port}/resource`);
+      assert.ok(
+        b.seen.some((h) => h && h.startsWith('L402 TESTMAC==:')),
+        'B, the issuer, receives its own credential',
+      );
+
+      const keys = Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8')));
+      assert.deepEqual(keys, [`http://127.0.0.1:${b.port}/resource`], 'stored under the issuing origin only');
+
+      const bCredsBefore = b.seen.filter(Boolean).length;
+      const second = await payVia(home, a.port);
+      assert.equal(second.tokenReused, true, 'the cached token is reused — at B');
+      assert.equal(aAuth(), 0, 'A still never receives it on cache reuse');
+      assert.equal(b.seen.filter(Boolean).length, bCredsBefore + 1, 'cache reuse sends it to B exactly once');
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('operator headers are withheld from a cross-origin challenge URL on the direct retry', async () => {
+    // Guards the NEW direct hop to the challenge URL: in-chain redirects strip
+    // operator headers cross-origin, so a direct retry must not reintroduce them.
+    const b = http.createServer((req, res) => {
+      b.seenHeaders.push(req.headers['x-api-key'] || null);
+      if (req.headers.authorization) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+        return;
+      }
+      res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+      res.end();
+    });
+    b.seenHeaders = [];
+    await new Promise((r) => b.listen(0, '127.0.0.1', r));
+    const a = await headStaysRedirectsElsewhere(b.address().port);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const out = await payVia(home, a.port, ['--header', 'X-Api-Key:operator-secret']);
+      assert.equal(out.event, 'l402_paid');
+      assert.ok(
+        a.seen.some((r) => r.headers['x-api-key'] === 'operator-secret'),
+        'A (the supplied origin) gets it',
+      );
+      assert.deepEqual(b.seenHeaders.filter(Boolean), [], 'B (a different origin) must never receive operator headers');
+    } finally {
+      a.server.close();
+      b.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator body is refused (URL_POLICY) before payment when the 402 came from another origin', async () => {
+    // A 302s the POST; WHATWG semantics turn it into a body-less GET at B. Replaying
+    // the original POST + body directly to B would disclose it in a form the
+    // redirect never produced — refuse, and pay nothing.
+    const b = await recordingServer();
+    const a = await headStaysRedirectsElsewhere(b.port, 302);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payViaRaw(home, a.port, ['--method', 'POST', '--body', '{"secret":1}']);
+      assert.notEqual(res.code, 0);
+      assert.match(res.stdout + res.stderr, /URL_POLICY|refusing/i);
+      assert.ok(!fs.existsSync(path.join(home, '.blink', 'l402-tokens.json')), 'no token stored');
+      const logFile = path.join(home, '.blink', 'spending-log.json');
+      const log = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];
+      assert.equal(log.length, 0, 'nothing paid');
+      assert.equal(a.seen.filter((r) => r.headers.authorization).length, 0);
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review round 2 (Medium): the direct credentialed retries rebuilt the
+  // request from the ORIGINAL --method/--body, discarding the redirect walker's
+  // WHATWG rewrites (301/302 POST→GET, 303 non-GET/HEAD→GET, body dropped).
+  // A same-origin POST /start → 302 → GET /resource got the 402, then the paid
+  // retry sent POST /resource WITH the body. The retry must repeat exactly the
+  // request that was challenged; a dropped operator body is refused pre-payment.
+
+  /**
+   * `/start`: HEAD → 200 (canonicalization stays here); any other method →
+   * `status` redirect to `/resource` on this server or on `targetPort`.
+   * `/resource`: records { method, body, auth } of every request; 402 without
+   * a credential, 200 with one.
+   */
+  function rewriteServer(status, targetPort = null) {
+    const hits = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          if (req.url === '/start') {
+            res.writeHead(req.method === 'HEAD' ? 200 : status, {
+              location: targetPort ? `http://127.0.0.1:${targetPort}/resource` : '/resource',
+            });
+            res.end();
+            return;
+          }
+          const isL402 = /^L402 /.test(req.headers.authorization || '');
+          hits.push({
+            method: req.method,
+            body,
+            auth: isL402 ? req.headers.authorization : null,
+            headers: req.headers,
+          });
+          if (isL402) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end('{"ok":true}');
+            return;
+          }
+          res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+          res.end();
+        });
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, hits, port: server.address().port }));
+  }
+
+  function payStart(home, port, extra) {
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/start`, '--spark', ...extra],
+        {
+          env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
+          timeout: 15000,
+          killSignal: 'SIGKILL',
+        },
+        (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }),
+      );
+    });
+  }
+
+  const credentialed = (hits) => hits.filter((h) => h.auth).map(({ method, body }) => ({ method, body }));
+
+  /**
+   * PR #24 review round 3: the invariant behind all three rounds. Every
+   * credentialed request must be EXACTLY the uncredentialed request that
+   * received the 402 — method, body, and the full header map as the server saw
+   * it (incl. the client's own defaults) — plus the L402 Authorization, and
+   * nothing else. Any field reconstructed from the original --method/--header/
+   * --body instead of replayed fails here.
+   */
+  function assertReplaysChallenged(hits) {
+    const view = ({ method, body, headers }) => {
+      const { authorization: _auth, ...rest } = headers;
+      return { method, body, headers: rest };
+    };
+    let challenged = null;
+    let checked = 0;
+    for (const h of hits) {
+      if (!h.auth) {
+        challenged = h;
+        continue;
+      }
+      assert.ok(challenged, 'a credentialed request must follow a challenged one');
+      assert.deepEqual(view(h), view(challenged), 'credentialed request = challenged request + L402 Authorization');
+      assert.match(h.auth, /^L402 TESTMAC==:[0-9a-f]+$/, 'the only Authorization is the L402 bearer');
+      checked++;
+    }
+    assert.ok(checked > 0, 'at least one credentialed request was checked');
+  }
+
+  function assertRefusedBeforePayment(home, res, hits) {
+    assert.notEqual(res.code, 0, 'must not succeed');
+    assert.match(res.stdout + res.stderr, /URL_POLICY|refusing/i);
+    assert.ok(!fs.existsSync(path.join(home, '.blink', 'l402-tokens.json')), 'no token stored');
+    const logFile = path.join(home, '.blink', 'spending-log.json');
+    const log = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];
+    assert.equal(log.length, 0, 'nothing paid');
+    assert.deepEqual(credentialed(hits), [], 'no credentialed request');
+  }
+
+  for (const [status, method] of [
+    [302, 'POST'],
+    [301, 'POST'],
+    [303, 'PUT'],
+  ]) {
+    it(`a same-origin ${status} that drops a ${method} --body is refused before payment`, async () => {
+      const s = await rewriteServer(status);
+      const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+      try {
+        const res = await payStart(home, s.port, ['--method', method, '--body', '{"secret":1}']);
+        assert.deepEqual(
+          { method: s.hits[0].method, body: s.hits[0].body, auth: s.hits[0].auth },
+          { method: 'GET', body: '', auth: null },
+          'the walker rewrote it to GET',
+        );
+        assertRefusedBeforePayment(home, res, s.hits);
+      } finally {
+        s.server.close();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('a body-less DELETE rewritten by a same-origin 303 is retried as GET — paid and on cache reuse', async () => {
+    const s = await rewriteServer(303);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const first = await payStart(home, s.port, ['--method', 'DELETE']);
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(JSON.parse(first.stdout).event, 'l402_paid');
+      const second = await payStart(home, s.port, ['--method', 'DELETE']);
+      assert.equal(JSON.parse(second.stdout).tokenReused, true);
+      assert.deepEqual(credentialed(s.hits), [
+        { method: 'GET', body: '' },
+        { method: 'GET', body: '' },
+      ]);
+      assertReplaysChallenged(s.hits);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a body-less POST rewritten by a cross-origin 302 is retried at the issuer as GET', async () => {
+    const b = await rewriteServer(302);
+    const a = await rewriteServer(302, b.port);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, a.port, ['--method', 'POST']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      assert.deepEqual(a.hits, [], 'A only redirects; its /resource is never hit');
+      assert.deepEqual(credentialed(b.hits), [{ method: 'GET', body: '' }]);
+      assertReplaysChallenged(b.hits);
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('control: a same-origin 307 preserves POST + body, and so does the credentialed retry', async () => {
+    const s = await rewriteServer(307);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--method', 'POST', '--body', '{"x":1}']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      assert.deepEqual(credentialed(s.hits), [{ method: 'POST', body: '{"x":1}' }]);
+      assertReplaysChallenged(s.hits);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review round 3 (Medium): the retries rebuilt operator headers from
+  // --header, but the walker's header state evolves too: a cross-origin hop
+  // clears it for the rest of the chain (A → B → A ends at A with NONE), and a
+  // rewrite strips body-associated headers. The paid retry reattached them.
+
+  it('A → B → A: operator headers cleared mid-chain are not reattached (paid and cache reuse)', async () => {
+    // A: HEAD /start → 200; GET /start → 302 B/middle; /resource records.
+    // B: /middle → 302 back to A/resource.
+    const hits = [];
+    let aPort;
+    const b = http.createServer((req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.1:${aPort}/resource` });
+      res.end();
+    });
+    await new Promise((r) => b.listen(0, '127.0.0.1', r));
+    const a = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        if (req.url === '/start') {
+          res.writeHead(req.method === 'HEAD' ? 200 : 302, {
+            location: `http://127.0.0.1:${b.address().port}/middle`,
+          });
+          res.end();
+          return;
+        }
+        const isL402 = /^L402 /.test(req.headers.authorization || '');
+        hits.push({ method: req.method, body, auth: isL402 ? req.headers.authorization : null, headers: req.headers });
+        if (isL402) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"ok":true}');
+          return;
+        }
+        res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+        res.end();
+      });
+    });
+    await new Promise((r) => a.listen(0, '127.0.0.1', r));
+    aPort = a.address().port;
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const first = await payStart(home, aPort, ['--header', 'X-Operator-Marker:1']);
+      assert.equal(JSON.parse(first.stdout).event, 'l402_paid', first.stderr);
+      const second = await payStart(home, aPort, ['--header', 'X-Operator-Marker:1']);
+      assert.equal(JSON.parse(second.stdout).tokenReused, true);
+      assert.ok(
+        hits.every((h) => !('x-operator-marker' in h.headers)),
+        'the marker was cleared at A → B and must never reappear at A/resource',
+      );
+      assertReplaysChallenged(hits);
+    } finally {
+      a.close();
+      b.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a rewrite that strips body headers is replayed without them (body-less POST + Content-Type, 302)', async () => {
+    const s = await rewriteServer(302);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--method', 'POST', '--header', 'Content-Type:application/json']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.ok(
+        s.hits.every((h) => !('content-type' in h.headers)),
+        'the GET the walker produced carries no Content-Type, nor may its replay',
+      );
+      assertReplaysChallenged(s.hits);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator Authorization header never overrides or joins the paid L402 bearer', async () => {
+    const s = await rewriteServer(307);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--header', 'authorization:Bearer operator-token']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      const creds = s.hits.filter((h) => h.auth);
+      assert.equal(creds.length, 1);
+      assert.match(creds[0].auth, /^L402 TESTMAC==:[0-9a-f]+$/, 'only the L402 bearer, no operator value');
+      assert.match(res.stderr, /Authorization/i, 'the dropped operator header is reported on stderr');
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a pre-3.0.1 host+path cache entry is never sent (origin unknown) — fresh payment instead', async () => {
+    const s = await recordingServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    fs.writeFileSync(
+      path.join(home, '.blink', 'l402-tokens.json'),
+      JSON.stringify({ '127.0.0.1/resource': { macaroon: 'LEGACYMAC', preimage: 'e'.repeat(64), satoshis: 100000 } }),
+      'utf8',
+    );
+    try {
+      const out = await payVia(home, s.port);
+      assert.equal(out.tokenReused, false);
+      assert.ok(!s.seen.some((h) => h && h.includes('LEGACYMAC')), 'the legacy credential must never be sent');
+      const store = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8'));
+      assert.ok(store['127.0.0.1/resource'], 'legacy entry is kept (ignored, not deleted)');
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 });

@@ -276,7 +276,15 @@ function lnurlpMetadataUrl(username, domain) {
  * @param {boolean} [opts.operatorBody]  True when `body` came from the
  *        operator (--body). Such a body is NEVER forwarded across origins —
  *        a cross-origin hop that would preserve it refuses with URL_POLICY.
- * @returns {Promise<Response>}
+ * @returns {Promise<Response>}  Annotated with the EXACT final request the
+ *        walker sent (PR #24 review rounds 2-3): `challengedRequest` =
+ *        { method, headers, body } after every redirect rewrite — method/body
+ *        rewritten by 301/302/303, caller headers cleared for the rest of the
+ *        chain by a cross-origin hop, body headers stripped with a dropped body
+ *        — and `bodyDropped` (a supplied body was discarded). A caller that
+ *        re-issues the request directly at `res.url` (l402_pay's credentialed
+ *        retries) must replay THIS request verbatim, never rebuild it from its
+ *        original inputs: every field rebuilt by hand has drifted.
  */
 async function fetchWithRetry(
   url,
@@ -387,7 +395,11 @@ async function fetchWithRetry(
     }
 
     const isRedirect = res.status >= 300 && res.status < 400 && res.headers.get('location');
-    if (!isRedirect) return res;
+    if (!isRedirect) {
+      res.challengedRequest = { method: reqMethod, headers: { ...reqHeaders }, body: reqBody };
+      res.bodyDropped = body !== undefined && body !== null && reqBody === undefined;
+      return res;
+    }
 
     if (hop >= MAX_REDIRECTS) {
       throw new Error(`Too many redirects (>${MAX_REDIRECTS}) fetching ${what}.`);

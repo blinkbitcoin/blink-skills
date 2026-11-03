@@ -26,7 +26,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Version bumps — the exact spots
 
 1. `package.json` (1×)
-2. `package-lock.json` — the **root pair only** (top-level + `packages[""]`). Beware deps that coincidentally share the version number (`pg-types`, `tar-stream` sat at 2.2.0 once) — never bump those.
+2. `package-lock.json` — the **root pair only** (top-level + `packages[""]`). Beware deps that coincidentally share the version number (`pg-types`, `tar-stream` sat at 2.2.0 once; `json-buffer` sits at 3.0.1) — never bump those.
 3. `blink/SKILL.md` frontmatter (2×: `version:` and `oa.version:`-style entry)
 4. `README.md`: **both** test-count mentions (line ~13 and ~258). The ClawHub reference is deliberately VERSION-NEUTRAL (PR #21 review) — never hard-code a version there; the registry lag makes any pinned claim false until post-merge publication, and it re-falsifies on the next bump
 
@@ -50,6 +50,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
    - Publish returns `pending-publication`: the version goes through ClawHub's security scan before the registry serves it. `clawhub skill verify` fails while the current published version is not scan-clean.
    - This skill inherently trips two scan heuristics: `suspicious.env_credential_access` (reads `BLINK_API_KEY` + network send — the skill IS an API client) and `suspicious.insecure_tls_verification` (the `--no-verify` flag whose DEFAULT is verify-on). Both are by-design; do NOT contort the code to satisfy the scanner.
    - Retrieve evidence: `clawhub scan download blink-wallet --version X.Y.Z` (writes a ZIP to cwd — delete it, don't commit).
+   - **"Publication checks failed — Security check: could not complete"** (3.0.0, 2026-10): the scan ZIP shows `status: succeeded` but `clawscan.json` is `null`, and the version stays unpublished indefinitely (the upload is retained). There is no CLI fix — contact ClawHub support at community.openclaw.ai (Troubleshooting) with the versionId/attemptId from the publish JSON. Do NOT republish an unchanged version to work around it. In 3.0.0's case ClawHub's follow-up local review found a REAL issue (L402 token cache lacked origin isolation, fixed in 3.0.1) and refused an unchanged retry — treat a stuck scan as a possible finding, not just infrastructure.
 6. **Verify the registry**: `https://clawhub.ai/api/v1/skills/blink-wallet?ownerHandle=pretyflaco` must report the new `version`, and `clawhub inspect blink-wallet@X.Y.Z` must resolve. The README's ClawHub reference is deliberately version-neutral (see the version-bump list) — but the registry actually serving the new version is still a release gate. If the scan leaves the version pending (suspicious heuristics), surface it to the user immediately rather than waiting.
 
 ## Multi-model review loop
