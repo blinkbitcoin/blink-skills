@@ -56,7 +56,7 @@ const {
   fetchL402ProtocolInvoice,
 } = require('./l402_discover');
 
-const { saveToken, getToken } = require('./l402_store');
+const { saveToken, getToken, storeKeyFor } = require('./l402_store');
 
 const {
   reserveBudget,
@@ -373,26 +373,6 @@ function extractDomain(url) {
   }
 }
 
-/**
- * Build a token store key from a URL: hostname + pathname (no query/fragment).
- *
- * Different paths on the same domain may have different L402 challenges (e.g.
- * different prices or resource caveats), so each path needs its own cached token.
- *
- * @param {string} url
- * @returns {string}  e.g. "api.citrusrate.com/v1/btc"
- */
-function extractStoreKey(url) {
-  try {
-    const u = new URL(url);
-    // Normalise: strip trailing slash for consistency
-    const p = u.pathname.replace(/\/+$/, '') || '';
-    return u.hostname + p;
-  } catch {
-    return url;
-  }
-}
-
 // ── L402 challenge resolution ─────────────────────────────────────────────────
 
 /**
@@ -552,9 +532,10 @@ async function main() {
     // origin policy never sees that transition. The SHARED policy
     // (withholdHeadersIfCrossOrigin) withholds the ENTIRE operator header set
     // when origins differ: custom credential names (X-API-Key, …) cannot be
-    // enumerated. (The cached L402 Authorization is keyed to the canonical
-    // store key — earned at that origin — and is injected per-request, not
-    // part of the operator set.)
+    // enumerated. (The cached L402 Authorization is injected per-request, not
+    // part of the operator set; it is keyed by the canonical URL's ORIGIN +
+    // path — storeKeyFor — so it is only ever sent back to the origin that
+    // earned it.)
     const originPolicy = withholdHeadersIfCrossOrigin(args.url, canonicalUrl, args.headers);
     if (originPolicy.withheld.length > 0) {
       args.headers = originPolicy.headers;
@@ -580,14 +561,19 @@ async function main() {
   }
 
   const domain = extractDomain(canonicalUrl);
-  const storeKey = extractStoreKey(canonicalUrl);
+  // Origin isolation (ClawHub review of v3.0.0): the key is the canonical URL's
+  // ORIGIN (scheme + host + port) + path, so a token is never replayed to a
+  // different service on another port or to plaintext http. null = unkeyable:
+  // neither reuse nor cache (never a raw-string key).
+  const storeKey = storeKeyFor(canonicalUrl);
+  const useStore = !args.noStore && storeKey !== null;
 
   // ── Check token store first ──
   // Skip cache on --dry-run: dry-run must always probe the server fresh so it
   // can report the current invoice price, even if a cached token exists.
   // NOTE: budget/domain enforcement happens later, only when a payment is
   // actually required — free (HTTP 200) resources work without configuration.
-  if (!args.noStore && !args.force && !args.dryRun) {
+  if (useStore && !args.force && !args.dryRun) {
     const cached = getToken(storeKey);
     if (cached) {
       console.error(`Using cached L402 token for ${storeKey} (paid ${cached.satoshis ?? '?'} sats previously).`);
@@ -1124,7 +1110,7 @@ async function main() {
   }
 
   // ── Save token to store ──
-  if (!args.noStore) {
+  if (useStore) {
     try {
       saveToken(storeKey, {
         macaroon,

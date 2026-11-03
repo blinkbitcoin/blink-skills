@@ -976,7 +976,7 @@ commands['l402-store'] = {
   description: 'Manage the L402 token cache (~/.blink/l402-tokens.json)',
   args: [
     { name: 'subcommand', required: true, description: 'list | get | clear' },
-    { name: 'domain', required: false, description: 'Domain for get subcommand' },
+    { name: 'key', required: false, description: 'For get: the paid URL, or a raw store key (origin + path)' },
   ],
   options: {
     expired: { type: 'boolean', default: false },
@@ -986,7 +986,7 @@ commands['l402-store'] = {
   },
   examples: [
     'blink l402-store list',
-    'blink l402-store get satring.com',
+    'blink l402-store get https://satring.com/api/v1/resource',
     'blink l402-store clear',
     'blink l402-store clear --expired',
   ],

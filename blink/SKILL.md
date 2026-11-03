@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.0
+version: 3.0.1
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.0'
+    version: '3.0.1'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -1223,16 +1223,18 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 
 ```bash
 blink l402-store list
-blink l402-store get <domain>
+blink l402-store get <url|key>
 blink l402-store clear [--expired]
 ```
 
 - `list` — show all cached tokens (masks preimage for security)
-- `get <domain>` — retrieve the full token for a specific domain
+- `get <url|key>` — retrieve the full token for a paid URL (normalized to its key) or a raw store key
 - `clear` — remove all cached tokens
 - `clear --expired` — remove only expired tokens
 
 Token cache location: `~/.blink/l402-tokens.json`
+
+**Origin isolation (v3.0.1):** tokens are keyed by the paid URL's **origin** (scheme + host + port) + path, e.g. `https://api.example.com/v1/data`, and a cached token is only ever sent back to the exact origin that earned it. Before v3.0.1 the key was host + path, so a token could be replayed to a different service on another port of the same host, or from `https` to plaintext `http`. Entries written by older versions have no scheme; `list` flags them `legacy: true` and they are **never reused** (the next request pays fresh). Run `blink l402-store clear` to remove them.
 
 ### L402 Output Examples
 

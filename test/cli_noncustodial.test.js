@@ -1044,8 +1044,8 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       JSON.stringify({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] }),
     );
     const store = {};
-    // extractStoreKey = hostname + pathname (no port)
-    store[`127.0.0.1/resource`] = {
+    // Store key = ORIGIN (scheme + host + port) + path — see storeKeyFor.
+    store[`http://127.0.0.1:${port}/resource`] = {
       macaroon: 'MAC',
       preimage: 'f'.repeat(64),
       invoice: 'lnbc1000u1p0x',
@@ -1108,7 +1108,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       const control = await pay([]);
       assert.equal(control.j.event, 'l402_paid');
       assert.ok(
-        control.stored && control.stored['127.0.0.1/resource'],
+        control.stored && control.stored[`http://${address}:${port}/resource`],
         'counterfactual: default run persists the token',
       );
 
@@ -1117,6 +1117,101 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.equal(optedOut.stored, null, '--no-store must not write ~/.blink/l402-tokens.json');
     } finally {
       server.close();
+    }
+  });
+
+  // ClawHub review of v3.0.0: the token cache did not preserve service-origin
+  // isolation. The key was hostname + path, so a macaroon + preimage paid for at
+  // http://127.0.0.1:A/resource was replayed (Authorization header) to an
+  // UNPAID service at http://127.0.0.1:B/resource — and likewise across
+  // schemes (https → plaintext http). Reproduced before the fix: service B
+  // received `L402 TESTMAC==:fff…` and served the request with tokenReused:true.
+
+  /** L402 server that records every Authorization header it receives. */
+  function recordingServer() {
+    const seen = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        seen.push(req.headers.authorization || null);
+        if (req.headers.authorization) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, seen, port: server.address().port }));
+  }
+
+  function payVia(home, port) {
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/resource`, '--spark'],
+        {
+          env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
+          timeout: 15000,
+          killSignal: 'SIGKILL',
+        },
+        (err, stdout) => resolve(JSON.parse(stdout)),
+      );
+    });
+  }
+
+  it('a token paid at one origin is never sent to another origin (different port, same host+path)', async () => {
+    const a = await recordingServer();
+    const b = await recordingServer();
+    const home = seededHome({ dailyLimitSats: 400000, allowlist: ['127.0.0.1'] });
+    try {
+      const paidA = await payVia(home, a.port);
+      assert.equal(paidA.tokenReused, false);
+
+      // Control (self-validation): the SAME origin reuses the token, so the
+      // cache works and the cross-origin assertion below can actually fail.
+      const reuseA = await payVia(home, a.port);
+      assert.equal(reuseA.tokenReused, true, 'same-origin reuse must still work');
+
+      const atB = await payVia(home, b.port);
+      assert.equal(atB.tokenReused, false, 'origin B must not reuse origin A’s token');
+      assert.equal(atB.event, 'l402_paid', 'origin B is paid for fresh');
+      // B's first credentialed request comes only AFTER its own payment: the
+      // first two requests (canonicalization HEAD + initial request) carry no
+      // Authorization at all.
+      assert.deepEqual(b.seen.slice(0, 2), [null, null], 'A’s credential must never reach B');
+
+      const keys = Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8')));
+      assert.deepEqual(
+        keys.sort(),
+        [`http://127.0.0.1:${a.port}/resource`, `http://127.0.0.1:${b.port}/resource`].sort(),
+      );
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a pre-3.0.1 host+path cache entry is never sent (origin unknown) — fresh payment instead', async () => {
+    const s = await recordingServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    fs.writeFileSync(
+      path.join(home, '.blink', 'l402-tokens.json'),
+      JSON.stringify({ '127.0.0.1/resource': { macaroon: 'LEGACYMAC', preimage: 'e'.repeat(64), satoshis: 100000 } }),
+      'utf8',
+    );
+    try {
+      const out = await payVia(home, s.port);
+      assert.equal(out.tokenReused, false);
+      assert.ok(!s.seen.some((h) => h && h.includes('LEGACYMAC')), 'the legacy credential must never be sent');
+      const store = JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8'));
+      assert.ok(store['127.0.0.1/resource'], 'legacy entry is kept (ignored, not deleted)');
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 });
