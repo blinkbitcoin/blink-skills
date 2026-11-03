@@ -625,57 +625,69 @@ async function main() {
   const challengeUrl = initialRes.url || canonicalUrl;
 
   // ── Replay exactly the request that was challenged ──
-  // PR #24 review round 2 (Medium): the credentialed retries go DIRECTLY to
-  // challengeUrl, bypassing the redirect walker — so they must reproduce the
-  // walker's WHATWG rewrites (301/302 POST→GET, 303 non-GET/HEAD→GET, body
-  // dropped) instead of re-sending the original --method/--body. A rewrite that
-  // DROPPED an operator body is refused before payment, on ANY origin: paying
-  // for — then authorizing — a body-less GET would silently be a different
-  // operation than the one requested, and a payment cannot be undone.
+  // PR #24 review rounds 2-3: the credentialed requests go DIRECTLY to
+  // challengeUrl, bypassing the redirect walker, so they must be the walker's
+  // final request VERBATIM plus the bearer — never rebuilt from the original
+  // --method/--header/--body. Hand-rebuilt fields drifted three ways: the URL,
+  // the method/body (301/302/303 rewrites), and the headers (a cross-origin hop
+  // clears operator headers for the rest of the chain, so A → B → A ends at A
+  // with NONE; a rewrite strips body headers). The walker reports the exact
+  // request it sent; there is deliberately no fallback to reconstruction.
+  const challenged = initialRes.challengedRequest;
+  if (!challenged) {
+    throw new Error('Internal error: the challenged request state is unavailable; refusing to send a credential.');
+  }
+  // A rewrite that DROPPED an operator body is refused before payment, on ANY
+  // origin: paying for — then authorizing — a body-less GET would silently be
+  // a different operation than the one invoked, and a payment cannot be undone.
   if (initialRes.bodyDropped) {
     const refusal = new Error(
-      `The server redirected this ${String(args.method).toUpperCase()} to ${initialRes.effectiveMethod} ` +
+      `The server redirected this ${String(args.method).toUpperCase()} to ${challenged.method} ` +
         `${challengeUrl} and the redirect dropped the operator-supplied body — refusing to pay for or ` +
         `forward a different request than the one invoked. Invoke the issuing URL explicitly: ${challengeUrl}`,
     );
     refusal.code = 'URL_POLICY';
     throw refusal;
   }
-  const retryMethod = initialRes.effectiveMethod || args.method;
-  if (String(retryMethod).toUpperCase() !== String(args.method).toUpperCase()) {
+  // Defense in depth: the walker already refuses an operator body that would
+  // survive a cross-origin hop (307/308), so this cannot fire in practice.
+  if (challenged.body !== undefined && new URL(challengeUrl).origin !== new URL(canonicalUrl).origin) {
+    const refusal = new Error(
+      `The L402 challenge was issued by another origin (${canonicalUrl} → ${challengeUrl}) and this request ` +
+        `carries an operator-supplied body — refusing to forward it. Invoke the issuing URL explicitly: ${challengeUrl}`,
+    );
+    refusal.code = 'URL_POLICY';
+    throw refusal;
+  }
+  if (String(challenged.method).toUpperCase() !== String(args.method).toUpperCase()) {
     console.error(
-      `Note: the redirect rewrote ${args.method} to ${retryMethod}; the challenged request is replayed as-is.`,
+      `Note: the redirect rewrote ${args.method} to ${challenged.method}; the challenged request is replayed as-is.`,
     );
   }
-  /** Both credentialed requests (cache reuse, paid retry): the challenged request + the bearer. */
+  // The L402 bearer is the ONLY Authorization on a credentialed request: an
+  // operator --header Authorization (any case) would otherwise override it or
+  // be sent alongside it (a header object with both spellings merges).
+  const replayHeaders = {};
+  const droppedAuth = [];
+  for (const [k, v] of Object.entries(challenged.headers)) {
+    if (k.toLowerCase() === 'authorization') droppedAuth.push(k);
+    else replayHeaders[k] = v;
+  }
+  if (droppedAuth.length > 0) {
+    console.error(
+      `Warning: the operator-supplied ${droppedAuth.join(', ')} header is not sent with the L402 credential — ` +
+        'the paid L402 Authorization replaces it.',
+    );
+  }
+  /** Both credentialed requests (cache reuse, paid retry): the challenged request + the bearer, nothing else. */
   const credentialedRequest = (authHeader) => ({
-    method: retryMethod,
-    headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
-    ...(args.body ? { body: args.body } : {}),
+    method: challenged.method,
+    headers: { ...replayHeaders, Authorization: authHeader },
+    ...(challenged.body !== undefined ? { body: challenged.body } : {}),
   });
 
   if (challengeUrl !== canonicalUrl) {
     console.error(`L402 challenge issued by: ${challengeUrl}`);
-    // The direct hop to challengeUrl bypasses the in-chain origin policy, so
-    // apply it here exactly as for canonicalization: a different origin gets
-    // NONE of the operator headers, and an operator body is refused (a
-    // 301/302/303 rewrite dropped it in-chain; replaying the original method +
-    // body straight to that origin would disclose it).
-    const challengePolicy = withholdHeadersIfCrossOrigin(canonicalUrl, challengeUrl, args.headers);
-    if (challengePolicy.withheld.length > 0) {
-      args.headers = challengePolicy.headers;
-      console.error(
-        `Warning: the challenge came from another origin — ALL operator-supplied headers (${challengePolicy.withheld.join(', ')}) are withheld from it.`,
-      );
-    }
-    if (challengePolicy.crossOrigin && args.body !== null && args.body !== undefined) {
-      const refusal = new Error(
-        `The L402 challenge was issued by another origin (${canonicalUrl} → ${challengeUrl}) and this request ` +
-          `carries an operator-supplied body — refusing to forward it. Invoke the issuing URL explicitly: ${challengeUrl}`,
-      );
-      refusal.code = 'URL_POLICY';
-      throw refusal;
-    }
   }
   const challengeUrlField = challengeUrl !== canonicalUrl ? challengeUrl : undefined;
 

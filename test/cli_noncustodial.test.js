@@ -1344,8 +1344,14 @@ describe('CLI: l402-pay --spark lifecycle', () => {
             res.end();
             return;
           }
-          hits.push({ method: req.method, body, auth: req.headers.authorization || null });
-          if (req.headers.authorization) {
+          const isL402 = /^L402 /.test(req.headers.authorization || '');
+          hits.push({
+            method: req.method,
+            body,
+            auth: isL402 ? req.headers.authorization : null,
+            headers: req.headers,
+          });
+          if (isL402) {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end('{"ok":true}');
             return;
@@ -1376,6 +1382,34 @@ describe('CLI: l402-pay --spark lifecycle', () => {
 
   const credentialed = (hits) => hits.filter((h) => h.auth).map(({ method, body }) => ({ method, body }));
 
+  /**
+   * PR #24 review round 3: the invariant behind all three rounds. Every
+   * credentialed request must be EXACTLY the uncredentialed request that
+   * received the 402 — method, body, and the full header map as the server saw
+   * it (incl. the client's own defaults) — plus the L402 Authorization, and
+   * nothing else. Any field reconstructed from the original --method/--header/
+   * --body instead of replayed fails here.
+   */
+  function assertReplaysChallenged(hits) {
+    const view = ({ method, body, headers }) => {
+      const { authorization: _auth, ...rest } = headers;
+      return { method, body, headers: rest };
+    };
+    let challenged = null;
+    let checked = 0;
+    for (const h of hits) {
+      if (!h.auth) {
+        challenged = h;
+        continue;
+      }
+      assert.ok(challenged, 'a credentialed request must follow a challenged one');
+      assert.deepEqual(view(h), view(challenged), 'credentialed request = challenged request + L402 Authorization');
+      assert.match(h.auth, /^L402 TESTMAC==:[0-9a-f]+$/, 'the only Authorization is the L402 bearer');
+      checked++;
+    }
+    assert.ok(checked > 0, 'at least one credentialed request was checked');
+  }
+
   function assertRefusedBeforePayment(home, res, hits) {
     assert.notEqual(res.code, 0, 'must not succeed');
     assert.match(res.stdout + res.stderr, /URL_POLICY|refusing/i);
@@ -1396,7 +1430,11 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
       try {
         const res = await payStart(home, s.port, ['--method', method, '--body', '{"secret":1}']);
-        assert.deepEqual(s.hits[0], { method: 'GET', body: '', auth: null }, 'the walker rewrote it to GET');
+        assert.deepEqual(
+          { method: s.hits[0].method, body: s.hits[0].body, auth: s.hits[0].auth },
+          { method: 'GET', body: '', auth: null },
+          'the walker rewrote it to GET',
+        );
         assertRefusedBeforePayment(home, res, s.hits);
       } finally {
         s.server.close();
@@ -1418,6 +1456,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
         { method: 'GET', body: '' },
         { method: 'GET', body: '' },
       ]);
+      assertReplaysChallenged(s.hits);
     } finally {
       s.server.close();
       fs.rmSync(home, { recursive: true, force: true });
@@ -1434,6 +1473,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
       assert.deepEqual(a.hits, [], 'A only redirects; its /resource is never hit');
       assert.deepEqual(credentialed(b.hits), [{ method: 'GET', body: '' }]);
+      assertReplaysChallenged(b.hits);
     } finally {
       a.server.close();
       b.server.close();
@@ -1449,6 +1489,98 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.equal(res.code, 0, res.stderr);
       assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
       assert.deepEqual(credentialed(s.hits), [{ method: 'POST', body: '{"x":1}' }]);
+      assertReplaysChallenged(s.hits);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review round 3 (Medium): the retries rebuilt operator headers from
+  // --header, but the walker's header state evolves too: a cross-origin hop
+  // clears it for the rest of the chain (A → B → A ends at A with NONE), and a
+  // rewrite strips body-associated headers. The paid retry reattached them.
+
+  it('A → B → A: operator headers cleared mid-chain are not reattached (paid and cache reuse)', async () => {
+    // A: HEAD /start → 200; GET /start → 302 B/middle; /resource records.
+    // B: /middle → 302 back to A/resource.
+    const hits = [];
+    let aPort;
+    const b = http.createServer((req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.1:${aPort}/resource` });
+      res.end();
+    });
+    await new Promise((r) => b.listen(0, '127.0.0.1', r));
+    const a = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        if (req.url === '/start') {
+          res.writeHead(req.method === 'HEAD' ? 200 : 302, {
+            location: `http://127.0.0.1:${b.address().port}/middle`,
+          });
+          res.end();
+          return;
+        }
+        const isL402 = /^L402 /.test(req.headers.authorization || '');
+        hits.push({ method: req.method, body, auth: isL402 ? req.headers.authorization : null, headers: req.headers });
+        if (isL402) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"ok":true}');
+          return;
+        }
+        res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+        res.end();
+      });
+    });
+    await new Promise((r) => a.listen(0, '127.0.0.1', r));
+    aPort = a.address().port;
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const first = await payStart(home, aPort, ['--header', 'X-Operator-Marker:1']);
+      assert.equal(JSON.parse(first.stdout).event, 'l402_paid', first.stderr);
+      const second = await payStart(home, aPort, ['--header', 'X-Operator-Marker:1']);
+      assert.equal(JSON.parse(second.stdout).tokenReused, true);
+      assert.ok(
+        hits.every((h) => !('x-operator-marker' in h.headers)),
+        'the marker was cleared at A → B and must never reappear at A/resource',
+      );
+      assertReplaysChallenged(hits);
+    } finally {
+      a.close();
+      b.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a rewrite that strips body headers is replayed without them (body-less POST + Content-Type, 302)', async () => {
+    const s = await rewriteServer(302);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--method', 'POST', '--header', 'Content-Type:application/json']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.ok(
+        s.hits.every((h) => !('content-type' in h.headers)),
+        'the GET the walker produced carries no Content-Type, nor may its replay',
+      );
+      assertReplaysChallenged(s.hits);
+    } finally {
+      s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator Authorization header never overrides or joins the paid L402 bearer', async () => {
+    const s = await rewriteServer(307);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payStart(home, s.port, ['--header', 'authorization:Bearer operator-token']);
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(JSON.parse(res.stdout).event, 'l402_paid');
+      const creds = s.hits.filter((h) => h.auth);
+      assert.equal(creds.length, 1);
+      assert.match(creds[0].auth, /^L402 TESTMAC==:[0-9a-f]+$/, 'only the L402 bearer, no operator value');
+      assert.match(res.stderr, /Authorization/i, 'the dropped operator header is reported on stderr');
     } finally {
       s.server.close();
       fs.rmSync(home, { recursive: true, force: true });
