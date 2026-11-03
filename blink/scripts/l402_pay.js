@@ -322,8 +322,11 @@ async function fetchWithTimeout(url, options, timeoutMs = 15_000, allowedHosts =
  * Sends a HEAD request with redirect:'follow' and returns response.url —
  * the final URL after the redirect chain. This prevents two failure modes:
  *
- *   1. Token cached under the wrong domain (e.g. www.satring.com instead of
- *      satring.com) when the user supplies a URL that redirects.
+ *   1. Requests issued at a non-canonical URL (e.g. www.satring.com instead
+ *      of satring.com). NOTE: the token cache is NOT keyed by this URL — a
+ *      HEAD can land somewhere other than the real request (method-dependent
+ *      redirects), so the credential is bound to the URL that actually issued
+ *      the 402 (challengeUrl in main).
  *   2. L402 Authorization header stripped by fetch on the retry request
  *      because the WHATWG Fetch spec forbids forwarding Authorization across
  *      cross-host redirects (redirect-fetch step 12).
@@ -518,8 +521,7 @@ async function main() {
   }
 
   // ── Resolve canonical URL (follow any HTTP redirects — guarded) ──
-  // This must happen before the token cache lookup and before any fetch so
-  // that: (a) the cache key is the canonical domain, and (b) the L402
+  // This must happen before any fetch so that the L402
   // Authorization header is not stripped by fetch when following redirects
   // from a non-canonical URL (WHATWG Fetch spec forbids forwarding
   // Authorization across cross-host redirects).
@@ -533,9 +535,8 @@ async function main() {
     // (withholdHeadersIfCrossOrigin) withholds the ENTIRE operator header set
     // when origins differ: custom credential names (X-API-Key, …) cannot be
     // enumerated. (The cached L402 Authorization is injected per-request, not
-    // part of the operator set; it is keyed by the canonical URL's ORIGIN +
-    // path — storeKeyFor — so it is only ever sent back to the origin that
-    // earned it.)
+    // part of the operator set; it is bound to the URL that actually ISSUED the
+    // 402 — see challengeUrl below — never to this HEAD-derived URL.)
     const originPolicy = withholdHeadersIfCrossOrigin(args.url, canonicalUrl, args.headers);
     if (originPolicy.withheld.length > 0) {
       args.headers = originPolicy.headers;
@@ -557,80 +558,6 @@ async function main() {
       );
       refusal.code = 'URL_POLICY'; // same machine-readable code as the in-chain refusal
       throw refusal;
-    }
-  }
-
-  const domain = extractDomain(canonicalUrl);
-  // Origin isolation (ClawHub review of v3.0.0): the key is the canonical URL's
-  // ORIGIN (scheme + host + port) + path, so a token is never replayed to a
-  // different service on another port or to plaintext http. null = unkeyable:
-  // neither reuse nor cache (never a raw-string key).
-  const storeKey = storeKeyFor(canonicalUrl);
-  const useStore = !args.noStore && storeKey !== null;
-
-  // ── Check token store first ──
-  // Skip cache on --dry-run: dry-run must always probe the server fresh so it
-  // can report the current invoice price, even if a cached token exists.
-  // NOTE: budget/domain enforcement happens later, only when a payment is
-  // actually required — free (HTTP 200) resources work without configuration.
-  if (useStore && !args.force && !args.dryRun) {
-    const cached = getToken(storeKey);
-    if (cached) {
-      console.error(`Using cached L402 token for ${storeKey} (paid ${cached.satoshis ?? '?'} sats previously).`);
-      console.error('Retrying request with cached token...');
-
-      const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
-      const res = await fetchWithTimeout(
-        canonicalUrl,
-        {
-          method: args.method,
-          headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
-          ...(args.body ? { body: args.body } : {}),
-        },
-        15_000,
-        allowHosts,
-      );
-
-      const body = await res.text();
-      let data;
-      try {
-        data = JSON.parse(body);
-      } catch {
-        data = body;
-      }
-
-      if (res.status !== 200) {
-        // Cached token rejected or server unreachable — emit l402_error so the
-        // caller can distinguish a successful cached-token hit from a failure.
-        const output = {
-          event: 'l402_error',
-          url: args.url,
-          canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-          status: res.status,
-          tokenReused: true,
-          satoshis: cached.satoshis ?? null,
-          message: `Cached token returned status ${res.status}. Token may be expired or server is unreachable.`,
-          data,
-        };
-        console.log(JSON.stringify(output, null, 2));
-        process.exit(1);
-        return; // unreachable in production; guards against mocked process.exit in tests
-      }
-
-      const output = {
-        event: 'l402_paid',
-        url: args.url,
-        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
-        status: res.status,
-        tokenReused: true,
-        backend: cached.backend ?? null,
-        satoshis: cached.satoshis ?? null,
-        invoiceMsats: cached.invoiceMsats ?? null,
-        budgetSats: cached.budgetSats ?? null,
-        data,
-      };
-      console.log(JSON.stringify(output, null, 2));
-      return;
     }
   }
 
@@ -682,6 +609,120 @@ async function main() {
       return;
     }
     throw new Error(`Unexpected status ${initialRes.status}: ${body.slice(0, 200)}`);
+  }
+
+  // ── Credential owner: the URL that actually ISSUED the 402 ──
+  // PR #24 review (High): the HEAD canonicalization is credential-free and can
+  // land somewhere other than the real request — a service may answer HEAD
+  // itself but redirect GET/POST elsewhere (method-dependent redirects). The
+  // challenge (invoice + macaroon) comes from wherever the REAL request ended
+  // up, so that URL owns the credential: the cache key, the allowlist/budget
+  // domain, and every credentialed request (paid retry and cache reuse) are
+  // derived from it, and the bearer is sent DIRECTLY to it — never to a first
+  // hop that would see it before cross-origin redirect stripping can act.
+  // initialRes.url is the final hop of the guarded, per-hop-validated chain
+  // (same mechanism as resolveCanonicalUrl); fall back if absent.
+  const challengeUrl = initialRes.url || canonicalUrl;
+  if (challengeUrl !== canonicalUrl) {
+    console.error(`L402 challenge issued by: ${challengeUrl}`);
+    // The direct hop to challengeUrl bypasses the in-chain origin policy, so
+    // apply it here exactly as for canonicalization: a different origin gets
+    // NONE of the operator headers, and an operator body is refused (a
+    // 301/302/303 rewrite dropped it in-chain; replaying the original method +
+    // body straight to that origin would disclose it).
+    const challengePolicy = withholdHeadersIfCrossOrigin(canonicalUrl, challengeUrl, args.headers);
+    if (challengePolicy.withheld.length > 0) {
+      args.headers = challengePolicy.headers;
+      console.error(
+        `Warning: the challenge came from another origin — ALL operator-supplied headers (${challengePolicy.withheld.join(', ')}) are withheld from it.`,
+      );
+    }
+    if (challengePolicy.crossOrigin && args.body !== null && args.body !== undefined) {
+      const refusal = new Error(
+        `The L402 challenge was issued by another origin (${canonicalUrl} → ${challengeUrl}) and this request ` +
+          `carries an operator-supplied body — refusing to forward it. Invoke the issuing URL explicitly: ${challengeUrl}`,
+      );
+      refusal.code = 'URL_POLICY';
+      throw refusal;
+    }
+  }
+  const challengeUrlField = challengeUrl !== canonicalUrl ? challengeUrl : undefined;
+
+  const domain = extractDomain(challengeUrl);
+  // Origin isolation (ClawHub review of v3.0.0): the key is the issuing URL's
+  // ORIGIN (scheme + host + port) + path, so a token is never replayed to a
+  // different service on another port or to plaintext http. null = unkeyable:
+  // neither reuse nor cache (never a raw-string key).
+  const storeKey = storeKeyFor(challengeUrl);
+  const useStore = !args.noStore && storeKey !== null;
+
+  // ── Reuse a cached token for the issuing URL ──
+  // Looked up only now, after the real request proved who issues the challenge
+  // (one extra uncredentialed request on a cache hit — the price of never
+  // sending a bearer to an unverified origin). Skipped on --dry-run: dry-run
+  // must always report the current invoice price. Budget/domain enforcement
+  // applies only when a payment is actually made.
+  if (useStore && !args.force && !args.dryRun) {
+    const cached = getToken(storeKey);
+    if (cached) {
+      console.error(`Using cached L402 token for ${storeKey} (paid ${cached.satoshis ?? '?'} sats previously).`);
+      console.error('Retrying request with cached token...');
+
+      const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
+      const res = await fetchWithTimeout(
+        challengeUrl,
+        {
+          method: args.method,
+          headers: { Accept: 'application/json', Authorization: authHeader, ...args.headers },
+          ...(args.body ? { body: args.body } : {}),
+        },
+        15_000,
+        allowHosts,
+      );
+
+      const body = await res.text();
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch {
+        data = body;
+      }
+
+      if (res.status !== 200) {
+        // Cached token rejected or server unreachable — emit l402_error so the
+        // caller can distinguish a successful cached-token hit from a failure.
+        const output = {
+          event: 'l402_error',
+          url: args.url,
+          canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+          challengeUrl: challengeUrlField,
+          status: res.status,
+          tokenReused: true,
+          satoshis: cached.satoshis ?? null,
+          message: `Cached token returned status ${res.status}. Token may be expired or server is unreachable.`,
+          data,
+        };
+        console.log(JSON.stringify(output, null, 2));
+        process.exit(1);
+        return; // unreachable in production; guards against mocked process.exit in tests
+      }
+
+      const output = {
+        event: 'l402_paid',
+        url: args.url,
+        canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+        challengeUrl: challengeUrlField,
+        status: res.status,
+        tokenReused: true,
+        backend: cached.backend ?? null,
+        satoshis: cached.satoshis ?? null,
+        invoiceMsats: cached.invoiceMsats ?? null,
+        budgetSats: cached.budgetSats ?? null,
+        data,
+      };
+      console.log(JSON.stringify(output, null, 2));
+      return;
+    }
   }
 
   console.error('402 Payment Required — parsing L402 challenge...');
@@ -1142,7 +1183,7 @@ async function main() {
   const authHeader = `L402 ${macaroon}:${preimage}`;
 
   const retryRes = await fetchWithTimeout(
-    canonicalUrl,
+    challengeUrl,
     {
       method: args.method,
       headers: {
@@ -1168,6 +1209,7 @@ async function main() {
     event: 'l402_paid',
     url: args.url,
     canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+    challengeUrl: challengeUrlField,
     format: challenge.format,
     backend: sparkBackend ? 'spark' : 'custodial',
     paymentStatus,

@@ -1729,13 +1729,18 @@ describe('l402_pay enforcement (non-dry-run)', () => {
       invoiceMsats: 1400,
       budgetSats: 2,
     });
-    // The retry with the cached token returns 200.
-    global.fetch = async (url) => ({
-      status: 200,
-      url: String(url),
-      headers: { get: () => null },
-      text: async () => JSON.stringify({ ok: true }),
-    });
+    // A real L402 server: 402 without a credential (the uncredentialed request
+    // that establishes who issues the challenge — PR #24 review), 200 with the
+    // cached token.
+    global.fetch = async (url, opts) => {
+      const authed = Boolean(opts && opts.headers && opts.headers.Authorization);
+      return {
+        status: authed ? 200 : 402,
+        url: String(url),
+        headers: { get: (h) => (!authed && /www-authenticate/i.test(h) ? 'L402 macaroon="X", invoice="lnbc1"' : null) },
+        text: async () => JSON.stringify({ ok: authed }),
+      };
+    };
     const code = await runPay(['https://paywall.example.com/resource']);
     assert.equal(code, null);
     const out = output();

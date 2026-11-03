@@ -1147,19 +1147,47 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     return ready.then(() => ({ server, seen, port: server.address().port }));
   }
 
-  function payVia(home, port) {
+  function payViaRaw(home, port, extra = []) {
     return new Promise((resolve) => {
       execFile(
         process.execPath,
-        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/resource`, '--spark'],
+        ['--require', stubPath, binPath, 'l402-pay', `http://127.0.0.1:${port}/resource`, '--spark', ...extra],
         {
           env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
           timeout: 15000,
           killSignal: 'SIGKILL',
         },
-        (err, stdout) => resolve(JSON.parse(stdout)),
+        (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }),
       );
     });
+  }
+
+  async function payVia(home, port, extra = []) {
+    return JSON.parse((await payViaRaw(home, port, extra)).stdout);
+  }
+
+  /**
+   * PR #24 review (High): a service that answers the credential-free HEAD
+   * canonicalization itself but redirects the REAL request elsewhere. `status`
+   * is the redirect code for non-HEAD methods. Records method + every header.
+   */
+  function headStaysRedirectsElsewhere(targetPort, status = 302) {
+    const seen = [];
+    let server;
+    const ready = new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        seen.push({ method: req.method, headers: req.headers });
+        if (req.method === 'HEAD') {
+          res.writeHead(200);
+          res.end();
+          return;
+        }
+        res.writeHead(status, { location: `http://127.0.0.1:${targetPort}/resource` });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    return ready.then(() => ({ server, seen, port: server.address().port }));
   }
 
   it('a token paid at one origin is never sent to another origin (different port, same host+path)', async () => {
@@ -1188,6 +1216,99 @@ describe('CLI: l402-pay --spark lifecycle', () => {
         keys.sort(),
         [`http://127.0.0.1:${a.port}/resource`, `http://127.0.0.1:${b.port}/resource`].sort(),
       );
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #24 review (High): the cache key and paid-retry target came from the
+  // credential-free HEAD canonicalization, but the REAL request can follow a
+  // different, method-dependent redirect. A answered HEAD itself, redirected
+  // GET to B; B issued the 402. Before the fix: B's macaroon + preimage were
+  // stored under A's key and the paid retry went to A FIRST — A received B's
+  // credential before cross-origin header stripping could act, on every run.
+  // The credential owner is the URL that actually issued the challenge.
+  it('a token is bound to the origin that issued the 402, not the HEAD canonical URL (method-dependent redirect)', async () => {
+    const b = await recordingServer();
+    const a = await headStaysRedirectsElsewhere(b.port);
+    const home = seededHome({ dailyLimitSats: 400000, allowlist: ['127.0.0.1'] });
+    const aAuth = () => a.seen.filter((r) => r.headers.authorization).length;
+    try {
+      const first = await payVia(home, a.port);
+      assert.equal(first.event, 'l402_paid');
+      assert.equal(first.tokenReused, false);
+      assert.equal(aAuth(), 0, 'A must never receive the credential B issued');
+      assert.equal(first.challengeUrl, `http://127.0.0.1:${b.port}/resource`);
+      assert.ok(
+        b.seen.some((h) => h && h.startsWith('L402 TESTMAC==:')),
+        'B, the issuer, receives its own credential',
+      );
+
+      const keys = Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.blink', 'l402-tokens.json'), 'utf8')));
+      assert.deepEqual(keys, [`http://127.0.0.1:${b.port}/resource`], 'stored under the issuing origin only');
+
+      const bCredsBefore = b.seen.filter(Boolean).length;
+      const second = await payVia(home, a.port);
+      assert.equal(second.tokenReused, true, 'the cached token is reused — at B');
+      assert.equal(aAuth(), 0, 'A still never receives it on cache reuse');
+      assert.equal(b.seen.filter(Boolean).length, bCredsBefore + 1, 'cache reuse sends it to B exactly once');
+    } finally {
+      a.server.close();
+      b.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('operator headers are withheld from a cross-origin challenge URL on the direct retry', async () => {
+    // Guards the NEW direct hop to the challenge URL: in-chain redirects strip
+    // operator headers cross-origin, so a direct retry must not reintroduce them.
+    const b = http.createServer((req, res) => {
+      b.seenHeaders.push(req.headers['x-api-key'] || null);
+      if (req.headers.authorization) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+        return;
+      }
+      res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+      res.end();
+    });
+    b.seenHeaders = [];
+    await new Promise((r) => b.listen(0, '127.0.0.1', r));
+    const a = await headStaysRedirectsElsewhere(b.address().port);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const out = await payVia(home, a.port, ['--header', 'X-Api-Key:operator-secret']);
+      assert.equal(out.event, 'l402_paid');
+      assert.ok(
+        a.seen.some((r) => r.headers['x-api-key'] === 'operator-secret'),
+        'A (the supplied origin) gets it',
+      );
+      assert.deepEqual(b.seenHeaders.filter(Boolean), [], 'B (a different origin) must never receive operator headers');
+    } finally {
+      a.server.close();
+      b.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator body is refused (URL_POLICY) before payment when the 402 came from another origin', async () => {
+    // A 302s the POST; WHATWG semantics turn it into a body-less GET at B. Replaying
+    // the original POST + body directly to B would disclose it in a form the
+    // redirect never produced — refuse, and pay nothing.
+    const b = await recordingServer();
+    const a = await headStaysRedirectsElsewhere(b.port, 302);
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payViaRaw(home, a.port, ['--method', 'POST', '--body', '{"secret":1}']);
+      assert.notEqual(res.code, 0);
+      assert.match(res.stdout + res.stderr, /URL_POLICY|refusing to forward/i);
+      assert.ok(!fs.existsSync(path.join(home, '.blink', 'l402-tokens.json')), 'no token stored');
+      const logFile = path.join(home, '.blink', 'spending-log.json');
+      const log = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];
+      assert.equal(log.length, 0, 'nothing paid');
+      assert.equal(a.seen.filter((r) => r.headers.authorization).length, 0);
     } finally {
       a.server.close();
       b.server.close();
