@@ -43,6 +43,8 @@ const CAVEAT_TYPE_RESOURCE = 0x02;
 const HMAC_SIZE = 32;
 const PAYMENT_HASH_SIZE = 32;
 const ROOT_KEY_SIZE = 32;
+const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
+
 const ROOT_KEY_FILE = path.join(os.homedir(), '.blink', 'l402-root-key');
 
 // ── Root key management ──────────────────────────────────────────────────────
@@ -67,23 +69,38 @@ function getRootKey() {
     return Buffer.from(envKey, 'hex');
   }
 
-  // 2. Persisted file
+  // 2. Persisted file. ClawHub 3.0.1 scan: the signing key mints and verifies
+  // every sold token, so it gets the same protection as the other state files
+  // (0700 dir, 0600 file, symlink refusal, atomic write) — it used to be read
+  // through symlinks and written with a plain mkdir + writeFile.
   try {
+    ensureSecureStateDir(path.dirname(ROOT_KEY_FILE));
+  } catch {
+    // Best-effort hardening on read (mirrors the token store).
+  }
+  let st = null;
+  try {
+    st = fs.lstatSync(ROOT_KEY_FILE);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  if (st && st.isSymbolicLink()) {
+    // Never read a key from (or regenerate over) a symlink's target.
+    throw new Error(`Refusing to use ${ROOT_KEY_FILE}: it is a symlink.`);
+  }
+  if (st) {
     const stored = fs.readFileSync(ROOT_KEY_FILE, 'utf8').trim();
     if (/^[0-9a-fA-F]{64}$/.test(stored)) {
       return Buffer.from(stored, 'hex');
     }
     console.error(`Warning: ${ROOT_KEY_FILE} contains an invalid key — regenerating.`);
-  } catch {
-    // file doesn't exist — will generate
   }
 
   // 3. Auto-generate
   const newKey = crypto.randomBytes(ROOT_KEY_SIZE);
   const newKeyHex = newKey.toString('hex');
   try {
-    fs.mkdirSync(path.dirname(ROOT_KEY_FILE), { recursive: true });
-    fs.writeFileSync(ROOT_KEY_FILE, newKeyHex, { mode: 0o600 });
+    writeSecureFileAtomic(ROOT_KEY_FILE, newKeyHex);
     console.error(`Warning: Generated new L402 root key and saved to ${ROOT_KEY_FILE}.`);
     console.error(`         To use it portably, copy its value into BLINK_L402_ROOT_KEY (never log the key itself).`);
   } catch (e) {
@@ -281,21 +298,26 @@ function decodeMacaroon({ macaroon, rootKey }) {
  * @param {object}  opts
  * @param {number|null} opts.expiresAt    Unix timestamp or null
  * @param {string|null} opts.resource     Required resource from macaroon or null
- * @param {string|null} [opts.checkResource]  Resource the caller is requesting (optional)
+ * @param {string|null} [opts.checkResource]  Resource the caller is requesting. REQUIRED
+ *        for a resource-scoped token — omitting it fails closed (resourceUnchecked).
  * @param {number}  [opts.nowSeconds]     Override "now" for testing
- * @returns {{ expired: boolean, resourceMismatch: boolean, caveatsValid: boolean }}
+ * @returns {{ expired: boolean, resourceMismatch: boolean, resourceUnchecked: boolean, caveatsValid: boolean }}
  */
 function checkCaveats({ expiresAt, resource, checkResource, nowSeconds }) {
   const now = nowSeconds !== undefined ? nowSeconds : Math.floor(Date.now() / 1000);
 
   const expired = expiresAt !== null && now > expiresAt;
 
-  const resourceMismatch =
-    resource !== null && checkResource !== undefined && checkResource !== null && resource !== checkResource;
+  const resourceGiven = checkResource !== undefined && checkResource !== null;
+  const resourceMismatch = resource !== null && resourceGiven && resource !== checkResource;
+  // ClawHub 3.0.1 scan (concern): a resource-scoped token verified WITHOUT the
+  // requested resource used to pass — the caveat was skipped, so a token sold
+  // for one path was accepted for any request. Missing context fails closed.
+  const resourceUnchecked = resource !== null && !resourceGiven;
 
-  const caveatsValid = !expired && !resourceMismatch;
+  const caveatsValid = !expired && !resourceMismatch && !resourceUnchecked;
 
-  return { expired, resourceMismatch, caveatsValid };
+  return { expired, resourceMismatch, resourceUnchecked, caveatsValid };
 }
 
 /**

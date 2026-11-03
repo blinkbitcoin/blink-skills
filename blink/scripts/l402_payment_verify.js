@@ -226,7 +226,7 @@ async function main() {
   const preimageValid = verifyPreimage(args.preimage, paymentHash);
 
   // Check caveats
-  const { expired, resourceMismatch, caveatsValid } = checkCaveats({
+  const { expired, resourceMismatch, resourceUnchecked, caveatsValid } = checkCaveats({
     expiresAt,
     resource,
     checkResource: args.resource,
@@ -259,6 +259,12 @@ async function main() {
 
   if (resourceMismatch) {
     output.resourceMismatch = true;
+  }
+  if (resourceUnchecked) {
+    output.resourceUnchecked = true;
+    output.message =
+      `This token is scoped to the resource '${resource}'. Pass --resource <requested resource> to verify it; ` +
+      'without it the token is rejected (a scoped token must never be accepted for an unknown request).';
   }
 
   console.log(JSON.stringify(output, null, 2));

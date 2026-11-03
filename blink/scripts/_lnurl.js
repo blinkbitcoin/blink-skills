@@ -105,7 +105,41 @@ function policyError(message) {
   return err;
 }
 
+const L402_ALLOWLIST = Symbol('l402Allowlist');
+
+/**
+ * Wrap the L402 BUDGET allowlist (a payment policy, not a network-access list)
+ * for the URL guard (FT7, v3.0.2):
+ *   - exclusive (default): only listed hosts may be fetched — every non-dry-run
+ *     l402-pay request (v2.6.1). Refusals name the L402 allowlist.
+ *   - relaxOnly: the list may only RELAX the SSRF guard (permit a listed
+ *     private/local host) and never restricts public hosts — the documented
+ *     ungated probes, l402-discover and l402-pay --dry-run.
+ * An unconfigured allowlist (null) stays null: behavior is unchanged.
+ *
+ * @param {Set<string>|string[]|null} hosts
+ * @param {{ relaxOnly?: boolean }} [opts]
+ * @returns {object|null} a value accepted wherever `allowedHosts` is
+ */
+function l402Allowlist(hosts, { relaxOnly = false } = {}) {
+  if (!hosts) return null;
+  return Object.freeze({
+    [L402_ALLOWLIST]: true,
+    hosts: hosts instanceof Set ? hosts : new Set(hosts),
+    relaxOnly: Boolean(relaxOnly),
+  });
+}
+
 function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
+  // L402 budget-allowlist policy (see l402Allowlist); a plain Set/array keeps
+  // the original exclusive "Blink hosts" semantics of the LNURL flows.
+  let relaxOnly = false;
+  let label = null;
+  if (allowedHosts && allowedHosts[L402_ALLOWLIST]) {
+    relaxOnly = allowedHosts.relaxOnly;
+    label = 'the L402 budget allowlist';
+    allowedHosts = allowedHosts.hosts;
+  }
   let url;
   try {
     url = new URL(String(rawUrl));
@@ -129,8 +163,13 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   const allowed = allowedHosts ? (allowedHosts instanceof Set ? allowedHosts : new Set(allowedHosts)) : null;
   const explicitlyAllowed = allowed ? allowed.has(host) : false;
 
-  if (allowed && !explicitlyAllowed) {
-    throw policyError(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
+  if (allowed && !explicitlyAllowed && !relaxOnly) {
+    throw policyError(
+      label
+        ? `Refusing to fetch ${what} from '${host}': not in ${label}. Allowed: ${[...allowed].join(', ')}. ` +
+            `Add it with: blink budget allowlist add ${host}`
+        : `Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`,
+    );
   }
 
   // Plaintext is tolerable only for a local host the caller deliberately
@@ -159,7 +198,7 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   // (portsUnrestricted): L402 services routinely live on arbitrary ports, and
   // the L402 allowlist is a PAYMENT policy list, not a network-access list —
   // private-address and redirect re-validation still apply regardless.
-  if (!opts.portsUnrestricted && allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
+  if (!opts.portsUnrestricted && allowed && !relaxOnly && url.port && !allowed.has(`${host}:${url.port}`)) {
     throw policyError(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
   }
 
@@ -389,9 +428,12 @@ async function fetchWithRetry(
     }
 
     if (!res) {
-      throw new Error(
-        `${what} request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
-      );
+      // Keep the transport cause: undici reports e.g. "terminated" whose cause
+      // ("Decompression failed") is the actual diagnosis (FT7, v3.0.2).
+      const detail = lastErr
+        ? lastErr.message + (lastErr.cause && lastErr.cause.message ? ` (${lastErr.cause.message})` : '')
+        : 'unknown error';
+      throw new Error(`${what} request failed after ${retries + 1} attempt(s): ${detail}`, { cause: lastErr });
     }
 
     const isRedirect = res.status >= 300 && res.status < 400 && res.headers.get('location');
@@ -1139,6 +1181,7 @@ module.exports = {
   isPrivateAddress,
   assertAllowedUrl,
   withholdHeadersIfCrossOrigin,
+  l402Allowlist,
   isLnurlNotFoundReason,
   bech32Decode,
   convertBits,

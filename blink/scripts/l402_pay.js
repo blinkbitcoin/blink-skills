@@ -70,7 +70,13 @@ const {
 // address rejection (incl. IPv4-mapped IPv6), manual redirects re-validated
 // per hop, hop limit, and the budget allowlist when configured (audit FT:
 // these scripts previously used bare fetch with redirect:'follow').
-const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
+const {
+  fetchWithRetry,
+  assertAllowedUrl,
+  withholdHeadersIfCrossOrigin,
+  l402Allowlist,
+  decodeBolt11,
+} = require('./_lnurl');
 
 // ── GraphQL mutation (same as pay_invoice.js) ─────────────────────────────────
 
@@ -493,7 +499,10 @@ async function main() {
   // machine; the canonical-domain gate below still catches cross-domain
   // redirects at payment time. All fetches (including the server-supplied
   // l402-protocol payment_request_url) route through the shared SSRF guard.
-  const allowHosts = getAllowHosts();
+  // Non-dry-run: the allowlist is EXCLUSIVE for every fetch (v2.6.1).
+  // --dry-run is the documented ungated preview: the list may only relax the
+  // SSRF guard there (FT7, v3.0.2 — it was enforced as exclusive).
+  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: args.dryRun });
   if (!args.dryRun) {
     // requireConfigured:false — an UNCONFIGURED allowlist leaves probing open
     // (the documented free-resource discovery mode; still SSRF-guarded, and
@@ -712,9 +721,33 @@ async function main() {
       console.error('Retrying request with cached token...');
 
       const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
-      const res = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
+      // FT7 (v3.0.2): a transport failure here used to escape as a bare
+      // "Error: terminated" with NOTHING on stdout — always emit JSON.
+      let res;
+      let body;
+      try {
+        res = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
+        body = await res.text();
+      } catch (err) {
+        if (err && err.code === 'URL_POLICY') throw err;
+        const output = {
+          event: 'l402_reuse_failed',
+          url: args.url,
+          canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+          challengeUrl: challengeUrlField,
+          tokenReused: true,
+          backend: cached.backend ?? null,
+          satoshis: cached.satoshis ?? null,
+          error: describeFetchError(err),
+          message:
+            'The cached L402 token was sent but the request failed before a response arrived; no payment was made. ' +
+            'Re-run to retry with the same token, or pass --force to pay for a fresh one.',
+        };
+        console.log(JSON.stringify(output, null, 2));
+        process.exit(1);
+        return; // unreachable in production; guards against mocked process.exit in tests
+      }
 
-      const body = await res.text();
       let data;
       try {
         data = JSON.parse(body);
@@ -918,6 +951,34 @@ async function main() {
     // Opt out of the fail-closed default so an unconfigured budget shows
     // remaining limits instead of a denial.
     const budgetInfo = budgetSats !== null ? checkBudget(budgetSats, { requireConfigured: false }) : null;
+    // FT7 (v3.0.2): --probe was silently ignored with --dry-run. The probe is a
+    // non-spending estimate — the ACTUAL routing fee can be higher (FT7: 1 sat
+    // estimated, 10 charged), and budgets/--max-amount never count fees.
+    let dryFeeProbe;
+    if (args.probe) {
+      if (sparkBackend) {
+        dryFeeProbe = {
+          estimatedFeeSats: null,
+          error: 'not available for --spark in dry-run; run: blink spark-fee-probe <invoice> <amount_sats>',
+        };
+      } else if (!process.env.BLINK_API_KEY) {
+        dryFeeProbe = { estimatedFeeSats: null, error: 'the fee probe requires BLINK_API_KEY' };
+      } else {
+        try {
+          const probeKey = getApiKey();
+          const probeUrl = getApiUrl();
+          const probeWallet = await getWallet({ apiKey: probeKey, apiUrl: probeUrl, currency: args.walletCurrency });
+          dryFeeProbe = await runFeeProbe(challenge.invoice, {
+            walletId: probeWallet.id,
+            walletCurrency: args.walletCurrency,
+            apiKey: probeKey,
+            apiUrl: probeUrl,
+          });
+        } catch (err) {
+          dryFeeProbe = { estimatedFeeSats: null, error: err.message };
+        }
+      }
+    }
     const output = {
       event: 'l402_dry_run',
       url: args.url,
@@ -940,6 +1001,7 @@ async function main() {
             effectiveRemaining: budgetInfo.effectiveRemaining,
           }
         : null,
+      ...(dryFeeProbe ? { feeProbe: dryFeeProbe } : {}),
       message: 'Dry-run: would pay this invoice to access the resource. No payment made.',
       ...(challenge.offers ? { offers: challenge.offers } : {}),
     };
@@ -960,6 +1022,8 @@ async function main() {
   let paymentStatus = null;
   let preimage = null;
   let feeProbeResult = null;
+  let paidPaymentHash = null; // backend-reported; invoicePaymentHash() fills gaps
+  let preimagePlaceholder = false;
   const macaroon = challenge.macaroon;
 
   if (sparkBackend) {
@@ -1154,6 +1218,7 @@ async function main() {
     // Option C (last resort): SHA-256(invoice) placeholder — works with non-strict servers only.
     preimage = payResult.transaction?.settlementVia?.preImage ?? null;
     const paymentHash = payResult.transaction?.initiationVia?.paymentHash ?? null;
+    paidPaymentHash = paymentHash;
 
     if (preimage) {
       console.error('Preimage received inline from payment response.');
@@ -1177,15 +1242,22 @@ async function main() {
       } else {
         console.error('Warning: preimage not available after 5 attempts. Using placeholder (non-strict servers only).');
         preimage = derivePreimageFromInvoice(challenge.invoice);
+        preimagePlaceholder = true;
       }
     } else {
       console.error('Warning: paymentHash not returned by API. Using preimage placeholder (non-strict servers only).');
       preimage = derivePreimageFromInvoice(challenge.invoice);
+      preimagePlaceholder = true;
     }
   }
 
   // ── Save token to store ──
-  if (useStore) {
+  // ClawHub 3.0.1 scan: a placeholder preimage is fabricated, not a proof of
+  // payment — never cache it as a reusable paid token.
+  let tokenStored = false;
+  if (useStore && preimagePlaceholder) {
+    console.error('Warning: the preimage is a placeholder, so the token is NOT cached (it is not a proof of payment).');
+  } else if (useStore) {
     try {
       saveToken(storeKey, {
         macaroon,
@@ -1196,6 +1268,7 @@ async function main() {
         budgetSats,
         backend: sparkBackend ? 'spark' : 'custodial',
       });
+      tokenStored = true;
       console.error(`Token cached for ${storeKey}.`);
     } catch (err) {
       console.error(`Warning: could not save token to store: ${err.message}`);
@@ -1216,9 +1289,51 @@ async function main() {
   console.error('Retrying request with L402 authorization...');
   const authHeader = `L402 ${macaroon}:${preimage}`;
 
-  const retryRes = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
+  // FT7 (v3.0.2): money has moved by now — a transport failure must never
+  // leave stdout empty (it used to escape as a bare "Error: terminated").
+  let retryRes;
+  let retryBody;
+  try {
+    retryRes = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
+    retryBody = await retryRes.text();
+  } catch (err) {
+    if (err && err.code === 'URL_POLICY') throw err;
+    const notKept = args.noStore
+      ? 'the token was not kept (--no-store)'
+      : preimagePlaceholder
+        ? 'the token was not kept (placeholder preimage)'
+        : 'the token could not be cached';
+    const output = {
+      event: 'l402_paid_retry_failed',
+      url: args.url,
+      canonicalUrl: canonicalUrl !== args.url ? canonicalUrl : undefined,
+      challengeUrl: challengeUrlField,
+      format: challenge.format,
+      backend: sparkBackend ? 'spark' : 'custodial',
+      paymentStatus,
+      ...(sparkBackend ? {} : { walletId: wallet.id, walletCurrency: args.walletCurrency }),
+      satoshis: satoshis ?? null,
+      invoiceMsats: charge.msats,
+      budgetSats,
+      paymentHash: paidPaymentHash ?? invoicePaymentHash(challenge.invoice),
+      tokenStored,
+      tokenReused: false,
+      ...(preimagePlaceholder ? { preimagePlaceholder: true } : {}),
+      feeProbe: feeProbeResult
+        ? { estimatedFeeSats: feeProbeResult.estimatedFeeSats, error: feeProbeResult.error }
+        : undefined,
+      error: describeFetchError(err),
+      message: tokenStored
+        ? `The payment settled, but the request carrying the L402 credential failed. The token is cached for ${storeKey}: ` +
+          're-run the same command to retry with it (no new payment).'
+        : `The payment settled, but the request carrying the L402 credential failed, and ${notKept} — ` +
+          're-running pays again.',
+    };
+    console.log(JSON.stringify(output, null, 2));
+    process.exit(1);
+    return; // unreachable in production; guards against mocked process.exit in tests
+  }
 
-  const retryBody = await retryRes.text();
   let retryData;
   try {
     retryData = JSON.parse(retryBody);
@@ -1235,6 +1350,7 @@ async function main() {
     backend: sparkBackend ? 'spark' : 'custodial',
     paymentStatus,
     ...(sparkBackend ? {} : { walletId: wallet.id, walletCurrency: args.walletCurrency }),
+    ...(preimagePlaceholder ? { preimagePlaceholder: true } : {}),
     satoshis: satoshis ?? null,
     invoiceMsats: charge.msats,
     budgetSats,
@@ -1252,6 +1368,28 @@ async function main() {
     console.error(`Warning: retry returned status ${retryRes.status} (expected 200).`);
     process.exit(1);
   }
+}
+
+/**
+ * Best-effort payment hash of a BOLT-11 invoice (checksum-verified decode), so
+ * a post-payment failure can always name the payment. Null when undecodable.
+ *
+ * @param {string} invoice
+ * @returns {string|null}
+ */
+function invoicePaymentHash(invoice) {
+  try {
+    return decodeBolt11(invoice, { nowSeconds: 0 }).paymentHash || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A transport error with its cause (undici reports e.g. "terminated (Decompression failed)"). */
+function describeFetchError(err) {
+  const msg = (err && err.message) || String(err);
+  const cause = err && err.cause && err.cause.message;
+  return cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
 }
 
 /**

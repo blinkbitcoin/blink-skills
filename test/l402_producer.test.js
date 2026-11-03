@@ -318,14 +318,25 @@ describe('checkCaveats', () => {
     assert.equal(caveatsValid, false);
   });
 
-  it('passes when resource is set but checkResource is not provided', () => {
-    // No checkResource = unconstrained check
-    const { resourceMismatch, caveatsValid } = mac.checkCaveats({
-      expiresAt: null,
-      resource: '/api',
-      checkResource: undefined,
-    });
-    assert.equal(resourceMismatch, false);
+  // ClawHub 3.0.1 scan (concern): a resource-scoped token verified WITHOUT a
+  // resource used to pass — the caveat was silently skipped, so a token sold
+  // for /api was accepted for any request. Missing context now fails closed.
+  it('FAILS CLOSED when the token is resource-scoped but no checkResource is provided', () => {
+    for (const checkResource of [undefined, null]) {
+      const { resourceMismatch, resourceUnchecked, caveatsValid } = mac.checkCaveats({
+        expiresAt: null,
+        resource: '/api',
+        checkResource,
+      });
+      assert.equal(resourceMismatch, false);
+      assert.equal(resourceUnchecked, true);
+      assert.equal(caveatsValid, false);
+    }
+  });
+
+  it('an unscoped token needs no checkResource (resourceUnchecked stays false)', () => {
+    const { resourceUnchecked, caveatsValid } = mac.checkCaveats({ expiresAt: null, resource: null });
+    assert.equal(resourceUnchecked, false);
     assert.equal(caveatsValid, true);
   });
 
@@ -768,6 +779,19 @@ describe('l402_payment_verify — main() mocked', () => {
     assert.equal(exitCode, 0);
   });
 
+  it('ClawHub 3.0.1 scan: a resource-scoped token is INVALID when verified without --resource', async () => {
+    const { macaroon, preimage } = makeValidToken({ resource: '/api/data' });
+    const { output, exitCode } = await runVerify(['--token', `${macaroon}:${preimage}`]);
+    assert.equal(output.valid, false);
+    assert.equal(output.resource, '/api/data');
+    assert.equal(output.resourceUnchecked, true);
+    assert.match(output.message, /--resource/);
+    assert.equal(exitCode, 1);
+    const ok = await runVerify(['--token', `${macaroon}:${preimage}`, '--resource', '/api/data']);
+    assert.equal(ok.output.valid, true);
+    assert.equal(ok.exitCode, 0);
+  });
+
   it('returns valid=false for wrong preimage', async () => {
     const { macaroon } = makeValidToken();
     const wrongPreimage = crypto.randomBytes(32).toString('hex');
@@ -923,5 +947,68 @@ describe('bin/blink.js — l402-challenge and l402-verify registered', () => {
     const fs = require('node:fs');
     const src = fs.readFileSync(path.join(binDir, 'blink.js'), 'utf8');
     assert.ok(src.includes('l402_payment_verify.js'), 'action should reference l402_payment_verify.js');
+  });
+});
+
+// ── Root key file security (ClawHub 3.0.1 scan) ─────────────────────────────
+//
+// The producer signing key (~/.blink/l402-root-key) mints and verifies every
+// sold L402 token. It was read through symlinks and written with a plain
+// mkdir + writeFile, bypassing the shared secure-file helper (0700 dir,
+// symlink refusal, atomic 0600 write) that guards the other state files.
+
+describe('getRootKey — secure persistence', () => {
+  const fs = require('node:fs');
+  let tmp;
+  let origHome;
+  let origEnv;
+
+  function freshMac() {
+    delete require.cache[require.resolve(path.join(scriptsDir, '_l402_macaroon.js'))];
+    delete require.cache[require.resolve(path.join(scriptsDir, '_secure_files.js'))];
+    return require(path.join(scriptsDir, '_l402_macaroon.js'));
+  }
+
+  before(() => {
+    origHome = os.homedir;
+    origEnv = process.env.BLINK_L402_ROOT_KEY;
+  });
+
+  afterEach(() => {
+    os.homedir = origHome;
+    if (origEnv !== undefined) process.env.BLINK_L402_ROOT_KEY = origEnv;
+    else delete process.env.BLINK_L402_ROOT_KEY;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    delete require.cache[require.resolve(path.join(scriptsDir, '_l402_macaroon.js'))];
+  });
+
+  function setup() {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-rootkey-'));
+    os.homedir = () => tmp;
+    delete process.env.BLINK_L402_ROOT_KEY;
+  }
+
+  it('a generated key is written 0600 inside a ~/.blink tightened to 0700', () => {
+    setup();
+    fs.mkdirSync(path.join(tmp, '.blink'), { mode: 0o755 });
+    fs.chmodSync(path.join(tmp, '.blink'), 0o755); // a pre-existing, loosely permissioned dir
+    const m = freshMac();
+    const key = m.getRootKey();
+    assert.equal(key.length, 32);
+    const file = path.join(tmp, '.blink', 'l402-root-key');
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(tmp, '.blink')).mode & 0o777, 0o700);
+    assert.equal(m.getRootKey().toString('hex'), key.toString('hex'), 'persisted and reloaded');
+  });
+
+  it('refuses a symlinked key file instead of reading (or regenerating over) its target', () => {
+    setup();
+    fs.mkdirSync(path.join(tmp, '.blink'));
+    const target = path.join(tmp, 'elsewhere-key');
+    fs.writeFileSync(target, 'ab'.repeat(32));
+    fs.symlinkSync(target, path.join(tmp, '.blink', 'l402-root-key'));
+    const m = freshMac();
+    assert.throws(() => m.getRootKey(), /symlink/);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'ab'.repeat(32), 'the symlink target is untouched');
   });
 });

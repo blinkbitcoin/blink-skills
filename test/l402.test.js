@@ -439,6 +439,9 @@ describe('l402_pay dry-run flow', () => {
   let stderrLines = [];
   const originalStdout = console.log;
   const originalStderr = console.error;
+  const budgetPath = path.join(scriptsDir, '_budget.js');
+  const originalHomedir = os.homedir;
+  let homeDir;
 
   before(() => {
     process.env.BLINK_API_KEY = 'blink_test_key';
@@ -459,15 +462,27 @@ describe('l402_pay dry-run flow', () => {
     console.error = originalStderr;
   });
 
+  // v3.0.2: these tests used to seed (and restore) the developer's REAL
+  // ~/.blink/l402-tokens.json. Every test now gets a throwaway home, and every
+  // module that resolves os.homedir() at load is re-bound to it BEFORE the test.
+  beforeEach(() => {
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-dryrun-'));
+    os.homedir = () => homeDir;
+    for (const p of [payPath, discoverPath, storePath, clientPath, budgetPath]) {
+      delete require.cache[require.resolve(p)];
+    }
+  });
+
   afterEach(() => {
     stdoutLines = [];
     stderrLines = [];
     global.fetch = originalFetch;
+    os.homedir = originalHomedir;
+    fs.rmSync(homeDir, { recursive: true, force: true });
     // Bust require cache so each test starts fresh
-    delete require.cache[require.resolve(payPath)];
-    delete require.cache[require.resolve(discoverPath)];
-    delete require.cache[require.resolve(storePath)];
-    delete require.cache[require.resolve(clientPath)];
+    for (const p of [payPath, discoverPath, storePath, clientPath, budgetPath]) {
+      delete require.cache[require.resolve(p)];
+    }
   });
 
   it('dry-run emits l402_dry_run event for Lightning Labs 402 response', async () => {
@@ -1385,11 +1400,16 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     // developer's real files, and starts unconfigured for every test.
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-enforce-'));
     os.homedir = () => tmpDir;
-    // Re-bind the budget module to this test's tmpDir: BLINK_DIR resolves
-    // os.homedir() at module load, and a file-load-time instance (bound to
-    // the real home) would otherwise leak across tests — reading and writing
-    // the developer's real spending log.
-    delete require.cache[require.resolve(budgetPath)];
+    // Re-bind EVERY module that resolves os.homedir() at load to this test's
+    // tmpDir. Clearing only _budget was not enough: l402_pay captures its own
+    // _budget/l402_store references at load, so an l402_pay instance cached by
+    // an EARLIER describe (bound to the real home) kept writing the
+    // developer's real ~/.blink/spending-log.json and l402-tokens.json
+    // (v3.0.2: a fake 100000-sat spend landed in the real log). afterEach
+    // alone cannot protect the first test of this suite.
+    for (const p of [payPath, discoverPath, storePath, budgetPath, clientPath, sparkPayPath]) {
+      delete require.cache[require.resolve(p)];
+    }
     delete process.env.BLINK_BUDGET_HOURLY_SATS;
     delete process.env.BLINK_BUDGET_DAILY_SATS;
     delete process.env.BLINK_L402_ALLOWED_DOMAINS;
@@ -2473,6 +2493,179 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.equal(out.event, 'l402_budget_exceeded');
     assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
   });
+
+  // ── v3.0.2 hardening (FT7 field test + ClawHub 3.0.1 scan) ──────────────────
+
+  /** Make every CREDENTIALED request to the paywall die like FT7's did. */
+  function credentialedRequestsDie() {
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (
+        String(url) === 'https://paywall.example.com/resource' &&
+        opts &&
+        opts.headers &&
+        opts.headers.Authorization
+      ) {
+        throw new TypeError('terminated', { cause: new Error('Decompression failed') });
+      }
+      return inner(url, opts);
+    };
+  }
+
+  it('FT7: a request that dies AFTER payment still emits machine-readable JSON (token stored)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, 1);
+    const out = output(); // stdout must never be empty after money moved
+    assert.equal(out.event, 'l402_paid_retry_failed');
+    assert.equal(out.paymentStatus, 'SUCCESS');
+    assert.equal(out.paymentHash, 'b'.repeat(64));
+    assert.equal(out.satoshis, 100000);
+    assert.equal(out.tokenStored, true);
+    assert.match(out.error, /terminated.*Decompression failed/);
+    assert.match(out.message, /re-run/i, 'recovery hint: the cached token can be retried without paying');
+  });
+
+  it('FT7: with --no-store, the post-payment failure says the token was NOT kept', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_paid_retry_failed');
+    assert.equal(out.tokenStored, false);
+    assert.match(out.message, /--no-store/);
+  });
+
+  it('FT7: a cached-token reuse that dies emits l402_reuse_failed (no payment made)', async () => {
+    configureAutoPay();
+    require(storePath).saveToken('https://paywall.example.com/resource', {
+      macaroon: 'TESTMAC==',
+      preimage: 'c'.repeat(64),
+      satoshis: 100000,
+    });
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, 1);
+    const out = output();
+    assert.equal(out.event, 'l402_reuse_failed');
+    assert.equal(out.tokenReused, true);
+    assert.match(out.error, /terminated/);
+    assert.ok(!requestedUrls.some((u) => u.includes('graphql')), 'no payment was attempted');
+  });
+
+  it('FT7: --dry-run --probe reports the estimated routing fee (it used to be silently ignored)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const inner = global.fetch;
+    let paid = false;
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        if (q.includes('lnInvoicePaymentSend')) paid = true;
+        if (q.includes('lnInvoiceFeeProbe')) {
+          const data = { lnInvoiceFeeProbe: { amount: 3, errors: [] } };
+          return {
+            ok: true,
+            status: 200,
+            url: String(url),
+            headers: { get: () => 'application/json' },
+            json: async () => ({ data }),
+            text: async () => JSON.stringify({ data }),
+          };
+        }
+      }
+      return inner(url, opts);
+    };
+    const code = await runPay(['https://paywall.example.com/resource', '--dry-run', '--probe']);
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_dry_run');
+    assert.deepEqual(out.feeProbe, { estimatedFeeSats: 3, error: null });
+    assert.equal(paid, false, 'a dry-run never pays');
+  });
+
+  it('ClawHub 3.0.1 scan: a placeholder preimage (no paymentHash) is never cached as a paid token', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('graphql') && (JSON.parse(opts.body).query || '').includes('lnInvoicePaymentSend')) {
+        const data = { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [], transaction: null } };
+        return {
+          ok: true,
+          status: 200,
+          url: String(url),
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        };
+      }
+      return inner(url, opts);
+    };
+    await runPay(['https://paywall.example.com/resource']);
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.preimagePlaceholder, true);
+    const store = require(storePath).listTokens();
+    assert.deepEqual(store, [], 'a fabricated preimage is not a proof of payment — do not cache it');
+  });
+
+  // FT7 finding: l402-discover and l402-pay --dry-run are documented as
+  // UNGATED (the allowlist is a payment policy), but a configured allowlist
+  // was enforced as an exclusive host list on their fetches.
+  it('FT7: --dry-run is not blocked by a configured allowlist that omits the host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'some-other.example';
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--dry-run']);
+    assert.equal(code, null);
+    assert.equal(output().event, 'l402_dry_run');
+  });
+
+  it('FT7: l402-discover is not blocked by a configured allowlist that omits the host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'some-other.example';
+    mock402(INVOICE_100K);
+    process.argv = ['node', 'l402_discover.js', 'https://paywall.example.com/resource'];
+    const { main } = require(discoverPath);
+    const originalExit = process.exit;
+    process.exit = (c) => {
+      throw new Error(`process.exit(${c})`);
+    };
+    try {
+      await main();
+    } finally {
+      process.exit = originalExit;
+    }
+    const out = output();
+    assert.equal(out.url, 'https://paywall.example.com/resource');
+    assert.equal(out.l402_detected, true, 'the 402 challenge was discovered');
+  });
+
+  it('FT7: a non-dry-run refusal names the L402 allowlist, not a "non-Blink host"', async () => {
+    configureAutoPay(); // allowlist = paywall.example.com
+    global.fetch = async (url) => {
+      requestedUrls.push(String(url));
+      return {
+        status: 302,
+        url: String(url),
+        headers: { get: (n) => (n.toLowerCase() === 'location' ? 'https://elsewhere.example/x' : null) },
+        text: async () => '',
+      };
+    };
+    process.argv = ['node', 'l402_pay.js', 'https://paywall.example.com/resource'];
+    const { main } = require(payPath);
+    await assert.rejects(main(), (err) => {
+      assert.equal(err.code, 'URL_POLICY');
+      assert.match(err.message, /not in the L402 budget allowlist/);
+      assert.doesNotMatch(err.message, /non-Blink/);
+      return true;
+    });
+    assert.ok(!requestedUrls.includes('https://elsewhere.example/x'), 'the out-of-policy host is never fetched');
+  });
 });
 
 // ── Security-audit fixes (v2.6.1) ─────────────────────────────────────────────
@@ -2480,6 +2673,50 @@ describe('l402_pay enforcement (non-dry-run)', () => {
 const { assertAllowedUrl, fetchWithRetry } = require(path.join(scriptsDir, '_lnurl'));
 const { writeSecureFileAtomic, ensureSecureStateDir } = require(path.join(scriptsDir, '_secure_files'));
 const { getAllowHosts } = require(path.join(scriptsDir, '_budget'));
+
+// FT7 (v3.0.2): the L402 budget allowlist is a PAYMENT policy. As an exclusive
+// host list it gates every non-dry-run l402-pay fetch; for the documented
+// ungated probes (l402-discover, l402-pay --dry-run) it may only RELAX the
+// SSRF guard (permit a listed private/local host), never restrict.
+describe('security: L402 allowlist policy (v3.0.2)', () => {
+  const { l402Allowlist } = require(path.join(scriptsDir, '_lnurl'));
+
+  it('exclusive mode refuses an unlisted host, naming the L402 allowlist (not "non-Blink host")', () => {
+    assert.throws(
+      () => assertAllowedUrl('https://elsewhere.example/x', l402Allowlist(new Set(['paywall.example.com']))),
+      (err) =>
+        err.code === 'URL_POLICY' &&
+        /not in the L402 budget allowlist/.test(err.message) &&
+        !/non-Blink/.test(err.message),
+    );
+    assert.doesNotThrow(() =>
+      assertAllowedUrl('https://paywall.example.com/x', l402Allowlist(new Set(['paywall.example.com']))),
+    );
+  });
+
+  it('relax-only mode lets an unlisted PUBLIC host through', () => {
+    const policy = l402Allowlist(new Set(['paywall.example.com']), { relaxOnly: true });
+    assert.doesNotThrow(() => assertAllowedUrl('https://elsewhere.example/x', policy));
+  });
+
+  it('relax-only mode still refuses unlisted private/plaintext targets, and permits a LISTED local host', () => {
+    const policy = l402Allowlist(new Set(['127.0.0.1']), { relaxOnly: true });
+    assert.throws(() => assertAllowedUrl('https://10.0.0.5/x', policy), /private address/);
+    assert.throws(() => assertAllowedUrl('http://elsewhere.example/x', policy), /plaintext http/);
+    assert.throws(
+      () => assertAllowedUrl('https://localhost/x', policy, 'L402 URL', { strictLocal: true }),
+      /local host/,
+    );
+    assert.doesNotThrow(() =>
+      assertAllowedUrl('http://127.0.0.1:8080/x', policy, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+    );
+  });
+
+  it('no configured allowlist stays null (unchanged behavior)', () => {
+    assert.equal(l402Allowlist(null), null);
+    assert.equal(l402Allowlist(null, { relaxOnly: true }), null);
+  });
+});
 
 describe('security: L402 SSRF guard (audit fix 1)', () => {
   it('refuses private/loopback/metadata targets even with NO allowlist configured', () => {

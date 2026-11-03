@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.1
+version: 3.0.2
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.1'
+    version: '3.0.2'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -1182,10 +1182,10 @@ Probes a URL for L402 payment requirements without paying. Returns the detected 
 
 **No API key required for discovery.**
 
-Known public L402 endpoints for testing (use specific paths, not root URLs; verified live 2026-09-12):
+Known public L402 endpoints for testing (use specific paths, not root URLs; re-verified live in field test FT7, 2026-11-04):
 
-- `https://lightningenable.com/api/v1/endpoint/<id>` — Lightning Labs format, from 1 sat (discovery: `l402-discover https://lightningenable.com`)
-- `https://www.l402apps.com/api/apis` — L402 API directory, 10 sats, Lightning Labs format
+- `https://api.lightningenable.com/l402/test/ping` — Lightning Labs format, **1 sat**, returns a fixed success message and accepts its token again (the reliable test endpoint). Other paid endpoints live under `https://api.lightningenable.com/l402/proxy/…` (about 2 sats); check each one's required query parameters first, since a missing parameter fails *after* payment. The old `lightningenable.com/api/v1/endpoint/<id>` pattern now returns 404.
+- `https://www.l402apps.com/api/apis` — L402 API directory, 10 sats, Lightning Labs format. **Unreliable:** it returned HTTP 500 (`Failed to create Lightning invoice`) throughout FT7.
 
 > Upstream availability shifts: `l402.services` (dead as of 2026-09-12) and `l402.directory` (intermittent 503 during rebuilds) have both been unreachable at times — `l402-search --source 402index` is the reliable directory fallback. Probe with `l402-discover` before relying on any endpoint.
 
@@ -1211,9 +1211,9 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 - `--header key:value` — extra request header (repeatable)
 - `--wait <seconds>` — Spark only: how long to poll an async (PENDING) settlement before failing (default 60; `0` disables). Spark settlement is asynchronous — a PENDING payment routinely settles seconds later carrying the preimage (the L402 token material), so the default waits rather than aborts. A timeout means the sats were spent but no token was captured: the error names the payment id (check `spark-transactions` before retrying — a retry pays again).
 - `--body <string>` — request body for POST/PUT
-- `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`)
+- `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`). It applies to **this run only**: if a request after payment fails, that payment's token is gone (re-running pays again). And if the server later re-issues the **same** already-paid invoice, a run *without* `--no-store` recovers that preimage from your transaction history and caches it.
 - `--force` — pay even if a valid cached token exists
-- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there)
+- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there). With `--dry-run` (v3.0.2) it also runs, without paying, and adds `feeProbe` to `l402_dry_run` (custodial only, needs `BLINK_API_KEY`; for `--spark`, use `blink spark-fee-probe <invoice> <amount>`). **The probe is an estimate:** in FT7 it estimated 1 sat while the actual routing fee was 10 sats on a 1–2 sat invoice. Neither budgets nor `--max-amount` count the fee, so for tiny invoices the fee can be several times the price.
 
 **Requires Write scope on the API key (custodial backend) or `SPARK_MNEMONIC` + `BREEZ_API_KEY` (spark backend).**
 
@@ -1234,7 +1234,15 @@ blink l402-store clear [--expired]
 
 Token cache location: `~/.blink/l402-tokens.json`
 
-**Origin isolation (v3.0.1):** tokens are keyed by the **origin** (scheme + host + port) + path of the URL that **actually issued the 402**, e.g. `https://api.example.com/v1/data`, and a cached token is only ever sent directly back to that URL. That is not necessarily the URL you passed: if a service redirects the request (even only for some methods, e.g. it answers `HEAD` itself but redirects `GET`), the token belongs to the redirect target, and `l402_paid` reports it as `challengeUrl`. Operator `--header`s are withheld from a different issuing origin, and a `--body` request whose 402 came from a different origin is refused (`URL_POLICY`) before paying. The credentialed retry repeats **exactly the request that received the 402** (same method, headers and body) with the L402 `Authorization` added, and is never rebuilt from your original flags. That includes HTTP redirect rewrites: 301/302 turn `POST` into `GET`, and 303 turns any non-`GET`/`HEAD` method into `GET`. It also covers header state along the chain: once a redirect leaves the origin, your `--header`s are dropped for the rest of the chain, even if it comes back, and a rewrite that drops the body also drops its `Content-Type`. An operator `--header Authorization` is never sent with the paid credential; the L402 token replaces it, with a warning on stderr. If such a rewrite **drops your `--body`**, the request is refused (`URL_POLICY`) before paying, on any origin, because the challenged request is no longer the one you invoked. Call the issuing URL directly instead. A 307/308 keeps the method and body, so those work as before. Each run first makes one credential-free request to learn which URL issues the challenge, so cache reuse costs one extra round trip. Before v3.0.1 the key was host + path, so a token could be replayed to a different service on another port of the same host, or from `https` to plaintext `http`. Entries written by older versions have no scheme; `list` flags them `legacy: true` and they are **never reused** (the next request pays fresh). Run `blink l402-store clear` to remove them.
+**Origin isolation (v3.0.1):** tokens are keyed by the **origin** (scheme + host + port) + path of the URL that **actually issued the 402**, e.g. `https://api.example.com/v1/data`, and a cached token is only ever sent directly back to that URL. That is not necessarily the URL you passed: if a service redirects the request (even only for some methods, e.g. it answers `HEAD` itself but redirects `GET`), the token belongs to the redirect target, and `l402_paid` reports it as `challengeUrl`. Operator `--header`s are withheld from a different issuing origin, and a `--body` request whose 402 came from a different origin is refused (`URL_POLICY`) before paying. The credentialed retry repeats **exactly the request that received the 402** (same method, headers and body) with the L402 `Authorization` added, and is never rebuilt from your original flags. That includes HTTP redirect rewrites: 301/302 turn `POST` into `GET`, and 303 turns any non-`GET`/`HEAD` method into `GET`. It also covers header state along the chain: once a redirect leaves the origin, your `--header`s are dropped for the rest of the chain, even if it comes back, and a rewrite that drops the body also drops its `Content-Type`. An operator `--header Authorization` is never sent with the paid credential; the L402 token replaces it, with a warning on stderr. If such a rewrite **drops your `--body`**, the request is refused (`URL_POLICY`) before paying, on any origin, because the challenged request is no longer the one you invoked. Call the issuing URL directly instead. A 307/308 keeps the method and body, so those work as before. Each run first makes one credential-free request to learn which URL issues the challenge, so cache reuse costs one extra round trip. Before v3.0.1 the key was host + path, so a token could be replayed to a different service on another port of the same host. (Replay from `https` to plaintext `http` was possible only for local hosts such as `127.0.0.1`/`localhost`, or before v2.6.1: since v2.6.1 the URL guard refuses plaintext `http` to any other host before sending anything.) Entries written by older versions have no scheme; `list` flags them `legacy: true` and they are **never reused** (the next request pays fresh). Run `blink l402-store clear` to remove them.
+
+**Failures after a credential is sent always emit JSON (v3.0.2).** If the request carrying the L402 credential dies before a response arrives (FT7: `terminated`, caused by a server's undecodable compressed reply), `l402-pay` exits 1 with:
+- `l402_paid_retry_failed` — the payment **settled** but the paid retry failed. Includes `paymentStatus`, `paymentHash`, `satoshis`, `tokenStored`, and `error`. With `tokenStored: true`, re-running the same command retries with the cached token without paying again; with `tokenStored: false` (`--no-store`, a placeholder preimage, or a failed cache write), re-running pays again.
+- `l402_reuse_failed` — a cached token was sent and the request failed; **no payment was made**. Re-run to retry, or pass `--force` to pay fresh.
+
+Before v3.0.2 both cases printed only `Error: …` on stderr with nothing on stdout.
+
+**Placeholder preimages are never cached (v3.0.2).** If the Blink API returns no preimage and no payment hash, `l402-pay` still retries with a placeholder (which only non-strict servers accept) and reports `preimagePlaceholder: true`, but it no longer caches that token: a fabricated preimage is not a proof of payment.
 
 ### L402 Output Examples
 
@@ -1356,7 +1364,7 @@ Verifies a client-submitted L402 `Authorization` token. Performs three layers of
 - `--token <macaroon>:<preimage>` — L402 authorization token (colon-separated, from `Authorization: L402 <token>` header)
 - `--macaroon <b64>` — base64url-encoded macaroon (alternative to `--token`)
 - `--preimage <hex>` — 64-char hex preimage (alternative to `--token`)
-- `--resource <id>` — expected resource identifier to check against the macaroon's resource caveat
+- `--resource <id>` — expected resource identifier to check against the macaroon's resource caveat. **Required for a resource-scoped token (v3.0.2):** verifying one without `--resource` returns `valid: false` with `resourceUnchecked: true` (exit 1). Before v3.0.2 the caveat was silently skipped, so a token sold for one path was accepted for any request. Always pass the path of the request you are authorizing.
 - `--check-api` — additionally query the Blink API to confirm PAID status (belt-and-suspenders)
 
 Exit code `0` when `valid: true`, exit code `1` when `valid: false` or on error.
@@ -1495,7 +1503,7 @@ Env vars take precedence over the config file (`~/.blink/budget.json`):
 **Unconfigured means "deny" for autonomous spending, not "unlimited".** The two
 kinds of payment behave differently on purpose:
 
-> **Security (v2.6.1):** the allowlist now gates **every non-dry-run `l402-pay` outbound request** (pre-flight, before canonicalization/probing), not only the payment itself — when an allowlist is configured, a URL outside it is refused before a single byte leaves the machine. All L402 fetches (`l402-pay`, `l402-discover`, and the server-supplied l402-protocol `payment_request_url`) route through the shared SSRF guard: private/loopback/link-local/metadata targets refused (incl. IPv4-mapped IPv6), redirects followed manually and re-validated per hop. `l402-discover` remains the ungated-but-guarded public prober; `l402-pay --dry-run` likewise. State files under `~/.blink` are `0700`/`0600` with atomic writes and symlink refusal (macaroons + preimages are a reusable bearer credential pair).
+> **Security (v2.6.1):** the allowlist now gates **every non-dry-run `l402-pay` outbound request** (pre-flight, before canonicalization/probing), not only the payment itself — when an allowlist is configured, a URL outside it is refused before a single byte leaves the machine. All L402 fetches (`l402-pay`, `l402-discover`, and the server-supplied l402-protocol `payment_request_url`) route through the shared SSRF guard: private/loopback/link-local/metadata targets refused (incl. IPv4-mapped IPv6), redirects followed manually and re-validated per hop. `l402-discover` remains the ungated-but-guarded public prober; `l402-pay --dry-run` likewise (enforced since v3.0.2; before that, a configured allowlist wrongly gated both). State files under `~/.blink` are `0700`/`0600` with atomic writes and symlink refusal (macaroons + preimages are a reusable bearer credential pair; since v3.0.2 the producer signing key `~/.blink/l402-root-key` is covered too).
 
 - **Explicit one-shot payments** — `pay-invoice`, `pay-lnaddress`, `pay-lnurl`,
   `spark-send`. You chose the recipient and amount, so these run with or
@@ -1519,6 +1527,8 @@ blink budget allowlist list                      # Show allowed L402 domains
 blink budget allowlist add satring.com           # Add domain to allowlist
 blink budget allowlist remove satring.com        # Remove domain from allowlist
 ```
+
+**Allowlist matching is exact-host:** `lightningenable.com` does **not** cover `www.lightningenable.com` or `api.lightningenable.com`; add each host you pay. The allowlist is a **payment** policy: it gates every non-dry-run `l402-pay` request, while `l402-discover` and `l402-pay --dry-run` stay ungated public probes (the list can only *permit* a listed private/local host for them). Before v3.0.2 a configured allowlist wrongly blocked both probes.
 
 ### Budget Status Output Example
 

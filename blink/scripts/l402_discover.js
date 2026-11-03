@@ -29,9 +29,10 @@
 // fix: this script previously used bare fetch with redirect:'follow'). Discovery
 // deliberately has NO allowlist payment gate — it is the documented public
 // prober — but every fetch is SSRF-guarded: private/loopback/link-local
-// targets refused (unless the host appears in a configured budget allowlist),
+// targets refused (unless the host appears in a configured budget allowlist,
+// which here only RELAXES the guard — see l402Allowlist),
 // redirects followed manually and re-validated per hop.
-const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin, l402Allowlist } = require('./_lnurl');
 const { getAllowHosts } = require('./_budget');
 
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
@@ -306,7 +307,10 @@ async function main() {
 
   // Resolve canonical URL (follow any HTTP redirects) so the probe always
   // hits the final endpoint and reports the correct URL.
-  const allowHosts = getAllowHosts();
+  // FT7 (v3.0.2): discovery is the documented UNGATED prober — the budget
+  // allowlist may only relax the SSRF guard here (permit a listed private/local
+  // host), never restrict public hosts. It was passed as an exclusive list.
+  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: true });
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
