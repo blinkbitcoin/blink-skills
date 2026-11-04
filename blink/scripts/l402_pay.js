@@ -1480,4 +1480,5 @@ module.exports = {
   derivePreimageFromInvoice,
   fetchPreimageByPaymentHash,
   runFeeProbe,
+  ARG_OPTIONS: L402_PAY_OPTIONS,
 };

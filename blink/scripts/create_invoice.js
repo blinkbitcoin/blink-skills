@@ -37,11 +37,19 @@ const {
   subscribeToInvoice,
   MUTATION_TIMEOUT_MS,
   exitAfterStdout,
+  strictArgv,
 } = require('./_blink_client');
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict
+// sweep). Free-text memo words go after `--` (e.g. a word like `-50%`),
+// exactly as at the `blink` CLI.
+const ARG_OPTIONS = { timeout: { type: 'string' }, 'no-subscribe': { type: 'boolean' } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true });
+  let literal = false; // after `--`: every word is a positional (memo text)
   let amountSats = null;
   let timeoutSeconds = 300;
   let noSubscribe = false;
@@ -51,7 +59,12 @@ function parseArgs(argv) {
   for (; i < argv.length; i++) {
     const arg = argv[i];
 
-    if (arg === '--timeout') {
+    if (!literal && arg === '--') {
+      literal = true;
+      continue;
+    }
+
+    if (!literal && arg === '--timeout') {
       const value = argv[i + 1];
       if (!value) throw new Error('Missing value for --timeout');
       timeoutSeconds = parseInt(value, 10);
@@ -60,7 +73,7 @@ function parseArgs(argv) {
       continue;
     }
 
-    if (arg === '--no-subscribe') {
+    if (!literal && arg === '--no-subscribe') {
       noSubscribe = true;
       continue;
     }
@@ -191,4 +204,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs, ARG_OPTIONS };

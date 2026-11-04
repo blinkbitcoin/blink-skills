@@ -72,17 +72,20 @@ const CREATE_INVOICE_MUTATION = `
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts (strict; exported for the CLI-forwarding guard).
+const ARG_OPTIONS = {
+  amount: { type: 'string' },
+  wallet: { type: 'string' },
+  memo: { type: 'string' },
+  expiry: { type: 'string' },
+  resource: { type: 'string' },
+  help: { type: 'boolean', short: 'h', default: false },
+};
+
 function parseCliArgs(argv) {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      amount: { type: 'string' },
-      wallet: { type: 'string' },
-      memo: { type: 'string' },
-      expiry: { type: 'string' },
-      resource: { type: 'string' },
-      help: { type: 'boolean', short: 'h', default: false },
-    },
+    options: ARG_OPTIONS,
     allowPositionals: false,
     strict: true,
   });
@@ -204,4 +207,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseCliArgs };
+module.exports = { main, parseCliArgs, ARG_OPTIONS };

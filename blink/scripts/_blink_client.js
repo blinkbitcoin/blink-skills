@@ -575,16 +575,6 @@ function formatUsdCents(cents) {
 // ── Arg parsing helpers ──────────────────────────────────────────────────────
 
 /**
- * Parse a --wallet BTC|USD flag from an argv array.
- * Also recognises payment safety flags: --dry-run, --force, --max-amount <sats>.
- *
- * Returns the chosen currency, safety flags, and the remaining positional args
- * (with all recognised flags stripped out).
- *
- * @param {string[]} argv  Typically `process.argv.slice(2)`.
- * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
- */
-/**
  * Strictly validate a money-moving script's argv and return it in canonical
  * split form (`--opt value`), for that script's own validation loop.
  *
@@ -597,11 +587,18 @@ function formatUsdCents(cents) {
  * missing value, and a value on a boolean flag all THROW (code ARG_INVALID)
  * before any credential, network, or SDK call; `--opt=value` is accepted.
  *
+ * Opts: `keepTerminator` re-emits an explicit `--` so a script that takes free
+ * text (memo words) can treat everything after it literally — a memo word
+ * like `-50%` must come after `--`, exactly as at the `blink` CLI.
+ * `positionalsFirst` puts all positionals before the options, for a loop that
+ * reads positionals by fixed index (the swap scripts).
+ *
  * @param {string[]} argv
  * @param {Record<string, {type: 'string'|'boolean', multiple?: boolean}>} options
+ * @param {{ keepTerminator?: boolean, positionalsFirst?: boolean }} [opts]
  * @returns {string[]}  canonical argv: `--name` (+ value for strings) and positionals, in order
  */
-function strictArgv(argv, options) {
+function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = false } = {}) {
   let tokens;
   try {
     ({ tokens } = require('node:util').parseArgs({
@@ -617,16 +614,21 @@ function strictArgv(argv, options) {
     e.code = 'ARG_INVALID';
     throw e;
   }
+  const opts = [];
+  const positionals = [];
   const out = [];
   for (const t of tokens) {
     if (t.kind === 'option') {
-      out.push(`--${t.name}`);
-      if (options[t.name].type === 'string') out.push(t.value);
+      const o = [`--${t.name}`];
+      if (options[t.name].type === 'string') o.push(t.value);
+      (positionalsFirst ? opts : out).push(...o);
+    } else if (t.kind === 'option-terminator') {
+      if (keepTerminator) out.push('--');
     } else if (t.kind === 'positional') {
-      out.push(t.value);
+      (positionalsFirst ? positionals : out).push(t.value);
     }
   }
-  return out;
+  return positionalsFirst ? [...positionals, ...opts] : out;
 }
 
 const WALLET_ARG_OPTIONS = {
@@ -636,6 +638,17 @@ const WALLET_ARG_OPTIONS = {
   'max-amount': { type: 'string' },
 };
 
+/**
+ * Parse a --wallet BTC|USD flag from an argv array.
+ * Also recognises payment safety flags: --dry-run, --force, --max-amount <sats>.
+ *
+ * Returns the chosen currency, safety flags, and the remaining positional args
+ * (with all recognised flags stripped out). Parsing is STRICT (strictArgv):
+ * an unknown or malformed option exits 1 before anything is sent.
+ *
+ * @param {string[]} argv  Typically `process.argv.slice(2)`.
+ * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
+ */
 function parseWalletArg(argv) {
   try {
     argv = strictArgv(argv, WALLET_ARG_OPTIONS);
@@ -897,6 +910,7 @@ function exitAfterStdout(code) {
 
 module.exports = {
   strictArgv,
+  WALLET_ARG_OPTIONS,
   exitAfterStdout,
   // Constants
   DEFAULT_API_URL,

@@ -41,6 +41,7 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
+const { strictArgv } = require('./_blink_client');
 const { connect, lnurlDomainFor, probeLnLookupHealthy } = require('./_spark_sdk');
 
 // Username rules mirrored from the Blink LNURL server (identifier.rs) and the
@@ -71,7 +72,11 @@ function validateUsername(raw) {
   return username;
 }
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = { network: { type: 'string' }, description: { type: 'string' } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS);
   let subcommand = null;
   let username = null;
   let description;
@@ -277,4 +282,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, validateUsername };
+module.exports = { main, parseArgs, validateUsername, ARG_OPTIONS };

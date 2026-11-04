@@ -29,7 +29,7 @@
 
 'use strict';
 
-const { exitAfterStdout } = require('./_blink_client');
+const { exitAfterStdout, strictArgv } = require('./_blink_client');
 
 const fs = require('node:fs');
 const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
@@ -258,8 +258,18 @@ function clearTokens({ expiredOnly = false } = {}) {
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+// Every option l402-store accepts (v3.0.4 strict sweep): `clear --expird` used
+// to be ignored as a typo — and then cleared EVERY cached paid token.
+const ARG_OPTIONS = { expired: { type: 'boolean' } };
+
 function main() {
-  const args = process.argv.slice(2);
+  let args;
+  try {
+    args = strictArgv(process.argv.slice(2), ARG_OPTIONS);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   const command = args[0];
 
   if (!command) {
@@ -332,6 +342,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ARG_OPTIONS,
   saveToken,
   getToken,
   storeKeyFor,

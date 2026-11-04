@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.3
+version: 3.0.4
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.3'
+    version: '3.0.4'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -39,7 +39,7 @@ metadata:
     homepage: 'https://github.com/blinkbitcoin/blink-skills'
     security:
       secrets: ['BLINK_API_KEY', 'SPARK_MNEMONIC', 'BREEZ_API_KEY']
-      network: "outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands and l402-pay --spark; spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient's address/callback hosts during SDK parse/prepare (before a budget rejection)"
+      network: "outbound HTTPS to api.blink.sv (or BLINK_API_URL override); outbound WSS to ws.blink.sv for subscriptions; outbound HTTPS to blink.sv for LNURL-pay receive (allowlisted, every redirect re-checked); outbound HTTPS to Breez/Spark infrastructure for spark-* commands and l402-pay --spark (the SDK connect also contacts blink.sv, the pinned Lightning-address domain, to recover the wallet's registered address — even on a dry run); spark-send/spark-fee-probe with a Lightning Address or LNURL destination also contact the recipient's address/callback hosts during SDK parse/prepare (before a budget rejection)"
       filesystem: 'reads nothing outside ~/.blink; writes temporary QR PNGs to /tmp; writes L402 token cache to ~/.blink/l402-tokens.json; writes budget config to ~/.blink/budget.json and spending log to ~/.blink/spending-log.json; writes Breez Spark SDK wallet state to ~/.blink/spark/<network>-<hash> when a spark-* command or l402-pay --spark is used'
       persistence: 'L402 token cache at ~/.blink/l402-tokens.json; budget config at ~/.blink/budget.json; spending log at ~/.blink/spending-log.json (auto-pruned, 25h retention); Spark SDK local wallet state at ~/.blink/spark/<network>-<hash>, the directory name being a non-reversible sha256 prefix of the seed'
       notes: 'Zero required npm runtime dependencies; the custodial commands use Node.js built-ins only. Two OPTIONAL, lazy-loaded dependencies exist solely for the non-custodial spark-* commands and l402-pay --spark: @breeztech/breez-sdk-spark (Node 22.4+, requires a native better-sqlite3 build) and bip39 (seed checksum validation). Nothing is loaded unless a spark-* command or l402-pay --spark is invoked. SPARK_MNEMONIC grants full spend authority over a self-custodial wallet: it is read from the environment only, never from files, and is never logged or written in readable form. BLINK_API_KEY is likewise read from the environment only; shell rc files are never read.'
@@ -139,7 +139,7 @@ npm link      # creates global 'blink' command
 blink --help  # verify
 ```
 
-> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`. **Scripts that move money parse options strictly (v3.0.3):** `pay_invoice`, `pay_lnaddress`, `pay_lnurl`, `fee_probe`, `l402_pay`, `spark_send`, and `spark_fee_probe` accept `--opt value` and `--opt=value`. They **refuse**, with exit 1 and before anything is sent, an unknown or misspelled option (e.g. `--dryrun`), a missing value (a trailing `--max-amount`), and a value on a yes/no flag (`--dry-run=true`). Before v3.0.3, such arguments were silently ignored: a ceiling could vanish, or a dry run could become a real payment. The `blink` CLI already behaved this way.
+> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`. **Scripts that move money parse options strictly (v3.0.3):** `pay_invoice`, `pay_lnaddress`, `pay_lnurl`, `fee_probe`, `l402_pay`, `spark_send`, and `spark_fee_probe` accept `--opt value` and `--opt=value`. They **refuse**, with exit 1 and before anything is sent, an unknown or misspelled option (e.g. `--dryrun`), a missing value (a trailing `--max-amount`), and a value on a yes/no flag (`--dry-run=true`). Before v3.0.3, such arguments were silently ignored: a ceiling could vanish, or a dry run could become a real payment. The `blink` CLI already behaved this way. **Since v3.0.4 every script parses this way**, including invoices, subscriptions, listings, `l402-discover`, `l402-store` and all `spark-*` commands. For example, `spark-lnaddress delete --network=regtest` used to delete the **mainnet** address, and `l402-store clear --expird` cleared every token. **Memo words that start with a dash go after `--`**, e.g. `blink create-invoice 1000 --no-subscribe -- -50% off`; this applies both at the CLI and when running a script directly.
 
 ## Agent Safety Policy
 

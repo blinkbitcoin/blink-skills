@@ -34,14 +34,17 @@ const DIRECTORY_BASE = 'https://l402.directory/api';
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts (strict; exported for the CLI-forwarding guard).
+const ARG_OPTIONS = {
+  report: { type: 'boolean', default: false },
+  force: { type: 'boolean', default: false },
+  help: { type: 'boolean', short: 'h', default: false },
+};
+
 function parseCliArgs(argv) {
   const { values, positionals } = parseArgs({
     args: argv,
-    options: {
-      report: { type: 'boolean', default: false },
-      force: { type: 'boolean', default: false },
-      help: { type: 'boolean', short: 'h', default: false },
-    },
+    options: ARG_OPTIONS,
     allowPositionals: true,
     strict: true,
   });
@@ -147,4 +150,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseCliArgs, fetchServiceDetail, DIRECTORY_BASE };
+module.exports = { main, parseCliArgs, fetchServiceDetail, DIRECTORY_BASE, ARG_OPTIONS };

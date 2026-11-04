@@ -30,6 +30,7 @@ const {
   normalizeInvoice,
   warnIfNotBolt11,
   MUTATION_TIMEOUT_MS,
+  WALLET_ARG_OPTIONS,
 } = require('./_blink_client');
 
 const FEE_PROBE_BTC_MUTATION = `
@@ -133,4 +134,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS: WALLET_ARG_OPTIONS };

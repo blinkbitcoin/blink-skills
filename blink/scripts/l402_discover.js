@@ -34,6 +34,7 @@
 // redirects followed manually and re-validated per hop.
 const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin, l402Allowlist } = require('./_lnurl');
 const { getAllowHosts } = require('./_budget');
+const { strictArgv } = require('./_blink_client');
 
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
 
@@ -268,7 +269,11 @@ function budgetChargeFromInvoice(invoice) {
 
 // ── Arg parsing ───────────────────────────────────────────────────────────────
 
+// Every option l402-discover accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = { method: { type: 'string' }, header: { type: 'string', multiple: true } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS);
   let url = null;
   let method = 'GET';
   const headers = {};
@@ -455,6 +460,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseArgs,
+  ARG_OPTIONS,
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,

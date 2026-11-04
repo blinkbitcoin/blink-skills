@@ -224,8 +224,10 @@ commands['create-invoice'] = {
     const argv = [String(pos[0])];
     if (timeout !== undefined) argv.push('--timeout', String(timeout));
     if (opts.subscribe === false) argv.push('--no-subscribe');
+    // Memo words go after `--`: the script parses strictly (v3.0.4), so a
+    // word like `-50%` would otherwise be refused as an unknown option.
     const memo = pos.slice(1);
-    if (memo.length > 0) argv.push(...memo);
+    if (memo.length > 0) argv.push('--', ...memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice.js'));
     await main();
@@ -256,8 +258,10 @@ commands['create-invoice-usd'] = {
     const argv = [String(pos[0])];
     if (timeout !== undefined) argv.push('--timeout', String(timeout));
     if (opts.subscribe === false) argv.push('--no-subscribe');
+    // Memo words go after `--`: the script parses strictly (v3.0.4), so a
+    // word like `-50%` would otherwise be refused as an unknown option.
     const memo = pos.slice(1);
-    if (memo.length > 0) argv.push(...memo);
+    if (memo.length > 0) argv.push('--', ...memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice_usd.js'));
     await main();
@@ -291,11 +295,12 @@ commands['create-invoice-lnaddress'] = {
   action: async (pos, opts) => {
     const timeout = parseNonNegativeInt(opts.timeout, '--timeout');
     const argv = [String(pos[0]), String(pos[1])];
-    const memo = pos.slice(2);
-    if (memo.length > 0) argv.push(...memo);
     argv.push('--timeout', String(timeout));
     if (opts.verify === false) argv.push('--no-verify');
     if (opts.qr) argv.push('--qr');
+    // Memo words last, after `--` (strict script parsing, v3.0.4).
+    const memo = pos.slice(2);
+    if (memo.length > 0) argv.push('--', ...memo);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'create_invoice_lnaddress.js'));
     await main();
@@ -588,12 +593,13 @@ commands['spark-receive-token'] = {
   ],
   action: async (pos, opts) => {
     const argv = [String(pos[0])];
-    const description = pos.slice(1);
-    if (description.length > 0) argv.push(...description);
     argv.push('--token', opts.token);
     if (opts['base-units']) argv.push('--base-units');
     if (opts.description !== undefined) argv.push('--description', opts.description);
     if (opts.network !== undefined) argv.push('--network', opts.network);
+    // Extra description words last, after `--` (strict script parsing, v3.0.4).
+    const description = pos.slice(1);
+    if (description.length > 0) argv.push('--', ...description);
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'spark_receive_token.js'));
     await main();

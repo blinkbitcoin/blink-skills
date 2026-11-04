@@ -32,6 +32,7 @@ const {
   normalizeInvoice,
   warnIfNotBolt11,
   MUTATION_TIMEOUT_MS,
+  WALLET_ARG_OPTIONS,
 } = require('./_blink_client');
 
 const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
@@ -226,4 +227,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS: WALLET_ARG_OPTIONS };
