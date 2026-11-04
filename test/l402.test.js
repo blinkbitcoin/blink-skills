@@ -479,6 +479,7 @@ describe('l402_pay dry-run flow', () => {
     stderrLines = [];
     global.fetch = originalFetch;
     os.homedir = originalHomedir;
+    process.exitCode = 0;
     fs.rmSync(homeDir, { recursive: true, force: true });
     // Bust require cache so each test starts fresh
     for (const p of [payPath, discoverPath, storePath, clientPath, budgetPath]) {
@@ -571,7 +572,7 @@ describe('l402_pay dry-run flow', () => {
     }
 
     // Should have exited with code 1 (budget exceeded — not a dry-run event)
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode ?? process.exitCode, 1);
     const out = JSON.parse(stdoutLines.join('\n'));
     assert.equal(out.event, 'l402_budget_exceeded');
     assert.equal(out.satoshis, 100_000); // lnbc1000u = 100_000 sats
@@ -788,7 +789,7 @@ describe('l402_pay dry-run flow', () => {
       assert.equal(out.status, 403);
       assert.equal(out.tokenReused, true);
       assert.ok(typeof out.message === 'string' && out.message.includes('403'), 'message must mention the status');
-      assert.equal(exitCode, 1, 'must exit with code 1 on error');
+      assert.equal(exitCode ?? process.exitCode, 1, 'must exit with code 1 on error');
     } finally {
       process.exit = originalExit;
       if (previousStore === null) {
@@ -1465,7 +1466,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     } finally {
       process.exit = originalExit;
     }
-    return exitCode;
+    // JSON-emitting refusals set process.exitCode and return (PR #25): the
+    // trapped hard exit, else the exit code the process would end with.
+    return exitCode ?? (process.exitCode || null);
   }
 
   function output() {
@@ -2519,7 +2522,6 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     mockPayment({ status: 'SUCCESS' });
     credentialedRequestsDie();
     const code = await runPay(['https://paywall.example.com/resource']);
-    assert.equal(code, null, 'no hard process.exit — piped stdout must flush (PR #25 review)');
     assert.equal(process.exitCode, 1);
     const out = output(); // stdout must never be empty after money moved
     assert.equal(out.event, 'l402_paid_retry_failed');
@@ -2536,8 +2538,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     mockPayment({ status: 'SUCCESS' });
     credentialedRequestsDie();
     const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
-    assert.equal(code, null);
-    assert.equal(process.exitCode, 1);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
     const out = output();
     assert.equal(out.event, 'l402_paid_retry_failed');
     assert.equal(out.tokenStored, false);
@@ -2554,8 +2556,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     mockPayment({ status: 'SUCCESS' });
     credentialedRequestsDie();
     const code = await runPay(['https://paywall.example.com/resource']);
-    assert.equal(code, null);
-    assert.equal(process.exitCode, 1);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
     const out = output();
     assert.equal(out.event, 'l402_reuse_failed');
     assert.equal(out.tokenReused, true);
@@ -2653,8 +2655,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     };
     credentialedRequestsRedirectToForbiddenHost();
     const code = await runPay(['https://paywall.example.com/resource']);
-    assert.equal(code, null);
-    assert.equal(process.exitCode, 1);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
     const out = output();
     assert.equal(out.event, 'l402_paid_retry_failed');
     assert.equal(out.errorCode, 'URL_POLICY');
@@ -2674,8 +2676,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     mockPayment({ status: 'SUCCESS' });
     credentialedRequestsRedirectToForbiddenHost();
     const code = await runPay(['https://paywall.example.com/resource']);
-    assert.equal(code, null);
-    assert.equal(process.exitCode, 1);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
     const out = output();
     assert.equal(out.event, 'l402_reuse_failed');
     assert.equal(out.errorCode, 'URL_POLICY');
@@ -2933,6 +2935,20 @@ describe('security: L402 allowlist policy (v3.0.2)', () => {
       () => assertAllowedUrl('http://127.0.0.1:6379/x', policy, 'L402 URL redirect target', { strictLocal: true }),
       (err) => err.code === 'URL_POLICY',
     );
+  });
+
+  it('a trailing root dot is normalized on BOTH the operator URL and the allowlist entries', () => {
+    for (const [listed, operatorUrl] of [
+      ['mynode.lan', 'https://mynode.lan./x'],
+      ['mynode.lan.', 'https://mynode.lan/x'],
+    ]) {
+      const policy = l402Allowlist(new Set([listed]), { relaxOnly: true, operatorUrl });
+      assert.doesNotThrow(
+        () => assertAllowedUrl(operatorUrl, policy, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+        `${listed} vs ${operatorUrl}`,
+      );
+      assert.doesNotThrow(() => assertAllowedUrl(operatorUrl, l402Allowlist(new Set([listed]))));
+    }
   });
 
   it('relax-only without an operatorUrl fails closed (never an unbound exception)', () => {

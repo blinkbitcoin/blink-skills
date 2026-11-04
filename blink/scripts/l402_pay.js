@@ -527,7 +527,9 @@ async function main() {
           2,
         ),
       );
-      process.exit(1);
+      // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+      process.exitCode = 1;
+      return;
     }
   }
 
@@ -776,8 +778,9 @@ async function main() {
           data,
         };
         console.log(JSON.stringify(output, null, 2));
-        process.exit(1);
-        return; // unreachable in production; guards against mocked process.exit in tests
+        // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+        process.exitCode = 1;
+        return;
       }
 
       const output = {
@@ -843,7 +846,9 @@ async function main() {
         'invoice explicitly with `blink pay-invoice` if you trust it.',
     };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
+    // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+    process.exitCode = 1;
+    return;
   }
 
   // ── Payment backend selection ──
@@ -903,7 +908,9 @@ async function main() {
           `Domain "${domain}" is not in the L402 allowlist. Add with: blink budget allowlist add ${domain}`,
       };
       console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
+      // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+      process.exitCode = 1;
+      return;
     }
 
     // ── Budget reservation (fail closed for autonomous auto-pay) ──
@@ -929,7 +936,9 @@ async function main() {
         message: reservation.reason,
       };
       console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
+      // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+      process.exitCode = 1;
+      return;
     }
     reservationId = reservation.id;
   }
@@ -946,7 +955,9 @@ async function main() {
       message: `Payment of ${budgetSats} sats exceeds --max-amount of ${args.maxAmount} sats. Aborting.`,
     };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
+    // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+    process.exitCode = 1;
+    return;
   }
 
   // ── Dry-run: report price and exit ──
@@ -1375,7 +1386,9 @@ async function main() {
 
   if (retryRes.status !== 200) {
     console.error(`Warning: retry returned status ${retryRes.status} (expected 200).`);
-    process.exit(1);
+    // Not process.exit(): it can truncate piped stdout; entry points drain, then exit (PR #25).
+    process.exitCode = 1;
+    return;
   }
 }
 

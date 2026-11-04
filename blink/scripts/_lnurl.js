@@ -229,11 +229,14 @@ const L402_ALLOWLIST = Symbol('l402Allowlist');
  */
 function l402Allowlist(hosts, { relaxOnly = false, operatorUrl } = {}) {
   if (!hosts) return null;
-  let set = hosts instanceof Set ? hosts : new Set(hosts);
+  // Same normalization as assertAllowedUrl (lowercase, no trailing root dot) on
+  // both sides, so 'mynode.lan.' and 'mynode.lan' are one host (PR #25 review).
+  const norm = (h) => String(h).toLowerCase().replace(/\.$/, '');
+  let set = new Set([...(hosts instanceof Set ? hosts : new Set(hosts))].map(norm));
   if (relaxOnly) {
     let operatorHost;
     try {
-      operatorHost = new URL(String(operatorUrl)).hostname.toLowerCase();
+      operatorHost = norm(new URL(String(operatorUrl)).hostname);
     } catch {
       throw new Error('l402Allowlist: relaxOnly requires the operatorUrl the exception is bound to.');
     }
