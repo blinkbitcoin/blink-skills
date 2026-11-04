@@ -60,6 +60,7 @@ function isIpLiteral(host) {
 const GUARD_DECISION = Symbol('guardDecision');
 
 const dns = require('node:dns');
+const net = require('node:net');
 // Test seam: a resolver installed under this registry key replaces DNS (the
 // in-process suites must never query real DNS). It is a process-global
 // Symbol.for key so it survives module reloads; only in-process code can set
@@ -73,36 +74,67 @@ function resolveHost(host) {
 }
 
 /**
- * Refuse a NAME that resolves to a private / loopback / link-local / metadata
- * address (PR #25 review round 2). The string checks in assertAllowedUrl can
- * only classify literals and known local names; any other name — an alias
- * like ip6-localhost, or attacker DNS such as 127.0.0.1.nip.io — passed them
- * in every mode, including the default no-allowlist one. Exempt: IP literals
- * (already classified), hosts the operator explicitly allowed (exclusive list
- * entry, or the operator's own host under relax-only), and local names that
- * assertAllowedUrl deliberately permitted (the LNURL regtest localhost).
- * A failed lookup is not a refusal: nothing resolves, so the fetch fails too.
+ * Refuse a NAME unless its resolved addresses are VERIFIED public (PR #25
+ * review rounds 2-3). The string checks in assertAllowedUrl can only classify
+ * literals and known local names; any other name — an alias like
+ * ip6-localhost, or attacker DNS such as 127.0.0.1.nip.io — passed them in
+ * every mode, including the default no-allowlist one.
  *
- * Residual limitation: the fetch resolves the name again, so a DNS answer
- * that changes between this check and the connection (rebinding) is not
- * caught; pinning the checked address needs a custom dispatcher that core
- * Node does not expose without the undici package.
+ * FAIL CLOSED: fetch() resolves the name again, independently, so an answer
+ * that cannot be verified here is never followed by a request. A lookup
+ * error (EAI_AGAIN, ENOTFOUND, SERVFAIL...), a timeout (bounded by the
+ * request deadline), an empty answer, or any entry that is not an IP literal
+ * is an UNVERIFIABLE refusal (`indeterminate: true`, retried by the walker
+ * like any transient fault); ANY private / loopback / link-local / metadata
+ * address is a deterministic refusal. The name looked up is exactly the
+ * hostname the fetch uses (an absolute trailing-dot name stays absolute).
+ *
+ * Exempt: IP literals (already classified), hosts the operator explicitly
+ * allowed (exclusive list entry, or the operator's own host under
+ * relax-only), and local names that assertAllowedUrl deliberately permitted
+ * (the LNURL regtest localhost).
+ *
+ * Residual limitation: an answer that was VERIFIED public and then changes
+ * before the connection (DNS rebinding) is not caught; pinning the checked
+ * address needs a custom dispatcher that core Node does not expose without
+ * the undici package.
  *
  * @param {URL} url  a URL returned by assertAllowedUrl
  * @param {string} what  label for the error message
+ * @param {number} timeoutMs  lookup bound (the caller passes the remaining deadline)
  */
-async function assertResolvedAddressesAllowed(url, what) {
+async function assertResolvedAddressesAllowed(url, what, timeoutMs) {
   const decision = url[GUARD_DECISION];
   if (!decision || decision.exempt) return;
+  const unverifiable = (why) => {
+    const err = policyError(
+      `Refusing to fetch ${what} from '${decision.host}': could not verify its resolved address (${why}).`,
+    );
+    err.indeterminate = true;
+    return err;
+  };
+  let timer;
   let addresses;
   try {
-    addresses = await resolveHost(decision.host);
-  } catch {
-    return;
+    addresses = await Promise.race([
+      Promise.resolve().then(() => resolveHost(decision.lookupHost)),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(Object.assign(new Error('lookup timed out'), { code: 'ETIMEOUT' })),
+          Math.max(1, timeoutMs),
+        );
+      }),
+    ]);
+  } catch (err) {
+    throw unverifiable((err && (err.code || err.message)) || 'lookup failed');
+  } finally {
+    clearTimeout(timer);
   }
-  for (const entry of addresses || []) {
-    const address = entry && (entry.address || entry);
-    if (isPrivateAddress(String(address))) {
+  if (!Array.isArray(addresses) || addresses.length === 0) throw unverifiable('empty answer');
+  for (const entry of addresses) {
+    const address = entry && typeof entry.address === 'string' ? entry.address : null;
+    if (!address || net.isIP(address) === 0) throw unverifiable('malformed answer');
+    if (isPrivateAddress(address)) {
       throw policyError(
         `Refusing to fetch ${what} from '${decision.host}': it resolves to the private address ${address}.`,
       );
@@ -289,7 +321,8 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   }
 
   Object.defineProperty(url, GUARD_DECISION, {
-    value: { host, exempt: explicitlyAllowed || isLocal || isIpLiteral(host) },
+    // host: normalized, for policy identity; lookupHost: exactly what fetch() resolves.
+    value: { host, lookupHost: url.hostname, exempt: explicitlyAllowed || isLocal || isIpLiteral(host) },
   });
   return url;
 }
@@ -461,9 +494,7 @@ async function fetchWithRetry(
   const overallDeadline = Date.now() + timeoutMs * (retries + 1) * (MAX_REDIRECTS + 1);
 
   for (let hop = 0; ; hop++) {
-    // Every hop — the first URL and each redirect target — is checked against
-    // the addresses its NAME resolves to, before any request is sent to it.
-    await assertResolvedAddressesAllowed(current, hop === 0 ? what : `${what} redirect target`);
+    const hopWhat = hop === 0 ? what : `${what} redirect target`;
     let lastErr;
     let res = null;
 
@@ -471,6 +502,18 @@ async function fetchWithRetry(
       const remaining = overallDeadline - Date.now();
       if (remaining <= 0) {
         throw new Error(`LNURL request exceeded its overall deadline fetching ${what}.`);
+      }
+      // Before EVERY attempt — the first URL and each redirect target — the
+      // name's resolved addresses must be verified (fail closed, PR #25
+      // review). A deterministic refusal aborts; an unverifiable answer is a
+      // transient fault: retried, and never followed by a request.
+      try {
+        await assertResolvedAddressesAllowed(current, hopWhat, Math.min(timeoutMs, remaining));
+      } catch (err) {
+        if (!err || !err.indeterminate) throw err;
+        lastErr = err;
+        if (attempt < retries) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        continue;
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
@@ -520,6 +563,8 @@ async function fetchWithRetry(
     }
 
     if (!res) {
+      // Every attempt was unverifiable: refuse as policy (nothing was sent).
+      if (lastErr && lastErr.indeterminate) throw lastErr;
       // Keep the transport cause: undici reports e.g. "terminated" whose cause
       // ("Decompression failed") is the actual diagnosis (FT7, v3.0.2).
       const detail = lastErr

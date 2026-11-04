@@ -2774,6 +2774,25 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     }
   }
 
+  for (const via of ['redirect', 'payment_request_url']) {
+    it(`PR #25 r3: l402-discover — a ${via} target whose lookup fails (EAI_AGAIN) is refused, never requested`, async () => {
+      const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+      const prev = globalThis[RESOLVER];
+      globalThis[RESOLVER] = async (h) => {
+        if (h === 'rebind.example') throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+        return [{ address: '93.184.215.14', family: 4 }];
+      };
+      try {
+        pivotFetch({ via, target: 'https://rebind.example:6379' });
+        const err = await runDiscover('https://attacker.example/start');
+        assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+        assert.equal(loopbackHit(), false, 'the unverified target is never requested');
+      } finally {
+        globalThis[RESOLVER] = prev;
+      }
+    });
+  }
+
   it('PR #25 r2: with NO allowlist (the default), a public redirect to a name resolving to loopback is refused', async () => {
     const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
     const prev = globalThis[RESOLVER];
@@ -3008,10 +3027,66 @@ describe('security: resolved-address guard (v3.0.2)', () => {
     assert.deepEqual(fetched, ['https://public.example/start'], 'only the public start was requested');
   });
 
-  it('a failed lookup is not a refusal (nothing resolves, so the fetch fails on its own)', async () => {
-    resolveAs({ 'nx.example': Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }) });
-    await fetchWithRetry('https://nx.example/x', L402);
-    assert.deepEqual(fetched, ['https://nx.example/x']);
+  // PR #25 review round 3 (Medium): an indeterminate lookup used to be
+  // treated as permitted — but fetch() resolves AGAIN, independently, so a
+  // transient policy-lookup failure followed by a private answer at connect
+  // time was never checked at all. Fail closed: no verified answer, no request.
+  for (const code of ['EAI_AGAIN', 'ENOTFOUND', 'ESERVFAIL']) {
+    it(`a lookup failing with ${code} is REFUSED and no request is sent (fail closed)`, async () => {
+      resolveAs({ 'flaky.example': Object.assign(new Error(`getaddrinfo ${code}`), { code }) });
+      await assert.rejects(fetchWithRetry('https://flaky.example/x', L402), (err) => {
+        assert.equal(err.code, 'URL_POLICY');
+        assert.match(err.message, /could not verify/);
+        return true;
+      });
+      assert.deepEqual(fetched, []);
+    });
+  }
+
+  for (const [label, answer] of [
+    ['an empty answer', []],
+    ['an entry without an address', [{}]],
+    ['a non-IP address', [{ address: 'not-an-ip', family: 4 }]],
+    ['a non-array answer', 'garbage'],
+  ]) {
+    it(`${label} is REFUSED (an unverifiable answer is not "nothing private")`, async () => {
+      globalThis[Symbol.for('blink-skills.test.hostResolver')] = async () => answer;
+      await assert.rejects(fetchWithRetry('https://odd.example/x', L402), (err) => err.code === 'URL_POLICY');
+      assert.deepEqual(fetched, []);
+    });
+  }
+
+  it('a lookup that never answers is bounded by the request deadline and REFUSED', { timeout: 3000 }, async () => {
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = () => new Promise(() => {});
+    const started = Date.now();
+    await assert.rejects(
+      fetchWithRetry('https://slow.example/x', { ...L402, timeoutMs: 200 }),
+      (err) => err.code === 'URL_POLICY',
+    );
+    assert.ok(Date.now() - started < 2000, 'bounded by the deadline, not hanging');
+    assert.deepEqual(fetched, []);
+  });
+
+  it('resolves exactly the hostname the fetch will use (an absolute trailing-dot name stays absolute)', async () => {
+    const asked = [];
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = async (h) => {
+      asked.push(h);
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+    await fetchWithRetry('https://abs.example./x', L402);
+    assert.deepEqual(asked, ['abs.example.']);
+  });
+
+  it('a transient lookup failure is RETRIED like any transient fault, then the verified request proceeds', async () => {
+    let calls = 0;
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+    await fetchWithRetry('https://retry.example/x', { ...L402, retries: 1 });
+    assert.equal(calls, 2);
+    assert.deepEqual(fetched, ['https://retry.example/x'], 'exactly one request, after a verified answer');
   });
 
   it('control: an operator-allowlisted LAN name that resolves private is still reachable (exclusive mode)', async () => {
