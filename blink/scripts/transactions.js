@@ -89,7 +89,7 @@ const ARG_OPTIONS = {
 };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   const args = { first: 20, after: null, wallet: null, includePreimage: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--first' && argv[i + 1]) {

@@ -33,7 +33,7 @@ const ARG_OPTIONS = {
 };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let limit = 20;
   let offset = 0;
   let type = null;

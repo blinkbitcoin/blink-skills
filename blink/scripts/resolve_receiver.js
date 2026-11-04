@@ -29,10 +29,15 @@ const {
   resolveReceiver,
   DEFAULT_LN_ADDRESS_DOMAIN,
   exitAfterStdout,
+  strictArgv,
 } = require('./_blink_client');
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {};
+
 async function main() {
-  const identifier = process.argv[2] ? process.argv[2].trim() : null;
+  const [arg] = strictArgv(process.argv.slice(2), ARG_OPTIONS, { positionals: [0, 1] });
+  const identifier = arg ? arg.trim() : null;
   if (!identifier) {
     console.error('Usage: node resolve_receiver.js <identifier>   (e.g. alice  or  alice@blink.sv)');
     process.exit(1);
@@ -89,4 +94,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

@@ -134,7 +134,7 @@ const SWAP_ARG_OPTIONS = {
 
 function parseCommonSwapArgs(argv) {
   try {
-    argv = strictArgv(argv, SWAP_ARG_OPTIONS, { positionalsFirst: true });
+    argv = strictArgv(argv, SWAP_ARG_OPTIONS, { positionalsFirst: true, positionals: [0, 2] });
   } catch (err) {
     return { error: err.message };
   }

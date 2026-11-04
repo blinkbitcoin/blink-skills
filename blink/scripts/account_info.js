@@ -15,7 +15,10 @@
  * Dependencies: None (uses Node.js built-in fetch)
  */
 
-const { getApiKey, getApiUrl, graphqlRequest, estimateSatsToUsd } = require('./_blink_client');
+const { getApiKey, getApiUrl, graphqlRequest, estimateSatsToUsd, strictArgv } = require('./_blink_client');
+
+// Takes no arguments; anything given is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {};
 
 const ACCOUNT_INFO_QUERY = `
   query AccountInfo {
@@ -76,6 +79,7 @@ function formatLimit(limits) {
 }
 
 async function main() {
+  strictArgv(process.argv.slice(2), ARG_OPTIONS, { positionals: [0, 0] });
   const apiKey = getApiKey();
   const apiUrl = getApiUrl();
 
@@ -134,4 +138,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

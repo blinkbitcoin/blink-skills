@@ -44,7 +44,7 @@ const ARG_OPTIONS = {
 };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true });
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true, positionals: [0, Infinity] });
   let literal = false; // after `--`: every word is a positional (memo text)
   let amount = null;
   let token = 'usdb';

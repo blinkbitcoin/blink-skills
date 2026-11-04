@@ -66,7 +66,7 @@ const SPARK_SEND_OPTIONS = {
 function parseArgs(argv) {
   // Strict first: `--dry-run=true` or a typo like `--dryrun` used to be read
   // as a positional and the SEND WAS REAL. Throws ARG_INVALID before any SDK.
-  argv = strictArgv(argv, SPARK_SEND_OPTIONS);
+  argv = strictArgv(argv, SPARK_SEND_OPTIONS, { positionals: [0, 2] });
   let destination = null;
   let amountSats = null;
   let dryRun = false;

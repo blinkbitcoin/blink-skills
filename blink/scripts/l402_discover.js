@@ -273,7 +273,7 @@ function budgetChargeFromInvoice(invoice) {
 const ARG_OPTIONS = { method: { type: 'string' }, header: { type: 'string', multiple: true } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 1] });
   let url = null;
   let method = 'GET';
   const headers = {};

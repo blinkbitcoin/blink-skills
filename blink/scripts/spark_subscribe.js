@@ -30,7 +30,7 @@ const { connect } = require('./_spark_sdk');
 const ARG_OPTIONS = { timeout: { type: 'string' }, network: { type: 'string' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let timeoutSeconds = 300;
   let network = process.env.SPARK_NETWORK || 'mainnet';
   for (let i = 0; i < argv.length; i++) {

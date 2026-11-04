@@ -51,7 +51,9 @@ const PAY_LN_ADDRESS_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), {
+    maxPositionals: 2,
+  });
   const lnAddress = remaining[0] ? remaining[0].trim() : null;
   const amountSats = remaining[1] ? parseInt(remaining[1], 10) : null;
 

@@ -19,7 +19,7 @@ const { getApiKey, getWsUrl, requireWebSocket, strictArgv } = require('./_blink_
 const ARG_OPTIONS = { timeout: { type: 'string' }, max: { type: 'string' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let timeoutSeconds = 0;
   let maxCount = 0;
 

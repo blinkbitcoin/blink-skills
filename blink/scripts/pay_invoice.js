@@ -52,7 +52,9 @@ const PAY_INVOICE_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), {
+    maxPositionals: 1,
+  });
   const rawInvoice = remaining[0];
 
   if (!rawInvoice) {

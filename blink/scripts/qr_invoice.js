@@ -657,7 +657,10 @@ const qrcodegen = (() => {
 const fs = require('fs');
 const zlib = require('zlib');
 
-const { normalizeInvoice } = require('./_blink_client');
+const { normalizeInvoice, strictArgv } = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {};
 
 function renderQrToString(qr, border = 1) {
   const size = qr.size;
@@ -787,7 +790,7 @@ function renderInvoiceQr(invoice) {
 }
 
 function main() {
-  const args = process.argv.slice(2);
+  const args = strictArgv(process.argv.slice(2), ARG_OPTIONS, { positionals: [0, Infinity] });
   if (args.length < 1) {
     console.error('Usage: node qr_invoice.js <bolt11_invoice>');
     process.exit(1);
@@ -811,4 +814,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, renderInvoiceQr };
+module.exports = { main, renderInvoiceQr, ARG_OPTIONS };

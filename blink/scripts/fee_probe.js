@@ -60,7 +60,7 @@ const FEE_PROBE_USD_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), { maxPositionals: 1 });
   const rawInvoice = remaining[0];
 
   // The shared parser accepts --max-amount; a probe never pays, so it cannot

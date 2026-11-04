@@ -58,7 +58,7 @@ const { getInvoiceFromLightningAddress, verifyLnurlPayment } = require('./_lnurl
 const ARG_OPTIONS = { timeout: { type: 'string' }, 'no-verify': { type: 'boolean' }, qr: { type: 'boolean' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true });
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true, positionals: [0, Infinity] });
   let literal = false; // after `--`: every word is a positional (memo text)
   let address = null;
   let amountSats = null;

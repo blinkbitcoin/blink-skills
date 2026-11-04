@@ -27,7 +27,7 @@ const { connect, waitForStableBalance, normalizeTokenBalances } = require('./_sp
 const ARG_OPTIONS = { network: { type: 'string' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let network = process.env.SPARK_NETWORK || 'mainnet';
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--network' && i + 1 < argv.length) {

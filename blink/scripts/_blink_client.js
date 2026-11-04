@@ -595,10 +595,16 @@ function formatUsdCents(cents) {
  *
  * @param {string[]} argv
  * @param {Record<string, {type: 'string'|'boolean', multiple?: boolean}>} options
- * @param {{ keepTerminator?: boolean, positionalsFirst?: boolean }} [opts]
+ * `positionals: [min, max]` enforces the positional arity (PR #27 review: an
+ * option typo WITHOUT dashes, `l402-store clear expird`, was an ignored extra
+ * positional — and cleared every token). Without `keepTerminator`, a `--` is
+ * REFUSED: words after it would otherwise be re-read as live options by the
+ * script's own loop (`-- --network mainnet`).
+ *
+ * @param {{ keepTerminator?: boolean, positionalsFirst?: boolean, positionals?: [number, number] }} [opts]
  * @returns {string[]}  canonical argv: `--name` (+ value for strings) and positionals, in order
  */
-function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = false } = {}) {
+function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = false, positionals: arity } = {}) {
   let tokens;
   try {
     ({ tokens } = require('node:util').parseArgs({
@@ -609,14 +615,16 @@ function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = 
       tokens: true,
     }));
   } catch (err) {
-    const reason = String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, '');
-    const e = new Error(`${reason}. Unknown or malformed options are refused before anything is sent.`);
-    e.code = 'ARG_INVALID';
-    throw e;
+    throw argInvalid(String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, ''));
   }
   const opts = [];
   const positionals = [];
   const out = [];
+  const allPositionals = tokens.filter((t) => t.kind === 'positional').map((t) => t.value);
+  if (!keepTerminator && tokens.some((t) => t.kind === 'option-terminator')) {
+    throw argInvalid("'--' is only accepted by commands that take free text (a memo or description)");
+  }
+  if (arity) assertPositionalCount(allPositionals, arity[0], arity[1]);
   for (const t of tokens) {
     if (t.kind === 'option') {
       const o = [`--${t.name}`];
@@ -629,6 +637,28 @@ function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = 
     }
   }
   return positionalsFirst ? [...positionals, ...opts] : out;
+}
+
+function argInvalid(reason) {
+  const e = new Error(`${reason}. Unknown or malformed options are refused before anything is sent.`);
+  e.code = 'ARG_INVALID';
+  return e;
+}
+
+/**
+ * Enforce a positional arity: throws ARG_INVALID naming the unexpected words.
+ * Exported for scripts whose arity depends on a subcommand.
+ *
+ * @param {string[]} list
+ * @param {number} min
+ * @param {number} max  Infinity for free text
+ */
+function assertPositionalCount(list, min, max) {
+  if (list.length >= min && list.length <= max) return;
+  const range =
+    min === max ? `${min}` : max === Infinity ? `at least ${min}` : min === 0 ? `at most ${max}` : `${min}–${max}`;
+  const extra = list.length > max ? `: unexpected argument(s) '${list.slice(max).join("', '")}'` : '';
+  throw argInvalid(`Expected ${range} positional argument(s), got ${list.length}${extra}`);
 }
 
 const WALLET_ARG_OPTIONS = {
@@ -649,9 +679,9 @@ const WALLET_ARG_OPTIONS = {
  * @param {string[]} argv  Typically `process.argv.slice(2)`.
  * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
  */
-function parseWalletArg(argv) {
+function parseWalletArg(argv, { maxPositionals = Infinity } = {}) {
   try {
-    argv = strictArgv(argv, WALLET_ARG_OPTIONS);
+    argv = strictArgv(argv, WALLET_ARG_OPTIONS, { positionals: [0, maxPositionals] });
   } catch (err) {
     console.error(`Error: ${err.message}`);
     process.exit(1);
@@ -910,6 +940,7 @@ function exitAfterStdout(code) {
 
 module.exports = {
   strictArgv,
+  assertPositionalCount,
   WALLET_ARG_OPTIONS,
   exitAfterStdout,
   // Constants

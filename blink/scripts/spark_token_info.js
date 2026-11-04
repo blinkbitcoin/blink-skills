@@ -25,7 +25,7 @@ const { connect, resolveTokenIdentifier, normalizeSdkValue } = require('./_spark
 const ARG_OPTIONS = { network: { type: 'string' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 1] });
   let token = null;
   let network = process.env.SPARK_NETWORK || 'mainnet';
   for (let i = 0; i < argv.length; i++) {

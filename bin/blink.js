@@ -1163,7 +1163,6 @@ commands.budget = {
     daily: { type: 'string' },
     off: { type: 'boolean', default: false },
     last: { type: 'string' },
-    expired: { type: 'boolean', default: false },
     force: { type: 'boolean', default: false },
   },
   optMeta: {
@@ -1190,7 +1189,6 @@ commands.budget = {
     if (opts.daily) argv.push('--daily', opts.daily);
     if (opts.off) argv.push('--off');
     if (opts.last) argv.push('--last', opts.last);
-    if (opts.expired) argv.push('--expired');
     if (opts.force) argv.push('--force');
     setProcessArgv(argv);
     const { main } = require(path.join(scriptsDir, 'budget.js'));

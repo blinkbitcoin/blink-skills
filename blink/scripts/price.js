@@ -22,7 +22,22 @@
  * Dependencies: None (uses Node.js built-in fetch)
  */
 
-const { getApiKey, getApiUrl, graphqlRequest, CONVERSION_QUERY, decimalFromBaseOffset } = require('./_blink_client');
+const {
+  getApiKey,
+  getApiUrl,
+  graphqlRequest,
+  CONVERSION_QUERY,
+  decimalFromBaseOffset,
+  strictArgv,
+} = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {
+  usd: { type: 'string' },
+  history: { type: 'string' },
+  currencies: { type: 'boolean' },
+  raw: { type: 'boolean' },
+};
 
 // ── Queries ─────────────────────────────────────────────────
 
@@ -274,11 +289,19 @@ async function cmdCurrencies(apiKey, apiUrl) {
 async function main() {
   const apiKey = getApiKey({ required: false });
   const apiUrl = getApiUrl();
-  const args = process.argv.slice(2);
+  const args = strictArgv(process.argv.slice(2), ARG_OPTIONS, { positionals: [0, 1] });
 
   // Check for --raw flag
   const includeRaw = args.includes('--raw');
   const filteredArgs = args.filter((a) => a !== '--raw');
+
+  // One mode at a time: `--usd 5 100` or `--usd 5 --currencies` used to run
+  // one mode and silently ignore the rest.
+  const modes = ['--usd', '--history', '--currencies'].filter((m) => filteredArgs.includes(m));
+  const expectedLen = modes.length === 0 ? Math.min(filteredArgs.length, 1) : modes[0] === '--currencies' ? 1 : 2;
+  if (modes.length > 1 || filteredArgs.length > expectedLen) {
+    throw new Error('price takes ONE of: [amount_sats], --usd <amount>, --history <range>, --currencies');
+  }
 
   if (filteredArgs.length === 0) {
     // No args: current BTC/USD price
@@ -329,4 +352,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

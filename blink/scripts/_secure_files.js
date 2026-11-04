@@ -141,8 +141,18 @@ function writeSecureFileAtomic(file, content) {
   }
   // Belt for a pre-existing target created by an older release with looser
   // umask: rename preserves the OLD file's mode, so set it explicitly.
-  fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // Never leave a 0600 copy of the state behind (PR #27 review).
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw e;
+  }
   fs.chmodSync(file, 0o600);
 }
 

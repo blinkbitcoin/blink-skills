@@ -53,7 +53,7 @@ const {
 const ARG_OPTIONS = { timeout: { type: 'string' }, 'no-subscribe': { type: 'boolean' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true });
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true, positionals: [0, Infinity] });
   let literal = false; // after `--`: every word is a positional (memo text)
   let amountCents = null;
   let timeoutSeconds = 300;

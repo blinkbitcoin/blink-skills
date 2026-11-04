@@ -31,7 +31,7 @@ const {
 const ARG_OPTIONS = { timeout: { type: 'string' } };
 
 function parseArgs(argv) {
-  argv = strictArgv(argv, ARG_OPTIONS);
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 1] });
   let invoice = null;
   let timeoutSeconds = 300;
 
