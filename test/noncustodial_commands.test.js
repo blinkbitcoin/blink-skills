@@ -258,10 +258,11 @@ describe('create_invoice_lnaddress main()', () => {
     assert.equal(j.event, 'invoice_created', 'the invoice is still the primary output');
     assert.equal(j.qrRendered, true);
     assert.equal(j.paymentRequest, PR);
-    assert.ok(j.pngPath.startsWith('/tmp/blink_qr_'));
+    // v3.0.5: a private mkdtemp directory, not a predictable /tmp name.
+    assert.match(path.basename(path.dirname(j.pngPath)), /^blink-qr-/);
     assert.ok(fs.existsSync(j.pngPath), 'the PNG file must exist');
     assert.ok(r.err.includes('PNG saved:'), 'the terminal QR and PNG notice go to stderr');
-    fs.unlinkSync(j.pngPath);
+    fs.rmSync(path.dirname(j.pngPath), { recursive: true, force: true });
   });
 
   it('a QR rendering failure never loses the invoice (non-fatal)', async () => {

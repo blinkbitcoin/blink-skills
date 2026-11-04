@@ -1439,17 +1439,17 @@ function describeFetchError(err) {
 }
 
 /**
- * Derive a placeholder preimage from the BOLT-11 invoice when the API does
- * not return it directly. This is used only for token caching — the L402
- * server may accept or reject it depending on its verification mode.
+ * Derive a placeholder preimage, SHA-256(invoice), when the API does not
+ * return the real one. It is sent in the paid request (a non-strict L402
+ * server may accept it) but is NEVER cached: it is not a proof of payment
+ * (ClawHub 3.0.1 scan), so access may still fail and the token is not kept.
  *
  * @param {string} invoice  BOLT-11 payment request.
  * @returns {string}  64-char hex string.
  */
 function derivePreimageFromInvoice(invoice) {
-  // Use a deterministic placeholder: pad the invoice chars to 64 hex chars.
-  // This is NOT a real preimage and will only work with servers that do
-  // not verify preimage hash matches. Agents should be aware of this limitation.
+  // NOT a real preimage: a server that checks sha256(preimage) == payment
+  // hash rejects it.
   const crypto = require('node:crypto');
   return crypto.createHash('sha256').update(invoice).digest('hex');
 }

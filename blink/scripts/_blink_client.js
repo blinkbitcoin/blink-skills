@@ -617,6 +617,7 @@ function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = 
   } catch (err) {
     throw argInvalid(String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, ''));
   }
+  assertNoConflictingRepeats(tokens, options);
   const opts = [];
   const positionals = [];
   const out = [];
@@ -637,6 +638,36 @@ function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = 
     }
   }
   return positionalsFirst ? [...positionals, ...opts] : out;
+}
+
+/**
+ * Refuse a single-value option given twice with DIFFERENT values (v3.0.5,
+ * FT10): parseArgs silently keeps the last one, so
+ * `spark-lnaddress delete --network regtest --network mainnet` targeted
+ * mainnet. An identical repeat is harmless and allowed; `multiple` options
+ * are exempt. Booleans compare their polarity (`--store` vs `--no-store`,
+ * with allowNegative).
+ *
+ * @param {Array<{kind: string, name?: string, rawName?: string, value?: string}>} tokens  parseArgs tokens
+ * @param {Record<string, {type: string, multiple?: boolean}>} options
+ */
+function assertNoConflictingRepeats(tokens, options) {
+  const seen = new Map();
+  for (const t of tokens) {
+    if (t.kind !== 'option' || !Object.hasOwn(options, t.name) || options[t.name].multiple) continue;
+    const isString = options[t.name].type === 'string';
+    const value = isString ? t.value : !String(t.rawName).startsWith('--no-');
+    if (!seen.has(t.name)) {
+      seen.set(t.name, { value, raw: t.rawName });
+    } else if (seen.get(t.name).value !== value) {
+      const first = seen.get(t.name);
+      throw argInvalid(
+        isString
+          ? `Conflicting values for --${t.name} ('${first.value}', '${value}'): give it once`
+          : `Conflicting options ${first.raw} and ${t.rawName}: give one`,
+      );
+    }
+  }
 }
 
 function argInvalid(reason) {
@@ -940,6 +971,7 @@ function exitAfterStdout(code) {
 
 module.exports = {
   strictArgv,
+  assertNoConflictingRepeats,
   assertPositionalCount,
   WALLET_ARG_OPTIONS,
   exitAfterStdout,
