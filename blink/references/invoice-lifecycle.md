@@ -115,7 +115,7 @@ node qr_invoice.js <paymentRequest>
 Output:
 
 - **Terminal QR** rendered to stderr (for visual verification)
-- **PNG file** written to `/tmp/blink_qr_<timestamp>.png`
+- **PNG file** written to a private temp directory, `<system temp>/blink-qr-XXXXXX/invoice.png` (directory `0700`, file `0600`)
 - **JSON to stdout** with `pngPath` field pointing to the PNG file
 
 The agent should use the `pngPath` to send the QR image to the user as a media attachment.

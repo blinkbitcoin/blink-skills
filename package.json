@@ -1,6 +1,6 @@
 {
   "name": "blink-claw-skill",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "private": true,
   "description": "Bitcoin Lightning wallet CLI for OpenClaw agents via the Blink API",
   "license": "MIT",

@@ -43,9 +43,14 @@
 
 'use strict';
 
-const { parseArgs } = require('node:util');
-
-const { getApiKey, getApiUrl, graphqlRequest, getWallet, MUTATION_TIMEOUT_MS } = require('./_blink_client');
+const {
+  getApiKey,
+  getApiUrl,
+  graphqlRequest,
+  getWallet,
+  MUTATION_TIMEOUT_MS,
+  strictParseArgs,
+} = require('./_blink_client');
 
 const { getRootKey, createMacaroon } = require('./_l402_macaroon');
 
@@ -83,12 +88,9 @@ const ARG_OPTIONS = {
 };
 
 function parseCliArgs(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: ARG_OPTIONS,
-    allowPositionals: false,
-    strict: true,
-  });
+  // Strict (PR #28 review): conflicting repeats and extra positionals are
+  // refused, and errors never echo argument values.
+  const { values } = strictParseArgs(argv, ARG_OPTIONS, { positionals: [0, 0] });
 
   if (values.help) {
     console.error(

@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.4
+version: 3.0.5
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.4'
+    version: '3.0.5'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -139,7 +139,7 @@ npm link      # creates global 'blink' command
 blink --help  # verify
 ```
 
-> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`. **Scripts that move money parse options strictly (v3.0.3):** `pay_invoice`, `pay_lnaddress`, `pay_lnurl`, `fee_probe`, `l402_pay`, `spark_send`, and `spark_fee_probe` accept `--opt value` and `--opt=value`. They **refuse**, with exit 1 and before anything is sent, an unknown or misspelled option (e.g. `--dryrun`), a missing value (a trailing `--max-amount`), and a value on a yes/no flag (`--dry-run=true`). Before v3.0.3, such arguments were silently ignored: a ceiling could vanish, or a dry run could become a real payment. The `blink` CLI already behaved this way. **Since v3.0.4 every script parses this way**, including invoices, subscriptions, listings, `l402-discover`, `l402-store` and all `spark-*` commands. For example, `spark-lnaddress delete --network=regtest` used to delete the **mainnet** address, and `l402-store clear --expird` cleared every token. **Memo words that start with a dash go after `--`**, e.g. `blink create-invoice 1000 --no-subscribe -- -50% off`; this applies both at the CLI and when running a script directly. `--` is accepted **only** by commands that take free text (memos and descriptions); anywhere else it is refused. **Unexpected extra arguments are refused too**, not ignored: `l402-store clear expird` (a typo without dashes) used to clear every token, and now exits 1 with the store untouched. Likewise `spark-lnaddress delete alice`, `budget status extra` and `price --usd 5 100` are refused.
+> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`. **Scripts that move money parse options strictly (v3.0.3):** `pay_invoice`, `pay_lnaddress`, `pay_lnurl`, `fee_probe`, `l402_pay`, `spark_send`, and `spark_fee_probe` accept `--opt value` and `--opt=value`. They **refuse**, with exit 1 and before anything is sent, an unknown or misspelled option (e.g. `--dryrun`), a missing value (a trailing `--max-amount`), and a value on a yes/no flag (`--dry-run=true`). Before v3.0.3, such arguments were silently ignored: a ceiling could vanish, or a dry run could become a real payment. The `blink` CLI already behaved this way. **Since v3.0.4 every script parses this way**, including invoices, subscriptions, listings, `l402-discover`, `l402-store` and all `spark-*` commands. For example, `spark-lnaddress delete --network=regtest` used to delete the **mainnet** address, and `l402-store clear --expird` cleared every token. **Memo words that start with a dash go after `--`**, e.g. `blink create-invoice 1000 --no-subscribe -- -50% off`; this applies both at the CLI and when running a script directly. `--` is accepted **only** by commands that take free text (memos and descriptions); anywhere else it is refused. **Unexpected extra arguments are refused too**, not ignored: `l402-store clear expird` (a typo without dashes) used to clear every token, and now exits 1 with the store untouched. Likewise `spark-lnaddress delete alice`, `budget status extra` and `price --usd 5 100` are refused. **Since v3.0.5, a repeated option with a different value is refused** instead of silently keeping the last one: `--network regtest --network mainnet` and `--store --no-store` exit 1. An identical repeat is fine, and repeatable options such as `--header` are unaffected. **Refusal messages name the option or the position, never the value** (e.g. `Conflicting values for --token: give it once`, `unexpected extra argument at position 2`), so a token, preimage or seed passed by mistake is not printed back into logs.
 
 ## Agent Safety Policy
 
@@ -388,7 +388,7 @@ Estimates the fee for paying a Lightning invoice without actually sending. Use b
 blink qr <bolt11_invoice>
 ```
 
-Renders a terminal QR code for a Lightning invoice (BOLT-11) to stderr and generates a **PNG image file** to `/tmp`. The stdout JSON includes a `pngPath` field with the absolute path to the PNG file.
+Renders a terminal QR code for a Lightning invoice (BOLT-11) to stderr and generates a **PNG image file** in a private temp directory. The stdout JSON includes a `pngPath` field with the absolute path to the PNG file. Always use `pngPath`; do not guess the location.
 
 **Sending the QR image to a user**: After running this script, use the `pngPath` from the JSON output to send the PNG as a media attachment to the user in the current chat. The agent should use its native message-send capability with the file path.
 
@@ -400,7 +400,7 @@ Output JSON includes:
 - `qrRendered` — always `true`
 - `qrSize` — QR module count
 - `errorCorrection` — `"L"` (LOW)
-- `pngPath` — absolute path to the generated PNG file (e.g. `/tmp/blink_qr_1234567890.png`)
+- `pngPath` — absolute path to the generated PNG file (e.g. `/tmp/blink-qr-Ab12Cd/invoice.png`: a fresh `0700` directory under the system temp dir, `TMPDIR` honored, holding a `0600` file)
 - `pngBytes` — file size in bytes
 
 ### List Transactions
@@ -468,7 +468,7 @@ Mints a BOLT-11 invoice for any `user@blink.sv` recipient via public LNURL-pay �
 
 **Output cardinality is conditional.** `invoice_created` is always emitted. The second object (`verify_result`, `PAID`/`TIMEOUT`) follows only if polling is active: `--no-verify` was **not** passed **and** the first JSON contains a `verifyUrl`. Check `verifyUrl` in the first JSON before waiting — when it is absent, the command emits exactly one object and exits.
 
-- `--qr` — render a terminal QR (stderr) and a PNG in /tmp for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
+- `--qr` — render a terminal QR (stderr) and a PNG (in a private temp directory, see `qr`) for the minted invoice; QR fields (`pngPath`, `qrSize`, `pngBytes`, …) are merged into the `invoice_created` JSON
 
 ### Spark Info
 
@@ -897,7 +897,7 @@ blink create-invoice 1000 "Payment for service"
 
 # 2. Generate QR code PNG
 blink qr <paymentRequest>
-# → JSON includes "pngPath": "/tmp/blink_qr_123456.png"
+# → JSON includes "pngPath": "/tmp/blink-qr-Ab12Cd/invoice.png"
 # → Send the PNG file to the user as a media attachment in the current chat
 
 # 3. The create-invoice command is still running, waiting for payment
@@ -1599,7 +1599,7 @@ blink budget allowlist remove satring.com        # Remove domain from allowlist
 ### Filesystem Access
 
 - **Credential handling:** `BLINK_API_KEY` is read from `process.env` only. Shell rc files are never read, and no credential is ever written outside the process.
-- **QR PNG generation:** The `qr` command writes temporary PNG files to `/tmp/blink_qr_*.png`. These are standard image files with no embedded metadata beyond the QR content.
+- **QR PNG generation:** The `qr` command (and `--qr`) writes each PNG into a fresh private directory, `<system temp>/blink-qr-XXXXXX/invoice.png` (directory `0700`, file `0600`, created exclusively). Before v3.0.5 it wrote to a predictable `/tmp/blink_qr_<timestamp>.png`, which another local user could redirect with a planted symlink (ClawHub 3.0.4 ClawScan). These are standard image files with no embedded metadata beyond the QR content.
 - **L402 token cache:** The `l402-pay` command writes paid tokens to `~/.blink/l402-tokens.json`. This file contains macaroons and preimages for previously-paid L402 services. Use `blink l402-store clear` to remove all cached tokens. Pass `--no-store` to disable caching entirely.
 - **Budget files:** Budget config at `~/.blink/budget.json` and spending log at `~/.blink/spending-log.json`. The spending log is auto-pruned (entries older than 25h removed). Use `blink budget reset` to clear the log.
 - **Spark SDK state:** `spark-*` commands and `l402-pay --spark` write Breez SDK wallet state to `~/.blink/spark/<network>-<hash>` (the directory name is a non-reversible sha256 prefix of the seed). Delete the directory to remove all local state.

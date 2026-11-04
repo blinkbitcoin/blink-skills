@@ -5,14 +5,15 @@
  * Usage: node qr_invoice.js <bolt11_invoice>
  *
  * Renders a terminal QR code for a Lightning invoice (BOLT-11) to stderr,
- * generates a PNG image file to /tmp, and outputs JSON with the file path.
+ * generates a PNG image file in a private temp directory, and outputs JSON
+ * with the file path.
  *
  * Arguments:
  *   bolt11_invoice - Required. The BOLT-11 payment request string (lnbc...)
  *
  * Output:
  *   - QR code to stderr (UTF-8 blocks)
- *   - PNG file saved to /tmp/blink_qr_<timestamp>.png
+ *   - PNG file saved to <os.tmpdir()>/blink-qr-XXXXXX/invoice.png (dir 0700, file 0600)
  *   - JSON to stdout (includes pngPath field)
  *
  * Dependencies: None (embedded Nayuki QR generator, MIT license; PNG via Node.js zlib/Buffer)
@@ -655,6 +656,8 @@ const qrcodegen = (() => {
 })();
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const zlib = require('zlib');
 
 const { normalizeInvoice, strictArgv } = require('./_blink_client');
@@ -759,7 +762,8 @@ function renderQrToPng(qr, { border = 4, scale = 10 } = {}) {
 
 /**
  * Render a BOLT-11 invoice as a terminal QR (printed to stderr) plus a PNG
- * file in /tmp. Shared by `blink qr` and `create-invoice-lnaddress --qr`.
+ * file in a private temp directory. Shared by `blink qr` and
+ * `create-invoice-lnaddress --qr`.
  *
  * @param {string} invoice  BOLT-11 payment request string.
  * @returns {{ invoice: string, qrRendered: boolean, qrSize: number, errorCorrection: string, pngPath: string, pngBytes: number }}
@@ -773,10 +777,21 @@ function renderInvoiceQr(invoice) {
   const qrText = renderQrToString(qr, 1);
   console.error(qrText);
 
-  // PNG generation to /tmp
+  // PNG into a PRIVATE directory (ClawHub 3.0.4 ClawScan concern): the old
+  // `/tmp/blink_qr_<Date.now()>.png` was predictable and written with a plain
+  // writeFileSync, so a symlink planted there by another local user redirected
+  // the write. mkdtemp gives a fresh 0700 directory with a random name; the
+  // file is created exclusively ('wx') and 0600.
   const pngBuf = renderQrToPng(qr, { border: 4, scale: 10 });
-  const pngPath = `/tmp/blink_qr_${Date.now()}.png`;
-  fs.writeFileSync(pngPath, pngBuf);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-qr-'));
+  const pngPath = path.join(dir, 'invoice.png');
+  try {
+    fs.writeFileSync(pngPath, pngBuf, { mode: 0o600, flag: 'wx' });
+  } catch (e) {
+    // Leave nothing behind, not even a partial PNG (PR #28 review).
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
   console.error(`PNG saved: ${pngPath} (${pngBuf.length} bytes)`);
 
   return {

@@ -1322,7 +1322,10 @@ async function main() {
 
   let parsed;
   try {
-    parsed = parseArgs(parseConfig);
+    parsed = parseArgs({ ...parseConfig, tokens: true });
+    // A repeated single-value option with a different value is refused, not
+    // last-wins (v3.0.5, FT10: `--network regtest --network mainnet`).
+    require(path.join(scriptsDir, '_blink_client.js')).assertNoConflictingRepeats(parsed.tokens, parseConfig.options);
   } catch (err) {
     console.error(`Error: ${err.message}`);
     console.error('(run with --help for usage)');

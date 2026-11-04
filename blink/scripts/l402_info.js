@@ -26,8 +26,7 @@
 
 'use strict';
 
-const { parseArgs } = require('node:util');
-const { assertPositionalCount } = require('./_blink_client');
+const { strictParseArgs } = require('./_blink_client');
 
 // ── URLs ─────────────────────────────────────────────────────────────────────
 
@@ -43,14 +42,9 @@ const ARG_OPTIONS = {
 };
 
 function parseCliArgs(argv) {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    options: ARG_OPTIONS,
-    allowPositionals: true,
-    strict: true,
-  });
-  // PR #27 review: extra positionals are refused, not ignored.
-  if (!values.help) assertPositionalCount(positionals, 0, 1);
+  // Strict (PR #28 review): conflicting repeats and extra positionals are
+  // refused, and errors never echo argument values.
+  const { values, positionals } = strictParseArgs(argv, ARG_OPTIONS, { positionals: [0, 1] });
 
   if (values.help) {
     console.error(
