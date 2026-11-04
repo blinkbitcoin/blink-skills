@@ -502,7 +502,9 @@ async function main() {
   // Non-dry-run: the allowlist is EXCLUSIVE for every fetch (v2.6.1).
   // --dry-run is the documented ungated preview: the list may only relax the
   // SSRF guard there (FT7, v3.0.2 — it was enforced as exclusive).
-  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: args.dryRun });
+  // In relax-only mode the private/local exception is bound to the host the
+  // operator chose, never inherited by redirect or server-supplied hops (PR #25 review).
+  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: args.dryRun, operatorUrl: args.url });
   if (!args.dryRun) {
     // requireConfigured:false — an UNCONFIGURED allowlist leaves probing open
     // (the documented free-resource discovery mode; still SSRF-guarded, and
@@ -729,7 +731,8 @@ async function main() {
         res = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
         body = await res.text();
       } catch (err) {
-        if (err && err.code === 'URL_POLICY') throw err;
+        // EVERY failure here — transport or URL policy (a credentialed response
+        // redirecting to a forbidden host, PR #25 review) — is reported as JSON.
         const output = {
           event: 'l402_reuse_failed',
           url: args.url,
@@ -739,13 +742,16 @@ async function main() {
           backend: cached.backend ?? null,
           satoshis: cached.satoshis ?? null,
           error: describeFetchError(err),
+          ...(err && err.code ? { errorCode: err.code } : {}),
           message:
             'The cached L402 token was sent but the request failed before a response arrived; no payment was made. ' +
             'Re-run to retry with the same token, or pass --force to pay for a fresh one.',
         };
         console.log(JSON.stringify(output, null, 2));
-        process.exit(1);
-        return; // unreachable in production; guards against mocked process.exit in tests
+        // exitCode, not process.exit(): both entry points drain stdout before
+        // exiting, so a piped consumer always receives the whole JSON.
+        process.exitCode = 1;
+        return;
       }
 
       let data;
@@ -1297,7 +1303,9 @@ async function main() {
     retryRes = await fetchWithTimeout(challengeUrl, credentialedRequest(authHeader), 15_000, allowHosts);
     retryBody = await retryRes.text();
   } catch (err) {
-    if (err && err.code === 'URL_POLICY') throw err;
+    // The payment has SETTLED: every failure — transport or URL policy (a
+    // credentialed response redirecting to a forbidden host, PR #25 review) —
+    // must be reported as JSON, never as a stderr-only error.
     const notKept = args.noStore
       ? 'the token was not kept (--no-store)'
       : preimagePlaceholder
@@ -1323,6 +1331,7 @@ async function main() {
         ? { estimatedFeeSats: feeProbeResult.estimatedFeeSats, error: feeProbeResult.error }
         : undefined,
       error: describeFetchError(err),
+      ...(err && err.code ? { errorCode: err.code } : {}),
       message: tokenStored
         ? `The payment settled, but the request carrying the L402 credential failed. The token is cached for ${storeKey}: ` +
           're-run the same command to retry with it (no new payment).'
@@ -1330,8 +1339,8 @@ async function main() {
           're-running pays again.',
     };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
-    return; // unreachable in production; guards against mocked process.exit in tests
+    process.exitCode = 1; // see l402_reuse_failed: entry points flush stdout first
+    return;
   }
 
   let retryData;

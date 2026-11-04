@@ -1001,6 +1001,16 @@ describe('getRootKey — secure persistence', () => {
     assert.equal(m.getRootKey().toString('hex'), key.toString('hex'), 'persisted and reloaded');
   });
 
+  it('PR #25: refuses to read the key through a symlinked ~/.blink directory', () => {
+    setup();
+    const realDir = path.join(tmp, 'elsewhere-dir');
+    fs.mkdirSync(realDir);
+    fs.writeFileSync(path.join(realDir, 'l402-root-key'), 'cd'.repeat(32));
+    fs.symlinkSync(realDir, path.join(tmp, '.blink'));
+    const m = freshMac();
+    assert.throws(() => m.getRootKey(), /symlink/);
+  });
+
   it('refuses a symlinked key file instead of reading (or regenerating over) its target', () => {
     setup();
     fs.mkdirSync(path.join(tmp, '.blink'));

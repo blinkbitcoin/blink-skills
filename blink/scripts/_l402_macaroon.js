@@ -73,8 +73,19 @@ function getRootKey() {
   // every sold token, so it gets the same protection as the other state files
   // (0700 dir, 0600 file, symlink refusal, atomic write) — it used to be read
   // through symlinks and written with a plain mkdir + writeFile.
+  // The DIRECTORY must not be a symlink either (PR #25 review): hardening on
+  // read is best-effort, so its refusal used to be swallowed and the key was
+  // read through a symlinked ~/.blink. Check it explicitly, then harden.
+  const keyDir = path.dirname(ROOT_KEY_FILE);
   try {
-    ensureSecureStateDir(path.dirname(ROOT_KEY_FILE));
+    if (fs.lstatSync(keyDir).isSymbolicLink()) {
+      throw new Error(`Refusing to use ${keyDir}: it is a symlink.`);
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  try {
+    ensureSecureStateDir(keyDir);
   } catch {
     // Best-effort hardening on read (mirrors the token store).
   }

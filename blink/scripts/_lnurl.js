@@ -112,20 +112,35 @@ const L402_ALLOWLIST = Symbol('l402Allowlist');
  * for the URL guard (FT7, v3.0.2):
  *   - exclusive (default): only listed hosts may be fetched — every non-dry-run
  *     l402-pay request (v2.6.1). Refusals name the L402 allowlist.
- *   - relaxOnly: the list may only RELAX the SSRF guard (permit a listed
- *     private/local host) and never restricts public hosts — the documented
- *     ungated probes, l402-discover and l402-pay --dry-run.
+ *   - relaxOnly: the list never restricts public hosts — the documented
+ *     ungated probes, l402-discover and l402-pay --dry-run. Its only effect is
+ *     to RELAX the SSRF guard for the host the OPERATOR chose (`operatorUrl`),
+ *     and only if that host is listed (PR #25 review: an exception that every
+ *     hop inherited let any public probe redirect — or name a
+ *     payment_request_url — at an allowlisted private service). Redirect
+ *     targets and server-supplied URLs on any other host get no exception.
  * An unconfigured allowlist (null) stays null: behavior is unchanged.
  *
  * @param {Set<string>|string[]|null} hosts
- * @param {{ relaxOnly?: boolean }} [opts]
+ * @param {{ relaxOnly?: boolean, operatorUrl?: string }} [opts]  operatorUrl is
+ *        REQUIRED with relaxOnly (fail closed: never an unbound exception).
  * @returns {object|null} a value accepted wherever `allowedHosts` is
  */
-function l402Allowlist(hosts, { relaxOnly = false } = {}) {
+function l402Allowlist(hosts, { relaxOnly = false, operatorUrl } = {}) {
   if (!hosts) return null;
+  let set = hosts instanceof Set ? hosts : new Set(hosts);
+  if (relaxOnly) {
+    let operatorHost;
+    try {
+      operatorHost = new URL(String(operatorUrl)).hostname.toLowerCase();
+    } catch {
+      throw new Error('l402Allowlist: relaxOnly requires the operatorUrl the exception is bound to.');
+    }
+    set = set.has(operatorHost) ? new Set([operatorHost]) : new Set();
+  }
   return Object.freeze({
     [L402_ALLOWLIST]: true,
-    hosts: hosts instanceof Set ? hosts : new Set(hosts),
+    hosts: set,
     relaxOnly: Boolean(relaxOnly),
   });
 }

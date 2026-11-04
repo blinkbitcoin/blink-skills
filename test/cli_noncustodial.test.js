@@ -1587,6 +1587,34 @@ describe('CLI: l402-pay --spark lifecycle', () => {
     }
   });
 
+  // PR #25 review: the new failure events must reach a PIPED stdout intact
+  // through the real CLI (no hard process.exit racing the write). The server
+  // kills the connection on the credentialed request, as in FT7.
+  it('a connection killed after payment yields complete l402_paid_retry_failed JSON on piped stdout, exit 1', async () => {
+    const server = http.createServer((req, res) => {
+      if (/^L402 /.test(req.headers.authorization || '')) {
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+      res.end();
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payViaRaw(home, server.address().port);
+      assert.equal(res.code, 1, res.stderr);
+      const out = JSON.parse(res.stdout); // throws if truncated or empty
+      assert.equal(out.event, 'l402_paid_retry_failed');
+      assert.equal(out.backend, 'spark');
+      assert.equal(out.tokenStored, true);
+      assert.ok(out.error && out.error.length > 0);
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('a pre-3.0.1 host+path cache entry is never sent (origin unknown) — fresh payment instead', async () => {
     const s = await recordingServer();
     const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });

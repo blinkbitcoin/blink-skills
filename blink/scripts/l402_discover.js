@@ -310,7 +310,8 @@ async function main() {
   // FT7 (v3.0.2): discovery is the documented UNGATED prober — the budget
   // allowlist may only relax the SSRF guard here (permit a listed private/local
   // host), never restrict public hosts. It was passed as an exclusive list.
-  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: true });
+  // The private/local exception is bound to the host the operator chose (PR #25 review).
+  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: true, operatorUrl: args.url });
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
