@@ -709,3 +709,73 @@ describe('writeSecureFileAtomic exclusive create + cleanup (PR #27 review)', () 
     }
   });
 });
+
+// ═══ PR #28 review: no raw argument value in any refusal ════════════════════
+//
+// A --token / --macaroon / --preimage is reusable bearer material, and a seed
+// pasted by mistake as positionals must never be printed back. For EVERY entry
+// script: each declared single-value string option given twice with different
+// synthetic secrets, and (unless it takes free text) a secret as an extra
+// positional. For EVERY `blink` command: each string option given twice. The
+// refusal must happen (exit 1) and the secret must appear in neither stream.
+describe('refusals never echo argument values (manifest guard)', () => {
+  const SECRET = 'SYNTHSECRETzq81';
+
+  function spawnOut(argv) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-noecho-'));
+    return new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        argv,
+        {
+          env: {
+            ...process.env,
+            HOME: home,
+            BLINK_API_KEY: 'blink_test',
+            BLINK_API_URL: 'http://127.0.0.1:9/graphql',
+            BLINK_L402_ROOT_KEY: 'ab'.repeat(32),
+            SPARK_MNEMONIC: '',
+            BREEZ_API_KEY: '',
+          },
+          timeout: 15000,
+        },
+        (err, stdout, stderr) => {
+          fs.rmSync(home, { recursive: true, force: true });
+          resolve({ code: err ? err.code : 0, out: `${stdout}\n${stderr}` });
+        },
+      ),
+    );
+  }
+
+  for (const [script, spec] of Object.entries(ENTRY_MANIFEST)) {
+    if (spec.moduleOnly) continue;
+    const opts = load(script).ARG_OPTIONS || {};
+    const strings = Object.keys(opts).filter((k) => opts[k].type === 'string' && !opts[k].multiple);
+    it(`${script}: ${strings.length} conflicting string option(s)${spec.freeText ? '' : ' + an extra positional'}`, async () => {
+      const cases = strings.map((o) => [...spec.args, `--${o}`, `${SECRET}A`, `--${o}`, `${SECRET}B`]);
+      if (!spec.freeText) cases.push([...spec.args, SECRET]);
+      for (const args of cases) {
+        const res = await spawnOut([path.join(scriptsDir, script), ...args]);
+        assert.equal(res.code, 1, `${script} ${args.join(' ')} must be refused`);
+        assert.equal(res.out.includes(SECRET), false, `${script} ${args.join(' ')} echoed the value:\n${res.out}`);
+      }
+    });
+  }
+
+  it('every `blink` command: conflicting string options are refused without echoing the values', async () => {
+    const src = fs.readFileSync(binPath, 'utf8');
+    const problems = [];
+    let checked = 0;
+    for (const m of src.matchAll(/commands(?:\['([a-z0-9-]+)'\]|\.([a-z0-9]+)) = \{([\s\S]*?)\n\};/g)) {
+      const cmd = m[1] || m[2];
+      const optBlock = (m[3].match(/\n {2}options: \{([\s\S]*?)\n {2}\},/) || [])[1] || '';
+      for (const o of optBlock.matchAll(/^\s+'?([a-z][a-z0-9-]*)'?: \{ type: 'string'(?![^}]*multiple: true)/gm)) {
+        checked++;
+        const res = await spawnOut([binPath, cmd, `--${o[1]}`, `${SECRET}A`, `--${o[1]}`, `${SECRET}B`]);
+        if (res.code !== 1 || res.out.includes(SECRET)) problems.push(`${cmd} --${o[1]}: exit ${res.code}`);
+      }
+    }
+    assert.ok(checked > 20, `scanned ${checked} string options`);
+    assert.deepEqual(problems, []);
+  });
+});

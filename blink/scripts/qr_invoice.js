@@ -785,7 +785,13 @@ function renderInvoiceQr(invoice) {
   const pngBuf = renderQrToPng(qr, { border: 4, scale: 10 });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-qr-'));
   const pngPath = path.join(dir, 'invoice.png');
-  fs.writeFileSync(pngPath, pngBuf, { mode: 0o600, flag: 'wx' });
+  try {
+    fs.writeFileSync(pngPath, pngBuf, { mode: 0o600, flag: 'wx' });
+  } catch (e) {
+    // Leave nothing behind, not even a partial PNG (PR #28 review).
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
   console.error(`PNG saved: ${pngPath} (${pngBuf.length} bytes)`);
 
   return {

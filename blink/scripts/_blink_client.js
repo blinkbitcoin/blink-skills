@@ -661,13 +661,46 @@ function assertNoConflictingRepeats(tokens, options) {
       seen.set(t.name, { value, raw: t.rawName });
     } else if (seen.get(t.name).value !== value) {
       const first = seen.get(t.name);
+      // Name the option only — NEVER the values: a --token / --macaroon /
+      // --preimage is reusable bearer material (PR #28 review).
       throw argInvalid(
         isString
-          ? `Conflicting values for --${t.name} ('${first.value}', '${value}'): give it once`
+          ? `Conflicting values for --${t.name}: give it once`
           : `Conflicting options ${first.raw} and ${t.rawName}: give one`,
       );
     }
   }
+}
+
+/**
+ * Strict replacement for node:util.parseArgs, for scripts that read `values`
+ * directly (the L402 producer/directory scripts). Same `{ values, positionals }`
+ * result, plus what strictArgv guarantees: conflicting repeats refused,
+ * positional arity enforced (skipped for `--help`), ARG_INVALID errors that
+ * never echo argument values. PR #28 review: these scripts called parseArgs
+ * themselves, so `--resource /safe --resource /admin` kept the last value.
+ *
+ * @param {string[]} argv
+ * @param {Record<string, object>} options  parseArgs option config
+ * @param {{ positionals?: [number, number] }} [opts]  default [0, 0]
+ * @returns {{ values: Record<string, unknown>, positionals: string[] }}
+ */
+function strictParseArgs(argv, options, { positionals: arity = [0, 0] } = {}) {
+  let parsed;
+  try {
+    parsed = require('node:util').parseArgs({
+      args: argv,
+      options,
+      allowPositionals: true, // counted below, so no error ever quotes a positional
+      strict: true,
+      tokens: true,
+    });
+  } catch (err) {
+    throw argInvalid(String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, ''));
+  }
+  assertNoConflictingRepeats(parsed.tokens, options);
+  if (!parsed.values.help) assertPositionalCount(parsed.positionals, arity[0], arity[1]);
+  return { values: parsed.values, positionals: parsed.positionals };
 }
 
 function argInvalid(reason) {
@@ -688,7 +721,13 @@ function assertPositionalCount(list, min, max) {
   if (list.length >= min && list.length <= max) return;
   const range =
     min === max ? `${min}` : max === Infinity ? `at least ${min}` : min === 0 ? `at most ${max}` : `${min}–${max}`;
-  const extra = list.length > max ? `: unexpected argument(s) '${list.slice(max).join("', '")}'` : '';
+  // Position only, never the words (PR #28 review): a seed or token pasted
+  // by mistake as positionals must not be printed back.
+  const from = max + 1;
+  const extra =
+    list.length > max
+      ? ` (unexpected extra argument at position${list.length > from ? `s ${from}–${list.length}` : ` ${from}`})`
+      : '';
   throw argInvalid(`Expected ${range} positional argument(s), got ${list.length}${extra}`);
 }
 
@@ -971,6 +1010,7 @@ function exitAfterStdout(code) {
 
 module.exports = {
   strictArgv,
+  strictParseArgs,
   assertNoConflictingRepeats,
   assertPositionalCount,
   WALLET_ARG_OPTIONS,

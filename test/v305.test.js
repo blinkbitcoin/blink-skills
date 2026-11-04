@@ -179,3 +179,120 @@ describe('the blink CLI refuses conflicting repeats too', () => {
     assert.equal(r.code, 0, r.stderr);
   });
 });
+
+// ═══ PR #28 review ══════════════════════════════════════════════════════════
+
+// MEDIUM 1: the L402 scripts called node:util.parseArgs directly, so a
+// conflicting repeat silently kept the LAST value on direct invocation.
+describe('L402 direct parsers refuse conflicting repeats (PR #28 review)', () => {
+  const load = (n) => require(path.join(scriptsDir, n));
+  const PRE_A = 'a'.repeat(64);
+  const PRE_B = 'b'.repeat(64);
+  const refused = (e) => e.code === 'ARG_INVALID' && /conflict/i.test(e.message);
+
+  it('l402_challenge_create: --amount 10 --amount 999 / --resource /safe --resource /admin', () => {
+    const { parseCliArgs } = load('l402_challenge_create.js');
+    assert.throws(() => parseCliArgs(['--amount', '10', '--amount', '999']), refused);
+    assert.throws(() => parseCliArgs(['--amount', '10', '--resource', '/safe', '--resource', '/admin']), refused);
+    assert.throws(() => parseCliArgs(['--amount', '10', '--expiry', '60', '--expiry', '99999']), refused);
+  });
+
+  it('l402_payment_verify: two different --token / --resource values', () => {
+    const { parseCliArgs } = load('l402_payment_verify.js');
+    assert.throws(() => parseCliArgs(['--token', `AgEA:${PRE_A}`, '--token', `AgEB:${PRE_B}`]), refused);
+    assert.throws(() => parseCliArgs(['--token', `AgEA:${PRE_A}`, '--resource', '/x', '--resource', '/open']), refused);
+  });
+
+  it('l402_search: two different --source values', () => {
+    assert.throws(
+      () => load('l402_search.js').parseCliArgs(['--source', 'directory', '--source', '402index']),
+      refused,
+    );
+  });
+
+  it('controls: identical repeats and single values still parse', () => {
+    assert.equal(load('l402_challenge_create.js').parseCliArgs(['--amount', '10', '--amount', '10']).amountSats, 10);
+    assert.equal(load('l402_payment_verify.js').parseCliArgs(['--token', `AgEA:${PRE_A}`]).preimage, PRE_A);
+    assert.equal(load('l402_search.js').parseCliArgs(['weather', '--source', '402index']).source, '402index');
+    assert.equal(load('l402_info.js').parseCliArgs(['svc', '--report', '--report']).report, true);
+  });
+
+  it('tripwire: no script imports parseArgs from node:util except _blink_client.js', () => {
+    const offenders = fs
+      .readdirSync(scriptsDir)
+      .filter((f) => f.endsWith('.js') && f !== '_blink_client.js')
+      .filter((f) =>
+        /parseArgs\s*\}\s*=\s*require\(['"](node:)?util['"]\)|require\(['"](node:)?util['"]\)\.parseArgs/.test(
+          fs.readFileSync(path.join(scriptsDir, f), 'utf8'),
+        ),
+      );
+    assert.deepEqual(offenders, []);
+  });
+});
+
+// MEDIUM 2: validation errors must never echo raw argument values — a
+// --token / --macaroon / --preimage is reusable bearer material, and a seed
+// pasted by mistake as positionals must not be printed back.
+describe('validation errors never echo argument values (PR #28 review)', () => {
+  const { strictArgv, assertPositionalCount } = require(path.join(scriptsDir, '_blink_client.js'));
+  const SECRET = 'SYNTHSECRETvalue123';
+
+  it('conflicting repeats name the option only', () => {
+    assert.throws(
+      () => strictArgv(['--token', `${SECRET}A`, '--token', `${SECRET}B`], { token: { type: 'string' } }),
+      (e) => /--token/.test(e.message) && !e.message.includes(SECRET),
+    );
+  });
+
+  it('extra positionals report the count and position only', () => {
+    assert.throws(
+      () => assertPositionalCount(['ok', SECRET], 1, 1),
+      (e) => /position 2/.test(e.message) && !e.message.includes(SECRET),
+    );
+    assert.throws(
+      () => strictArgv(['word1', SECRET, 'word3'], {}, { positionals: [0, 0] }),
+      (e) => /position/.test(e.message) && !e.message.includes(SECRET) && !e.message.includes('word1'),
+    );
+  });
+
+  it('the blink CLI conflict message does not echo the values', async () => {
+    const res = await new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        [binPath, 'l402-verify', '--token', `${SECRET}A`, '--token', `${SECRET}B`],
+        { env: { ...process.env, HOME: os.tmpdir() }, timeout: 15000 },
+        (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: stdout + stderr }),
+      ),
+    );
+    assert.equal(res.code, 1);
+    assert.match(res.out, /Conflicting values for --token/);
+    assert.equal(res.out.includes(SECRET), false, 'no raw value in the output');
+  });
+});
+
+// LOW 3: a failed QR write must not leave the private directory behind.
+describe('QR write failure cleans up its private directory (PR #28 review)', () => {
+  it('a throwing writeFileSync leaves no blink-qr-* directory', () => {
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-qr-fail-'));
+    const saved = { tmpdir: process.env.TMPDIR, write: fs.writeFileSync, error: console.error };
+    process.env.TMPDIR = sandbox;
+    console.error = () => {};
+    const qrPath = require.resolve(path.join(scriptsDir, 'qr_invoice.js'));
+    delete require.cache[qrPath];
+    try {
+      const { renderInvoiceQr } = require(qrPath);
+      fs.writeFileSync = (p, ...rest) => {
+        if (String(p).endsWith('invoice.png')) throw Object.assign(new Error('ENOSPC simulated'), { code: 'ENOSPC' });
+        return saved.write(p, ...rest);
+      };
+      assert.throws(() => renderInvoiceQr(INVOICE), /ENOSPC/);
+      assert.deepEqual(fs.readdirSync(sandbox), [], 'no leftover blink-qr-* directory');
+    } finally {
+      fs.writeFileSync = saved.write;
+      console.error = saved.error;
+      if (saved.tmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved.tmpdir;
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+});
