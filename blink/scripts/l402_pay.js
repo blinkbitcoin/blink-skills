@@ -46,6 +46,7 @@ const {
   getWallet,
   formatBalance,
   MUTATION_TIMEOUT_MS,
+  strictArgv,
 } = require('./_blink_client');
 
 const {
@@ -207,7 +208,30 @@ async function runFeeProbe(invoice, { walletId, walletCurrency, apiKey, apiUrl }
 
 // ── Arg parsing ───────────────────────────────────────────────────────────────
 
+// Every option l402-pay accepts; anything else is refused (PR #26 review).
+const L402_PAY_OPTIONS = {
+  wallet: { type: 'string' },
+  'max-amount': { type: 'string' },
+  wait: { type: 'string' },
+  'dry-run': { type: 'boolean' },
+  method: { type: 'string' },
+  header: { type: 'string', multiple: true },
+  body: { type: 'string' },
+  'no-store': { type: 'boolean' },
+  force: { type: 'boolean' },
+  probe: { type: 'boolean' },
+  spark: { type: 'boolean' },
+};
+
 function parseArgs(argv) {
+  // Strict first: an unknown/malformed option (e.g. `--dry-run=true`, a
+  // valueless `--max-amount`) used to be silently dropped — refuse it.
+  try {
+    argv = strictArgv(argv, L402_PAY_OPTIONS);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   let url = null;
   let walletCurrency = 'BTC';
   let maxAmount = null;

@@ -139,7 +139,7 @@ npm link      # creates global 'blink' command
 blink --help  # verify
 ```
 
-> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`.
+> **Note:** `npm link` modifies global npm state. This is optional — all functionality is available by running scripts directly with `node {baseDir}/scripts/<script>.js`. The ClawHub-installed version does not require or use `npm link`. **Scripts that move money parse options strictly (v3.0.3):** `pay_invoice`, `pay_lnaddress`, `pay_lnurl`, `fee_probe`, `l402_pay`, `spark_send`, and `spark_fee_probe` accept `--opt value` and `--opt=value`. They **refuse**, with exit 1 and before anything is sent, an unknown or misspelled option (e.g. `--dryrun`), a missing value (a trailing `--max-amount`), and a value on a yes/no flag (`--dry-run=true`). Before v3.0.3, such arguments were silently ignored: a ceiling could vanish, or a dry run could become a real payment. The `blink` CLI already behaved this way.
 
 ## Agent Safety Policy
 
