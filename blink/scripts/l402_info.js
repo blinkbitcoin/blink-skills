@@ -129,10 +129,22 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((e) => {
-    console.error('Error:', e.message);
-    process.exit(1);
-  });
+  main()
+    .then(async () => {
+      // --report delegates to l402_pay, which may load the Spark SDK (open
+      // event-loop handles) and reports failures via process.exitCode, not a
+      // hard exit. Drain stdout, then exit with that code — the same tail as
+      // l402_pay's own direct entrypoint (PR #25 review).
+      await new Promise((resolve) => {
+        if (process.stdout.writableLength === 0) return resolve();
+        process.stdout.write('', () => resolve());
+      });
+      process.exit(process.exitCode || 0);
+    })
+    .catch((e) => {
+      console.error('Error:', e.message);
+      process.exit(1);
+    });
 }
 
 module.exports = { main, parseCliArgs, fetchServiceDetail, DIRECTORY_BASE };

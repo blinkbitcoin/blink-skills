@@ -29,6 +29,8 @@
 
 'use strict';
 
+const { exitAfterStdout } = require('./_blink_client');
+
 const fs = require('node:fs');
 const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
 const path = require('node:path');
@@ -119,6 +121,40 @@ function isLegacyKey(key) {
   return !/^https?:\/\//.test(key);
 }
 
+// ── Token expiry ──────────────────────────────────────────────────────────────
+
+/**
+ * Expiry (unix ms) from a plain-text first-party caveat in an L402 macaroon,
+ * or null. FT8: lightningenable tokens live ~1 h and carry `expires = <unix>`,
+ * but the store recorded expiresAt: null and replayed stale tokens (402).
+ * Recognized caveats: `expires=<unix>` and `<service>_valid_until=<unix>`
+ * (seconds, 9–11 digits; 13 digits = ms). The EARLIEST one wins. Third-party
+ * caveat ids are opaque bytes; a 10-digit `expires=` match in random bytes is
+ * negligible, and a false match can only make a token look EXPIRED (pay fresh,
+ * still budget-gated) — never extend it.
+ *
+ * @param {string} macaroon  base64 / base64url macaroon
+ * @returns {number|null}
+ */
+function macaroonExpiryMs(macaroon) {
+  if (typeof macaroon !== 'string' || !/^[A-Za-z0-9+/_=-]+$/.test(macaroon)) return null;
+  const text = Buffer.from(macaroon.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('latin1');
+  let earliest = null;
+  for (const m of text.matchAll(/(?:^|[^A-Za-z0-9])(?:expires|[A-Za-z0-9_]*valid_until)\s*=\s*(\d{9,13})(?!\d)/g)) {
+    const n = Number(m[1]);
+    const ms = m[1].length >= 13 ? n : n * 1000;
+    if (earliest === null || ms < earliest) earliest = ms;
+  }
+  return earliest;
+}
+
+/** An entry's expiry: the recorded one, else its macaroon's caveat (entries cached before 3.0.3). */
+function entryExpiresAt(entry) {
+  if (!entry) return null;
+  if (typeof entry.expiresAt === 'number') return entry.expiresAt;
+  return macaroonExpiryMs(entry.macaroon);
+}
+
 // ── Token operations ──────────────────────────────────────────────────────────
 
 /**
@@ -136,6 +172,8 @@ function saveToken(domain, tokenData) {
   const store = readStore();
   store[domain] = {
     ...tokenData,
+    // Record the server's own expiry when the caller did not pass one (FT8).
+    expiresAt: tokenData.expiresAt ?? macaroonExpiryMs(tokenData.macaroon),
     savedAt: Date.now(),
   };
   writeStore(store);
@@ -153,7 +191,8 @@ function getToken(domain) {
   const entry = store[domain];
   if (!entry) return null;
   // Check expiry
-  if (entry.expiresAt && Date.now() > entry.expiresAt) {
+  const expiresAt = entryExpiresAt(entry);
+  if (expiresAt && Date.now() > expiresAt) {
     return null; // expired
   }
   return entry;
@@ -169,8 +208,9 @@ function listTokens() {
   const store = readStore();
   return Object.entries(store).map(([domain, entry]) => {
     const now = Date.now();
-    const expired = entry.expiresAt ? now > entry.expiresAt : false;
-    const expiresInMs = entry.expiresAt ? entry.expiresAt - now : null;
+    const expiresAtMs = entryExpiresAt(entry);
+    const expired = expiresAtMs ? now > expiresAtMs : false;
+    const expiresInMs = expiresAtMs ? expiresAtMs - now : null;
     return {
       domain,
       legacy: isLegacyKey(domain),
@@ -180,7 +220,7 @@ function listTokens() {
       invoiceMsats: entry.invoiceMsats ?? null,
       budgetSats: entry.budgetSats ?? null,
       savedAt: entry.savedAt ? new Date(entry.savedAt).toISOString() : null,
-      expiresAt: entry.expiresAt ? new Date(entry.expiresAt).toISOString() : null,
+      expiresAt: expiresAtMs ? new Date(expiresAtMs).toISOString() : null,
       expired,
       expiresIn: !expired && expiresInMs !== null ? `${Math.round(expiresInMs / 1000)}s` : null,
     };
@@ -206,7 +246,8 @@ function clearTokens({ expiredOnly = false } = {}) {
   }
 
   for (const [domain, entry] of Object.entries(store)) {
-    if (entry.expiresAt && now > entry.expiresAt) {
+    const expiresAt = entryExpiresAt(entry);
+    if (expiresAt && now > expiresAt) {
       delete store[domain];
       removed++;
     }
@@ -251,7 +292,8 @@ function main() {
     if (!entry) {
       console.error(`No valid token found for: ${domain}`);
       console.log(JSON.stringify({ domain, found: false }, null, 2));
-      process.exit(0);
+      exitAfterStdout(0); // flush piped stdout first (v3.0.3 sweep)
+      return;
     }
     const output = {
       domain,
@@ -263,7 +305,7 @@ function main() {
       invoiceMsats: entry.invoiceMsats ?? null,
       budgetSats: entry.budgetSats ?? null,
       savedAt: entry.savedAt ? new Date(entry.savedAt).toISOString() : null,
-      expiresAt: entry.expiresAt ? new Date(entry.expiresAt).toISOString() : null,
+      expiresAt: entryExpiresAt(entry) ? new Date(entryExpiresAt(entry)).toISOString() : null,
     };
     console.log(JSON.stringify(output, null, 2));
     return;
@@ -294,6 +336,7 @@ module.exports = {
   getToken,
   storeKeyFor,
   isLegacyKey,
+  macaroonExpiryMs,
   listTokens,
   clearTokens,
   STORE_FILE,

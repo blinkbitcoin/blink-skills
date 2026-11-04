@@ -51,7 +51,7 @@
 
 const { parseArgs } = require('node:util');
 
-const { getApiKey, getApiUrl, graphqlRequest, getAllWallets } = require('./_blink_client');
+const { getApiKey, getApiUrl, graphqlRequest, getAllWallets, exitAfterStdout } = require('./_blink_client');
 
 const { getRootKey, decodeMacaroon, checkCaveats, verifyPreimage } = require('./_l402_macaroon');
 
@@ -217,7 +217,8 @@ async function main() {
       error: e.message,
     };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
+    exitAfterStdout(1); // flush piped stdout first (v3.0.3 sweep)
+    return;
   }
 
   const { signatureValid, paymentHash, expiresAt, resource } = decoded;
@@ -268,7 +269,8 @@ async function main() {
   }
 
   console.log(JSON.stringify(output, null, 2));
-  process.exit(valid ? 0 : 1);
+  exitAfterStdout(valid ? 0 : 1); // flush piped stdout first (v3.0.3 sweep)
+  return;
 }
 
 if (require.main === module) {

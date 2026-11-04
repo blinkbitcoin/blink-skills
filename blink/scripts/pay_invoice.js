@@ -2,7 +2,7 @@
 /**
  * Blink Wallet - Pay Lightning Invoice
  *
- * Usage: node pay_invoice.js <bolt11_invoice> [--wallet BTC|USD]
+ * Usage: node pay_invoice.js <bolt11_invoice> [--wallet BTC|USD] [--max-amount <sats>] [--dry-run] [--force]
  *
  * Pays a BOLT-11 Lightning invoice from the BTC or USD wallet.
  * Automatically resolves the wallet ID from the account.
@@ -10,6 +10,8 @@
  * Arguments:
  *   bolt11_invoice  - Required. The BOLT-11 payment request string (lnbc...).
  *   --wallet        - Optional. Wallet to pay from: BTC (default) or USD.
+ *   --max-amount    - Optional. Refuse (before any API call) if the invoice
+ *                     charges more than N sats. --force does not bypass it.
  *
  * Environment:
  *   BLINK_API_KEY  - Required. Blink API key (format: blink_...)
@@ -49,16 +51,36 @@ const PAY_INVOICE_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, dryRun, force, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
   const rawInvoice = remaining[0];
 
   if (!rawInvoice) {
-    console.error('Usage: node pay_invoice.js <bolt11_invoice> [--wallet BTC|USD] [--dry-run] [--force]');
+    console.error(
+      'Usage: node pay_invoice.js <bolt11_invoice> [--wallet BTC|USD] [--max-amount <sats>] [--dry-run] [--force]',
+    );
     process.exit(1);
   }
 
   const paymentRequest = normalizeInvoice(rawInvoice);
   warnIfNotBolt11(paymentRequest);
+
+  // ── Amount ceiling (--max-amount) ──
+  // ClawHub 3.0.2 scan (concern): the shared parser accepted --max-amount and
+  // this script discarded it, so the ceiling was silently ignored. Enforced
+  // here BEFORE any API call, on dry-run too, and NOT bypassed by --force. The
+  // charge is the budget's conservative one (ceil, ≥ 1 sat). An amount that
+  // cannot be decoded cannot be bounded, so a requested ceiling fails closed.
+  const charge = budgetChargeFromInvoice(paymentRequest);
+  if (maxAmount !== null) {
+    if (charge.budgetSats === null) {
+      throw new Error(
+        `Refusing to pay: cannot enforce --max-amount ${maxAmount} because the invoice amount could not be decoded.`,
+      );
+    }
+    if (charge.budgetSats > maxAmount) {
+      throw new Error(`Invoice amount ${charge.budgetSats} sats exceeds --max-amount ceiling of ${maxAmount} sats.`);
+    }
+  }
 
   const apiKey = getApiKey();
   const apiUrl = getApiUrl();
@@ -100,7 +122,6 @@ async function main() {
   // is skipped then — the API enforces wallet limits for those), otherwise
   // max(1, ceil(msats/1000)). Any positive decodable amount charges at least
   // 1 sat, so explicit payments can never move funds untracked.
-  const charge = budgetChargeFromInvoice(paymentRequest);
   const invoiceSats = charge.budgetSats;
   if (invoiceSats !== null && charge.msats !== null && charge.msats % 1000 !== 0) {
     console.error(`Note: budget charges ${invoiceSats} sats conservatively for this fractional/sub-satoshi invoice.`);

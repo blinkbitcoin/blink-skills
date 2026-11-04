@@ -1,13 +1,13 @@
 ---
 name: blink-wallet
 description: Bitcoin Lightning wallet for agents — balances, invoices, payments, BTC/USD swaps, QR codes, price conversion, transaction history, non-custodial (Spark) accounts, and L402 auto-pay client via the Blink API. All output is JSON.
-version: 3.0.2
+version: 3.0.3
 repository: https://github.com/blinkbitcoin/blink-skills
 metadata:
   oa:
     project: blink
     identifier: blink-wallet
-    version: '3.0.2'
+    version: '3.0.3'
     expires_at_unix: 1798761600
     capabilities:
       - http:outbound
@@ -326,13 +326,14 @@ Checks the payment status of a Lightning invoice by its payment hash. Use after 
 ### Pay Lightning Invoice
 
 ```bash
-blink pay-invoice <bolt11_invoice> [--wallet BTC|USD]
+blink pay-invoice <bolt11_invoice> [--wallet BTC|USD] [--max-amount <sats>]
 ```
 
 Pays a BOLT-11 Lightning invoice from the BTC or USD wallet. Returns payment status: `SUCCESS`, `PENDING`, `FAILURE`, or `ALREADY_PAID`. The wallet ID is resolved automatically.
 
 - `bolt11_invoice` — the BOLT-11 payment request string, e.g. `lnbc...` (required)
 - `--wallet BTC|USD` — wallet to pay from (default: BTC). When USD is selected, the Blink API debits the USD equivalent from the USD wallet.
+- `--max-amount <sats>` — refuse, **before any API call**, if the invoice charges more than N sats (the same conservative charge the budget uses: rounded up, at least 1 sat). Applies to `--dry-run` too and is **not** bypassed by `--force`. If the invoice amount can't be decoded, a requested ceiling refuses the payment. Before v3.0.3 the script silently ignored this flag (and `blink pay-invoice` didn't accept it).
 
 **Requires Write scope on the API key.**
 
@@ -1213,7 +1214,7 @@ Both backends share the same budget reservation/enforcement, token cache, and re
 - `--body <string>` — request body for POST/PUT
 - `--no-store` — disable token cache (do not read or write `~/.blink/l402-tokens.json`). It applies to **this run only**: if a request after payment fails, that payment's token is gone (re-running pays again). And if the server later re-issues the **same** already-paid invoice, a run *without* `--no-store` recovers that preimage from your transaction history and caches it.
 - `--force` — pay even if a valid cached token exists
-- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there). With `--dry-run` (v3.0.2) it also runs, without paying, and adds `feeProbe` to `l402_dry_run` (custodial only, needs `BLINK_API_KEY`; for `--spark`, use `blink spark-fee-probe <invoice> <amount>`). **The probe is an estimate:** in FT7 it estimated 1 sat while the actual routing fee was 10 sats on a 1–2 sat invoice. Neither budgets nor `--max-amount` count the fee, so for tiny invoices the fee can be several times the price.
+- `--probe` — estimate the routing fee before paying; warns and continues if the probe fails; adds a `feeProbe` field to the `l402_paid` output (custodial: `lnInvoiceFeeProbe`; spark: the prepare step always resolves the fee, so `--probe` is a no-op there). With `--dry-run` (v3.0.2) it also runs, without paying, and adds `feeProbe` to `l402_dry_run` (custodial only, needs `BLINK_API_KEY`; for `--spark`, use `blink spark-fee-probe <invoice> <amount>`). **The probe is an estimate, and its accuracy depends on the backend:** in the field tests the **custodial** probe estimated 1 sat while the actual routing fee was 10 sats on a 1–2 sat invoice (FT7), whereas the **Spark** probe matched exactly (3 sats, FT8). Neither budgets nor `--max-amount` count the fee, so for tiny invoices the fee can be several times the price.
 
 **Requires Write scope on the API key (custodial backend) or `SPARK_MNEMONIC` + `BREEZ_API_KEY` (spark backend).**
 
@@ -1235,6 +1236,8 @@ blink l402-store clear [--expired]
 Token cache location: `~/.blink/l402-tokens.json`
 
 **Origin isolation (v3.0.1):** tokens are keyed by the **origin** (scheme + host + port) + path of the URL that **actually issued the 402**, e.g. `https://api.example.com/v1/data`, and a cached token is only ever sent directly back to that URL. That is not necessarily the URL you passed: if a service redirects the request (even only for some methods, e.g. it answers `HEAD` itself but redirects `GET`), the token belongs to the redirect target, and `l402_paid` reports it as `challengeUrl`. Operator `--header`s are withheld from a different issuing origin, and a `--body` request whose 402 came from a different origin is refused (`URL_POLICY`) before paying. The credentialed retry repeats **exactly the request that received the 402** (same method, headers and body) with the L402 `Authorization` added, and is never rebuilt from your original flags. That includes HTTP redirect rewrites: 301/302 turn `POST` into `GET`, and 303 turns any non-`GET`/`HEAD` method into `GET`. It also covers header state along the chain: once a redirect leaves the origin, your `--header`s are dropped for the rest of the chain, even if it comes back, and a rewrite that drops the body also drops its `Content-Type`. An operator `--header Authorization` is never sent with the paid credential; the L402 token replaces it, with a warning on stderr. If such a rewrite **drops your `--body`**, the request is refused (`URL_POLICY`) before paying, on any origin, because the challenged request is no longer the one you invoked. Call the issuing URL directly instead. A 307/308 keeps the method and body, so those work as before. Each run first makes one credential-free request to learn which URL issues the challenge, so cache reuse costs one extra round trip. Before v3.0.1 the key was host + path, so a token could be replayed to a different service on another port of the same host. (Replay from `https` to plaintext `http` was possible only for local hosts such as `127.0.0.1`/`localhost`, or before v2.6.1: since v2.6.1 the URL guard refuses plaintext `http` to any other host before sending anything.) Entries written by older versions have no scheme; `list` flags them `legacy: true` and they are **never reused** (the next request pays fresh). Run `blink l402-store clear` to remove them.
+
+**Server-set expiry is honored (v3.0.3).** Many L402 services put an expiry in the macaroon itself, e.g. `expires = <unix>` (FT8: lightningenable tokens last about an hour). The cache now reads that caveat (`expires=` or `<service>_valid_until=`), when saving and for entries cached before v3.0.3, and treats an expired token as absent. The next request pays for a fresh token (still subject to budget and allowlist) instead of replaying a stale one and getting a 402. `l402-store list` shows these tokens as `expired: true`, and `clear --expired` removes them.
 
 **Failures after a credential is sent always emit JSON (v3.0.2).** If the request carrying the L402 credential dies before a response arrives (FT7: `terminated`, caused by a server's undecodable compressed reply), `l402-pay` exits 1 with:
 - `l402_paid_retry_failed` — the payment **settled** but the paid retry failed. Includes `paymentStatus`, `paymentHash`, `satoshis`, `tokenStored`, `error`, and `errorCode` when the failure was a policy refusal (`URL_POLICY`, e.g. the credentialed response redirected to a host outside the allowlist). With `tokenStored: true`, re-running the same command retries with the cached token without paying again; with `tokenStored: false` (`--no-store`, a placeholder preimage, or a failed cache write), re-running pays again.
@@ -1336,7 +1339,7 @@ Creates a Lightning invoice via Blink and issues a signed macaroon bound to its 
 - `--amount <sats>` — invoice amount in satoshis (required)
 - `--wallet <id>` — Blink BTC wallet ID (auto-resolved if omitted)
 - `--memo <text>` — invoice memo / description
-- `--expiry <seconds>` — macaroon caveat expiry (e.g. `3600` = 1 hour); controls how long the challenge is valid, not the invoice expiry
+- `--expiry <seconds>` — macaroon caveat expiry (e.g. `3600` = 1 hour); controls how long the challenge is valid, not the invoice expiry. **Recommended:** without it the token **never expires** (`expiresAt: null`), so a paid token grants access indefinitely. Set an expiry that matches what you are selling.
 - `--resource <id>` — resource identifier caveat (e.g. `/api/v1/data`); returned tokens will only be valid for this exact path
 
 **Requires Write scope on the API key.**

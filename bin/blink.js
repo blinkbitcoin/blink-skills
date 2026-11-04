@@ -93,9 +93,14 @@ commands['pay-invoice'] = {
     wallet: { type: 'string', short: 'w', default: 'BTC' },
     'dry-run': { type: 'boolean', default: false },
     force: { type: 'boolean', default: false },
+    'max-amount': { type: 'string' },
   },
   optMeta: {
     wallet: { description: 'Wallet to pay from', valueName: 'currency' },
+    'max-amount': {
+      description: 'Refuse if the invoice charges more than this (sats); checked before any API call',
+      valueName: 'sats',
+    },
     'dry-run': { description: 'Show what would be sent without executing the payment' },
     force: { description: 'Skip balance sufficiency check' },
   },
@@ -103,9 +108,15 @@ commands['pay-invoice'] = {
     'blink pay-invoice lnbc10u1p...',
     'blink pay-invoice lnbc10u1p... --wallet USD',
     'blink pay-invoice lnbc10u1p... --dry-run',
+    'blink pay-invoice lnbc10u1p... --max-amount 1000',
   ],
   action: async (pos, opts) => {
     const argv = [pos[0], '--wallet', opts.wallet];
+    // Only the script can decode the invoice amount, so the ceiling is passed
+    // through (ClawHub 3.0.2 scan: it was not even an accepted option here).
+    if (opts['max-amount'] != null) {
+      argv.push('--max-amount', String(parseSats(opts['max-amount'], '--max-amount')));
+    }
     if (opts['dry-run']) argv.push('--dry-run');
     if (opts.force) argv.push('--force');
     setProcessArgv(argv);

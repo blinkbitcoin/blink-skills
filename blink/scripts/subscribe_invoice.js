@@ -17,7 +17,14 @@
  *   BLINK_API_URL  - Optional. Override API endpoint (default: https://api.blink.sv/graphql)
  */
 
-const { getApiKey, getWsUrl, normalizeInvoice, requireWebSocket, subscribeToInvoice } = require('./_blink_client');
+const {
+  getApiKey,
+  getWsUrl,
+  normalizeInvoice,
+  requireWebSocket,
+  subscribeToInvoice,
+  exitAfterStdout,
+} = require('./_blink_client');
 
 function parseArgs(argv) {
   let invoice = null;
@@ -64,7 +71,8 @@ function main() {
     timeoutSeconds: args.timeoutSeconds,
     onResult(result, exitCode) {
       console.log(JSON.stringify(result, null, 2));
-      process.exit(exitCode);
+      exitAfterStdout(exitCode); // flush piped stdout first (v3.0.3 sweep)
+      return;
     },
   });
 }

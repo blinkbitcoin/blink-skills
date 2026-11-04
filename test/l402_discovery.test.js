@@ -389,3 +389,31 @@ describe('l402_info --report enforcement delegation', () => {
     );
   });
 });
+
+// ── Direct entrypoint lifecycle (PR #25 review, LOW) ─────────────────────────
+//
+// `blink l402-info --report` is forceExit, but running l402_info.js DIRECTLY
+// only exited when main() rejected. l402_pay now sets process.exitCode and
+// returns (stdout-safe), so a Spark-backed failure left the SDK's handles
+// open and the direct script hung. It must drain stdout and exit like
+// l402_pay's own direct entrypoint.
+describe('l402_info direct entrypoint', () => {
+  it('exits promptly with the delegated exit code and complete stdout, despite a lingering handle', async () => {
+    const { execFile } = require('node:child_process');
+    const script = path.join(__dirname, '..', 'blink', 'scripts', 'l402_info.js');
+    const stub = path.join(__dirname, 'fixtures', 'l402_pay_lingering_stub.js');
+    const started = Date.now();
+    const res = await new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        ['--require', stub, script, 'deadbeef', '--report'],
+        { timeout: 8000, killSignal: 'SIGKILL' },
+        (err, stdout) => resolve({ err, code: err ? err.code : 0, killed: Boolean(err && err.killed), stdout }),
+      ),
+    );
+    assert.equal(res.killed, false, 'must not hang on the lingering handle');
+    assert.ok(Date.now() - started < 6000);
+    assert.equal(res.code, 1, 'the delegated exitCode is the process exit code');
+    assert.equal(JSON.parse(res.stdout).event, 'l402_paid_retry_failed');
+  });
+});

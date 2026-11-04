@@ -817,7 +817,28 @@ function subscribeToInvoice({ paymentRequest, apiKey, wsUrl, timeoutSeconds, onR
 
 // ── Exports ──────────────────────────────────────────────────────────────────
 
+/**
+ * Exit with `code` only after buffered stdout has been flushed.
+ *
+ * process.exit() right after console.log() can cut a PIPED stdout mid-write
+ * (PR #25 review: 8 MiB of JSON arrived as 146 KB). Commands that must exit
+ * explicitly — e.g. to tear down a WebSocket subscription — call this instead,
+ * and `return` right after it (the exit may happen on a later tick).
+ * Synchronous when nothing is buffered, so tests that trap process.exit see
+ * the code immediately.
+ *
+ * @param {number} code
+ */
+function exitAfterStdout(code) {
+  if (process.stdout.writableLength === 0) {
+    process.exit(code);
+    return;
+  }
+  process.stdout.write('', () => process.exit(code));
+}
+
 module.exports = {
+  exitAfterStdout,
   // Constants
   DEFAULT_API_URL,
   DEFAULT_TIMEOUT_MS,

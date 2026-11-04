@@ -71,6 +71,12 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
   - Live custodial routing fees were ~10 sats on 1–2 sat invoices while the fee probe estimated 1. Size the cap on the **wallet** drop, not the budget (which counts price only).
   - Verify an endpoint's required query parameters before paying: a 400 after payment burns the sats (and with `--no-store`, the token too). The reliable test endpoint is `https://api.lightningenable.com/l402/test/ping` (1 sat).
   - Never prescribe a flag combination you haven't checked in the code (FT7: `--dry-run --probe` was a no-op).
+- FT8 (v3.0.2) lessons:
+  - **Test tokens expire** (~1 h on lightningenable, `expires = <unix>` caveat). A reuse step must run within the hour of the payment that created the token; tokens left from an earlier round are stale (an expired reuse correctly yields `l402_error`, no auto-repay).
+  - **Redaction must cover nested fields.** Server bodies land in `data.*` (FT8 printed an unpaid challenge macaroon from `data`). Redact the whole JSON tree, not the top level.
+  - **Never pipe a script that pays into a filter** (a failing `sed` can kill the script mid-flow). Write output to a `0600` file first, then redact.
+  - Spark's fee probe matched the actual fee (3 sats); the custodial probe under-estimated (1 vs 10). Size caps on the worst case.
+- **Read the ClawScan report after every publish, not just the moderation verdict.** Moderation can be *clean* while the detailed ClawScan verdict raises a real concern: 3.0.1's flagged the verifier's `--resource` fail-open, and 3.0.2's flagged `pay_invoice` silently ignoring `--max-amount`. `clawhub scan download blink-wallet --version X.Y.Z` → `clawscan.json` → check `dimensions[].rating == "concern"`, and verify each against the code.
 
 ## Open upstream items
 
