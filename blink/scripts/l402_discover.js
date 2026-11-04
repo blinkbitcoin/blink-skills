@@ -149,7 +149,11 @@ async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000, a
     // Response shape: { invoice: "lnbc...", ... } or { payment_request: "lnbc..." }
     const invoice = data.invoice || data.payment_request || null;
     return invoice ? { invoice, offerId: data.offer_id || null } : null;
-  } catch {
+  } catch (err) {
+    // A policy refusal raised INSIDE the walker (a hostile redirect hop, or a
+    // name resolving to a private address) must fail loud too — it was
+    // swallowed into the graceful null (PR #25 review round 2).
+    if (err && err.code === 'URL_POLICY') throw err;
     return null;
   }
 }

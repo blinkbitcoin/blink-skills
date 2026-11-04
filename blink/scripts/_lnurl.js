@@ -41,6 +41,75 @@ const MAX_REDIRECTS = 3;
 // would accept `localhost.attacker.example`.
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
+// Loopback NAMES beyond the canonical spellings (PR #25 review round 2): the
+// common /etc/hosts IPv6 aliases, and RFC 6761 `*.localhost`, which resolvers
+// must answer with loopback. Classified as local without consulting DNS.
+const LOCAL_NAME_ALIASES = new Set(['ip6-localhost', 'ip6-loopback', 'localhost.localdomain']);
+
+/** Is this (normalized) hostname a local/loopback name or literal? */
+function isLocalName(host) {
+  return LOCAL_HOSTS.has(host) || LOCAL_NAME_ALIASES.has(host) || host.endsWith('.localhost');
+}
+
+/** Is this (normalized) hostname an IP literal (v4 dotted or bracketed v6)? */
+function isIpLiteral(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^\[.*\]$/.test(host) || host.includes(':');
+}
+
+// Per-URL guard decision, consumed by the resolved-address check below.
+const GUARD_DECISION = Symbol('guardDecision');
+
+const dns = require('node:dns');
+// Test seam: a resolver installed under this registry key replaces DNS (the
+// in-process suites must never query real DNS). It is a process-global
+// Symbol.for key so it survives module reloads; only in-process code can set
+// it, and in-process code could patch fetch/dns directly anyway.
+const TEST_RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+
+function resolveHost(host) {
+  const stub = globalThis[TEST_RESOLVER];
+  if (typeof stub === 'function') return stub(host);
+  return dns.promises.lookup(host, { all: true, verbatim: true });
+}
+
+/**
+ * Refuse a NAME that resolves to a private / loopback / link-local / metadata
+ * address (PR #25 review round 2). The string checks in assertAllowedUrl can
+ * only classify literals and known local names; any other name — an alias
+ * like ip6-localhost, or attacker DNS such as 127.0.0.1.nip.io — passed them
+ * in every mode, including the default no-allowlist one. Exempt: IP literals
+ * (already classified), hosts the operator explicitly allowed (exclusive list
+ * entry, or the operator's own host under relax-only), and local names that
+ * assertAllowedUrl deliberately permitted (the LNURL regtest localhost).
+ * A failed lookup is not a refusal: nothing resolves, so the fetch fails too.
+ *
+ * Residual limitation: the fetch resolves the name again, so a DNS answer
+ * that changes between this check and the connection (rebinding) is not
+ * caught; pinning the checked address needs a custom dispatcher that core
+ * Node does not expose without the undici package.
+ *
+ * @param {URL} url  a URL returned by assertAllowedUrl
+ * @param {string} what  label for the error message
+ */
+async function assertResolvedAddressesAllowed(url, what) {
+  const decision = url[GUARD_DECISION];
+  if (!decision || decision.exempt) return;
+  let addresses;
+  try {
+    addresses = await resolveHost(decision.host);
+  } catch {
+    return;
+  }
+  for (const entry of addresses || []) {
+    const address = entry && (entry.address || entry);
+    if (isPrivateAddress(String(address))) {
+      throw policyError(
+        `Refusing to fetch ${what} from '${decision.host}': it resolves to the private address ${address}.`,
+      );
+    }
+  }
+}
+
 /**
  * Is this hostname a literal IP address in a private / loopback / link-local
  * range? Defence in depth behind the host allowlist: if an allowed host ever
@@ -166,8 +235,10 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
     throw policyError(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
   }
 
-  const host = url.hostname.toLowerCase();
-  const isLocal = LOCAL_HOSTS.has(host);
+  // Normalize: lowercase and strip a trailing root dot ('localhost.' is
+  // 'localhost'), so every check below sees one spelling (PR #25 review r2).
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  const isLocal = isLocalName(host);
 
   // Being a local host is NOT itself a licence to be fetched. Treating it as
   // one would let a hostile LNURL response name `http://127.0.0.1:6379/` (or
@@ -203,7 +274,7 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   if (isPrivateAddress(host) && !explicitlyAllowed) {
     throw policyError(`Refusing to fetch ${what} from private address '${host}'.`);
   }
-  if (opts.strictLocal && LOCAL_HOSTS.has(host) && !explicitlyAllowed) {
+  if (opts.strictLocal && isLocal && !explicitlyAllowed) {
     throw policyError(`Refusing to fetch ${what} from local host '${host}' (not allowlisted).`);
   }
 
@@ -217,6 +288,9 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
     throw policyError(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
   }
 
+  Object.defineProperty(url, GUARD_DECISION, {
+    value: { host, exempt: explicitlyAllowed || isLocal || isIpLiteral(host) },
+  });
   return url;
 }
 
@@ -387,6 +461,9 @@ async function fetchWithRetry(
   const overallDeadline = Date.now() + timeoutMs * (retries + 1) * (MAX_REDIRECTS + 1);
 
   for (let hop = 0; ; hop++) {
+    // Every hop — the first URL and each redirect target — is checked against
+    // the addresses its NAME resolves to, before any request is sent to it.
+    await assertResolvedAddressesAllowed(current, hop === 0 ? what : `${what} redirect target`);
     let lastErr;
     let res = null;
 

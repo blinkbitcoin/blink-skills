@@ -17,6 +17,7 @@
 
 const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+require('./fixtures/public_dns_stub'); // never query real DNS (resolved-address guard)
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -2682,7 +2683,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
 
   // PR #25 review (Medium): relax-only probing must not let a public server
   // pivot to an allowlisted PRIVATE host via a redirect or payment_request_url.
-  function pivotFetch({ via }) {
+  function pivotFetch({ via, target = 'http://127.0.0.1:6379' }) {
     global.fetch = async (url) => {
       const u = String(url);
       requestedUrls.push(u);
@@ -2691,11 +2692,11 @@ describe('l402_pay enforcement (non-dry-run)', () => {
           return {
             status: 302,
             url: u,
-            headers: { get: (n) => (n.toLowerCase() === 'location' ? 'http://127.0.0.1:6379/x' : null) },
+            headers: { get: (n) => (n.toLowerCase() === 'location' ? `${target}/x` : null) },
             text: async () => '',
           };
         }
-        const body = { version: '0.2', payment_request_url: 'http://127.0.0.1:6379/pay', offers: [] };
+        const body = { version: '0.2', payment_request_url: `${target}/pay`, offers: [] };
         return {
           status: 402,
           ok: false,
@@ -2733,7 +2734,8 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     }
   }
 
-  const loopbackHit = () => requestedUrls.some((u) => u.includes('127.0.0.1'));
+  const loopbackHit = () =>
+    requestedUrls.some((u) => /127\.0\.0\.1|ip6-localhost|ip6-loopback|rebind\.example/.test(u));
 
   it('PR #25: l402-discover — a public redirect cannot pivot to an allowlisted private host', async () => {
     process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
@@ -2749,6 +2751,42 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     const err = await runDiscover('https://attacker.example/start');
     assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
     assert.equal(loopbackHit(), false, 'the loopback service is never requested');
+  });
+
+  // PR #25 review round 2: loopback ALIASES and names that RESOLVE to loopback.
+  for (const target of ['https://ip6-localhost:6379', 'https://ip6-loopback:6379', 'https://rebind.example:6379']) {
+    for (const via of ['redirect', 'payment_request_url']) {
+      it(`PR #25 r2: l402-discover — a public ${via} to ${target} receives no request`, async () => {
+        process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
+        const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+        const prev = globalThis[RESOLVER];
+        globalThis[RESOLVER] = async (h) =>
+          h === 'rebind.example' ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.215.14', family: 4 }];
+        try {
+          pivotFetch({ via, target });
+          const err = await runDiscover('https://attacker.example/start');
+          assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+          assert.equal(loopbackHit(), false, 'the loopback alias is never requested');
+        } finally {
+          globalThis[RESOLVER] = prev;
+        }
+      });
+    }
+  }
+
+  it('PR #25 r2: with NO allowlist (the default), a public redirect to a name resolving to loopback is refused', async () => {
+    const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+    const prev = globalThis[RESOLVER];
+    globalThis[RESOLVER] = async (h) =>
+      h === 'rebind.example' ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.215.14', family: 4 }];
+    try {
+      pivotFetch({ via: 'redirect', target: 'https://rebind.example:6379' });
+      const err = await runDiscover('https://attacker.example/start');
+      assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+      assert.equal(loopbackHit(), false);
+    } finally {
+      globalThis[RESOLVER] = prev;
+    }
   });
 
   it('PR #25: l402-pay --dry-run — a public payment_request_url cannot pivot to an allowlisted private host', async () => {
@@ -2885,6 +2923,121 @@ describe('security: L402 allowlist policy (v3.0.2)', () => {
   it('no configured allowlist stays null (unchanged behavior)', () => {
     assert.equal(l402Allowlist(null), null);
     assert.equal(l402Allowlist(null, { relaxOnly: true, operatorUrl: 'https://a.example/' }), null);
+  });
+});
+
+// PR #25 review round 2 (Medium): the guard classified HOSTNAME STRINGS only,
+// so any name that RESOLVES to a private address passed — loopback aliases
+// (ip6-localhost, localhost., *.localhost) and attacker DNS (127.0.0.1.nip.io)
+// alike, in every mode incl. the default no-allowlist one (since v2.6.1).
+// The walker now checks the resolved addresses of every name it fetches.
+describe('security: resolved-address guard (v3.0.2)', () => {
+  const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+  const { l402Allowlist } = require(path.join(scriptsDir, '_lnurl'));
+  const originalFetch = global.fetch;
+  let previousResolver;
+  let fetched;
+
+  beforeEach(() => {
+    previousResolver = globalThis[RESOLVER];
+    fetched = [];
+    global.fetch = async (url) => {
+      fetched.push(String(url));
+      return { status: 200, ok: true, url: String(url), headers: { get: () => null }, text: async () => '' };
+    };
+  });
+  afterEach(() => {
+    globalThis[RESOLVER] = previousResolver;
+    global.fetch = originalFetch;
+  });
+
+  /** Resolve names per a table; anything else resolves public. */
+  function resolveAs(table) {
+    globalThis[RESOLVER] = async (host) => {
+      if (host in table) {
+        if (table[host] instanceof Error) throw table[host];
+        return [].concat(table[host]).map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+      }
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+  }
+
+  const L402 = { what: 'L402 URL', portsUnrestricted: true, strictLocal: true, retries: 0, timeoutMs: 2000 };
+
+  for (const address of ['127.0.0.1', '::1', '10.0.0.5', '169.254.169.254', '::ffff:7f00:1']) {
+    it(`refuses a public-looking name that resolves to ${address} (no allowlist, the default)`, async () => {
+      resolveAs({ 'rebind.example': address });
+      await assert.rejects(fetchWithRetry('https://rebind.example:6379/x', L402), (err) => {
+        assert.equal(err.code, 'URL_POLICY');
+        assert.match(err.message, /resolves to/);
+        return true;
+      });
+      assert.deepEqual(fetched, [], 'no request is sent');
+    });
+  }
+
+  it('refuses a name with ANY private address among several', async () => {
+    resolveAs({ 'mixed.example': ['93.184.215.14', '127.0.0.1'] });
+    await assert.rejects(fetchWithRetry('https://mixed.example/x', L402), (err) => err.code === 'URL_POLICY');
+    assert.deepEqual(fetched, []);
+  });
+
+  for (const host of ['ip6-localhost', 'ip6-loopback', 'localhost.', 'foo.localhost', 'localhost.localdomain']) {
+    it(`treats ${host} as a local name (refused under strictLocal, no DNS needed)`, () => {
+      resolveAs({}); // would resolve "public" — the name itself must be enough
+      assert.throws(
+        () =>
+          assertAllowedUrl(`https://${host}:6379/x`, null, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+        (err) => err.code === 'URL_POLICY',
+      );
+    });
+  }
+
+  it('a redirect to a name resolving to loopback is refused before it is requested', async () => {
+    resolveAs({ 'rebind.example': '127.0.0.1' });
+    global.fetch = async (url) => {
+      fetched.push(String(url));
+      return {
+        status: 302,
+        url: String(url),
+        headers: { get: (n) => (n.toLowerCase() === 'location' ? 'https://rebind.example:6379/x' : null) },
+        text: async () => '',
+      };
+    };
+    await assert.rejects(fetchWithRetry('https://public.example/start', L402), (err) => err.code === 'URL_POLICY');
+    assert.deepEqual(fetched, ['https://public.example/start'], 'only the public start was requested');
+  });
+
+  it('a failed lookup is not a refusal (nothing resolves, so the fetch fails on its own)', async () => {
+    resolveAs({ 'nx.example': Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }) });
+    await fetchWithRetry('https://nx.example/x', L402);
+    assert.deepEqual(fetched, ['https://nx.example/x']);
+  });
+
+  it('control: an operator-allowlisted LAN name that resolves private is still reachable (exclusive mode)', async () => {
+    resolveAs({ 'mynode.lan': '192.168.1.5' });
+    await fetchWithRetry('https://mynode.lan:8443/x', {
+      ...L402,
+      allowedHosts: l402Allowlist(new Set(['mynode.lan'])),
+    });
+    assert.deepEqual(fetched, ['https://mynode.lan:8443/x']);
+  });
+
+  it('control: relax-only keeps the operator’s own listed LAN name, but not for other names', async () => {
+    resolveAs({ 'mynode.lan': '192.168.1.5', 'rebind.example': '127.0.0.1' });
+    const policy = l402Allowlist(new Set(['mynode.lan']), { relaxOnly: true, operatorUrl: 'https://mynode.lan/x' });
+    await fetchWithRetry('https://mynode.lan/x', { ...L402, allowedHosts: policy });
+    await assert.rejects(
+      fetchWithRetry('https://rebind.example/x', { ...L402, allowedHosts: policy }),
+      (err) => err.code === 'URL_POLICY',
+    );
+    assert.deepEqual(fetched, ['https://mynode.lan/x']);
+  });
+
+  it('control: LNURL regtest plaintext localhost (no allowlist, non-strict) still works', async () => {
+    resolveAs({});
+    await fetchWithRetry('http://localhost:3002/lnurlp/x', { what: 'LNURL', retries: 0, timeoutMs: 2000 });
+    assert.deepEqual(fetched, ['http://localhost:3002/lnurlp/x']);
   });
 });
 
