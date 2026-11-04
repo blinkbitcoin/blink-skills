@@ -184,4 +184,6 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main };
+const { ARG_OPTIONS } = require('./spark_send');
+
+module.exports = { main, ARG_OPTIONS };

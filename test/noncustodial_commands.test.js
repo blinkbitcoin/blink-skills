@@ -449,7 +449,8 @@ describe('create_invoice_lnaddress main()', () => {
   it('surfaces a bad amount argument', async () => {
     await assert.rejects(
       () => runScript('create_invoice_lnaddress.js', ['alice@blink.sv', '-5', '--no-verify']),
-      /positive integer/,
+      // v3.0.4: a dash-leading positional is refused by the strict parser.
+      /positive integer|Unknown option '-5'/,
     );
   });
 
@@ -749,7 +750,8 @@ describe('spark_subscribe main()', () => {
         return 1;
       },
     });
-    await assert.rejects(() => runScript('spark_subscribe.js', ['--timeout', '-1']), /non-negative/);
+    await assert.rejects(() => runScript('spark_subscribe.js', ['--timeout', '-1']), /ambiguous|non-negative/);
+    await assert.rejects(() => runScript('spark_subscribe.js', ['--timeout=-1']), /non-negative/);
   });
 });
 

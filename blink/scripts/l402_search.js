@@ -28,6 +28,7 @@
 'use strict';
 
 const { parseArgs } = require('node:util');
+const { assertPositionalCount } = require('./_blink_client');
 
 // ── Directory URLs ───────────────────────────────────────────────────────────
 
@@ -36,19 +37,24 @@ const INDEX_URL = 'https://402index.io/api/v1/services';
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts (strict; exported for the CLI-forwarding guard).
+const ARG_OPTIONS = {
+  source: { type: 'string', default: 'directory' },
+  category: { type: 'string' },
+  status: { type: 'string', default: 'live' },
+  format: { type: 'string', default: 'full' },
+  help: { type: 'boolean', short: 'h', default: false },
+};
+
 function parseCliArgs(argv) {
   const { values, positionals } = parseArgs({
     args: argv,
-    options: {
-      source: { type: 'string', default: 'directory' },
-      category: { type: 'string' },
-      status: { type: 'string', default: 'live' },
-      format: { type: 'string', default: 'full' },
-      help: { type: 'boolean', short: 'h', default: false },
-    },
+    options: ARG_OPTIONS,
     allowPositionals: true,
     strict: true,
   });
+  // PR #27 review: extra positionals are refused, not ignored.
+  if (!values.help) assertPositionalCount(positionals, 0, 1);
 
   if (values.help) {
     console.error(
@@ -196,4 +202,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseCliArgs, searchDirectory, searchIndex, DIRECTORY_URL, INDEX_URL };
+module.exports = { main, parseCliArgs, searchDirectory, searchIndex, DIRECTORY_URL, INDEX_URL, ARG_OPTIONS };

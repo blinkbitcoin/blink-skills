@@ -1301,7 +1301,12 @@ describe('budget.js CLI — option validation', () => {
       process.argv = ['node', 'blink', ...argv];
       const { exitCode, stderr } = runMainTrappingExit();
       assert.equal(exitCode, 1, `must reject: ${argv.join(' ')}`);
-      assert.match(stderr, /digits only|safe-integer/i, `clear flag-level error for: ${argv.join(' ')}`);
+      // v3.0.4: a missing value is refused by the strict parser ("argument missing").
+      assert.match(
+        stderr,
+        /digits only|safe-integer|argument missing/i,
+        `clear flag-level error for: ${argv.join(' ')}`,
+      );
     }
   });
 

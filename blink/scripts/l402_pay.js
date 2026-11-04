@@ -227,7 +227,7 @@ function parseArgs(argv) {
   // Strict first: an unknown/malformed option (e.g. `--dry-run=true`, a
   // valueless `--max-amount`) used to be silently dropped — refuse it.
   try {
-    argv = strictArgv(argv, L402_PAY_OPTIONS);
+    argv = strictArgv(argv, L402_PAY_OPTIONS, { positionals: [0, 1] });
   } catch (err) {
     console.error(`Error: ${err.message}`);
     process.exit(1);
@@ -1480,4 +1480,5 @@ module.exports = {
   derivePreimageFromInvoice,
   fetchPreimageByPaymentHash,
   runFeeProbe,
+  ARG_OPTIONS: L402_PAY_OPTIONS,
 };

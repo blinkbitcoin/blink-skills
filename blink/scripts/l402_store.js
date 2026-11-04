@@ -29,7 +29,7 @@
 
 'use strict';
 
-const { exitAfterStdout } = require('./_blink_client');
+const { exitAfterStdout, strictArgv, assertPositionalCount } = require('./_blink_client');
 
 const fs = require('node:fs');
 const { ensureSecureStateDir, writeSecureFileAtomic } = require('./_secure_files');
@@ -258,9 +258,40 @@ function clearTokens({ expiredOnly = false } = {}) {
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+// Every option l402-store accepts (v3.0.4 strict sweep): `clear --expird` used
+// to be ignored as a typo — and then cleared EVERY cached paid token.
+const ARG_OPTIONS = { expired: { type: 'boolean' } };
+
 function main() {
-  const args = process.argv.slice(2);
+  let args;
+  try {
+    args = strictArgv(process.argv.slice(2), ARG_OPTIONS);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   const command = args[0];
+
+  // Per-subcommand contract, checked BEFORE any store read/write (PR #27
+  // review: `clear expird` — an option typo without dashes — was an ignored
+  // extra positional and cleared every token).
+  const positionals = args.filter((a) => a !== '--expired');
+  const expired = args.includes('--expired');
+  const CONTRACTS = {
+    list: { n: 1, expired: false },
+    get: { n: 2, expired: false },
+    clear: { n: 1, expired: true },
+  };
+  const contract = Object.hasOwn(CONTRACTS, command) ? CONTRACTS[command] : null;
+  if (contract) {
+    try {
+      assertPositionalCount(positionals, contract.n, contract.n);
+      if (expired && !contract.expired) throw new Error(`--expired is only valid with 'clear'`);
+    } catch (err) {
+      console.error(`Error: l402-store ${command}: ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   if (!command) {
     console.error('Usage:');
@@ -332,6 +363,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ARG_OPTIONS,
   saveToken,
   getToken,
   storeKeyFor,

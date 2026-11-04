@@ -41,6 +41,7 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
+const { strictArgv, assertPositionalCount } = require('./_blink_client');
 const { connect, lnurlDomainFor, probeLnLookupHealthy } = require('./_spark_sdk');
 
 // Username rules mirrored from the Blink LNURL server (identifier.rs) and the
@@ -71,7 +72,22 @@ function validateUsername(raw) {
   return username;
 }
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = { network: { type: 'string' }, description: { type: 'string' } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS);
+  // Exact arity per subcommand (PR #27 review): `delete`/`get` take no
+  // username, `check`/`register` exactly one — an extra word is refused.
+  {
+    const pos = [];
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === '--network' || argv[i] === '--description') i++;
+      else pos.push(argv[i]);
+    }
+    const arity = { get: 1, delete: 1, check: 2, register: 2 };
+    if (Object.hasOwn(arity, pos[0])) assertPositionalCount(pos, arity[pos[0]], arity[pos[0]]);
+  }
   let subcommand = null;
   let username = null;
   let description;
@@ -277,4 +293,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs, validateUsername };
+module.exports = { main, parseArgs, validateUsername, ARG_OPTIONS };

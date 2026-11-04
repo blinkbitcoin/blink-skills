@@ -33,6 +33,7 @@ const {
   formatBalance,
   parseWalletArg,
   MUTATION_TIMEOUT_MS,
+  WALLET_ARG_OPTIONS,
 } = require('./_blink_client');
 
 const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
@@ -51,7 +52,9 @@ const PAY_LNURL_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), {
+    maxPositionals: 2,
+  });
   const lnurl = remaining[0] ? remaining[0].trim() : null;
   const amountSats = remaining[1] ? parseInt(remaining[1], 10) : null;
 
@@ -203,4 +206,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS: WALLET_ARG_OPTIONS };

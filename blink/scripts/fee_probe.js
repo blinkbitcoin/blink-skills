@@ -30,6 +30,7 @@ const {
   normalizeInvoice,
   warnIfNotBolt11,
   MUTATION_TIMEOUT_MS,
+  WALLET_ARG_OPTIONS,
 } = require('./_blink_client');
 
 const FEE_PROBE_BTC_MUTATION = `
@@ -59,7 +60,7 @@ const FEE_PROBE_USD_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), { maxPositionals: 1 });
   const rawInvoice = remaining[0];
 
   // The shared parser accepts --max-amount; a probe never pays, so it cannot
@@ -133,4 +134,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS: WALLET_ARG_OPTIONS };

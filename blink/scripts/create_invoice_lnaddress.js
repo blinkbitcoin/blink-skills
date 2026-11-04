@@ -46,12 +46,20 @@ const {
   ALLOWED_LN_ADDRESS_DOMAINS,
   ALLOWED_LNURL_SERVICE_HOSTS,
   exitAfterStdout,
+  strictArgv,
 } = require('./_blink_client');
 const { getInvoiceFromLightningAddress, verifyLnurlPayment } = require('./_lnurl');
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict
+// sweep). Free-text memo words go after `--` (e.g. a word like `-50%`),
+// exactly as at the `blink` CLI.
+const ARG_OPTIONS = { timeout: { type: 'string' }, 'no-verify': { type: 'boolean' }, qr: { type: 'boolean' } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true, positionals: [0, Infinity] });
+  let literal = false; // after `--`: every word is a positional (memo text)
   let address = null;
   let amountSats = null;
   let timeoutSeconds = 300;
@@ -61,7 +69,11 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--timeout') {
+    if (!literal && arg === '--') {
+      literal = true;
+      continue;
+    }
+    if (!literal && arg === '--timeout') {
       const value = argv[i + 1];
       if (!value) throw new Error('Missing value for --timeout');
       timeoutSeconds = parseInt(value, 10);
@@ -69,11 +81,11 @@ function parseArgs(argv) {
       i++;
       continue;
     }
-    if (arg === '--no-verify') {
+    if (!literal && arg === '--no-verify') {
       noVerify = true;
       continue;
     }
-    if (arg === '--qr') {
+    if (!literal && arg === '--qr') {
       qr = true;
       continue;
     }
@@ -243,4 +255,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseArgs, pollVerify, isFatalVerifyError };
+module.exports = { main, parseArgs, pollVerify, isFatalVerifyError, ARG_OPTIONS };

@@ -17,7 +17,10 @@
  * Dependencies: None (uses Node.js built-in fetch)
  */
 
-const { getApiKey, getApiUrl, graphqlRequest, getAllWallets } = require('./_blink_client');
+const { getApiKey, getApiUrl, graphqlRequest, getAllWallets, strictArgv } = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {};
 
 const CHECK_INVOICE_QUERY = `
   query InvoiceByHash($walletId: WalletId!, $paymentHash: PaymentHash!) {
@@ -55,7 +58,7 @@ const CHECK_INVOICE_QUERY = `
 `;
 
 async function main() {
-  const args = process.argv.slice(2);
+  const args = strictArgv(process.argv.slice(2), ARG_OPTIONS, { positionals: [0, 1] });
   if (args.length < 1) {
     console.error('Usage: node check_invoice.js <payment_hash>');
     process.exit(1);
@@ -127,4 +130,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

@@ -86,17 +86,20 @@ const CHECK_INVOICE_QUERY = `
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
+// Every option this script accepts (strict; exported for the CLI-forwarding guard).
+const ARG_OPTIONS = {
+  token: { type: 'string' },
+  macaroon: { type: 'string' },
+  preimage: { type: 'string' },
+  resource: { type: 'string' },
+  'check-api': { type: 'boolean', default: false },
+  help: { type: 'boolean', short: 'h', default: false },
+};
+
 function parseCliArgs(argv) {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      token: { type: 'string' },
-      macaroon: { type: 'string' },
-      preimage: { type: 'string' },
-      resource: { type: 'string' },
-      'check-api': { type: 'boolean', default: false },
-      help: { type: 'boolean', short: 'h', default: false },
-    },
+    options: ARG_OPTIONS,
     allowPositionals: false,
     strict: true,
   });
@@ -280,4 +283,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseCliArgs, fetchApiStatus };
+module.exports = { main, parseCliArgs, fetchApiStatus, ARG_OPTIONS };

@@ -21,9 +21,19 @@
  * Dependencies: @breeztech/breez-sdk-spark (optional; Node 22+).
  */
 
+const { strictArgv } = require('./_blink_client');
 const { connect, normalizePayment } = require('./_spark_sdk');
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {
+  limit: { type: 'string' },
+  offset: { type: 'string' },
+  type: { type: 'string' },
+  network: { type: 'string' },
+};
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let limit = 20;
   let offset = 0;
   let type = null;
@@ -105,4 +115,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs };
+module.exports = { main, parseArgs, ARG_OPTIONS };

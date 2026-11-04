@@ -13,9 +13,13 @@
  *   BLINK_API_URL  - Optional. Override API endpoint (default: https://api.blink.sv/graphql)
  */
 
-const { getApiKey, getWsUrl, requireWebSocket } = require('./_blink_client');
+const { getApiKey, getWsUrl, requireWebSocket, strictArgv } = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = { timeout: { type: 'string' }, max: { type: 'string' } };
 
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   let timeoutSeconds = 0;
   let maxCount = 0;
 
@@ -210,4 +214,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs, ARG_OPTIONS };

@@ -12,7 +12,7 @@
  * Zero external dependencies — Node.js 22+ built-ins only.
  */
 
-const { graphqlRequest, CONVERSION_QUERY, MUTATION_TIMEOUT_MS, getAllWallets } = require('./_blink_client');
+const { graphqlRequest, CONVERSION_QUERY, MUTATION_TIMEOUT_MS, getAllWallets, strictArgv } = require('./_blink_client');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -121,7 +121,23 @@ function parsePositiveInt(raw, fieldName) {
  * @param {string[]} argv  Typically `process.argv.slice(2)`.
  * @returns {object} Parsed args or `{ error }` on invalid input.
  */
+// Every option swap-quote / swap-execute accept (v3.0.4: strict like the CLI;
+// the loop below was already fail-closed — this adds `--opt=value` and options
+// before the positionals).
+const SWAP_ARG_OPTIONS = {
+  unit: { type: 'string' },
+  'ttl-seconds': { type: 'string' },
+  immediate: { type: 'boolean' },
+  'dry-run': { type: 'boolean' },
+  memo: { type: 'string' },
+};
+
 function parseCommonSwapArgs(argv) {
+  try {
+    argv = strictArgv(argv, SWAP_ARG_OPTIONS, { positionalsFirst: true, positionals: [0, 2] });
+  } catch (err) {
+    return { error: err.message };
+  }
   if (argv.length < 2) {
     return {
       error:
@@ -446,6 +462,7 @@ async function executeSwap({ direction, quote, memo, apiKey, apiUrl }) {
 // ── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
+  SWAP_ARG_OPTIONS,
   // Constants
   DIRECTION_BTC_TO_USD,
   DIRECTION_USD_TO_BTC,

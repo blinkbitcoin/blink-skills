@@ -24,9 +24,14 @@ const {
   requireWebSocket,
   subscribeToInvoice,
   exitAfterStdout,
+  strictArgv,
 } = require('./_blink_client');
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = { timeout: { type: 'string' } };
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 1] });
   let invoice = null;
   let timeoutSeconds = 300;
 
@@ -86,4 +91,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs, ARG_OPTIONS };

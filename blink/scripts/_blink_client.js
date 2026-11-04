@@ -575,16 +575,6 @@ function formatUsdCents(cents) {
 // ── Arg parsing helpers ──────────────────────────────────────────────────────
 
 /**
- * Parse a --wallet BTC|USD flag from an argv array.
- * Also recognises payment safety flags: --dry-run, --force, --max-amount <sats>.
- *
- * Returns the chosen currency, safety flags, and the remaining positional args
- * (with all recognised flags stripped out).
- *
- * @param {string[]} argv  Typically `process.argv.slice(2)`.
- * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
- */
-/**
  * Strictly validate a money-moving script's argv and return it in canonical
  * split form (`--opt value`), for that script's own validation loop.
  *
@@ -597,11 +587,24 @@ function formatUsdCents(cents) {
  * missing value, and a value on a boolean flag all THROW (code ARG_INVALID)
  * before any credential, network, or SDK call; `--opt=value` is accepted.
  *
+ * Opts: `keepTerminator` re-emits an explicit `--` so a script that takes free
+ * text (memo words) can treat everything after it literally — a memo word
+ * like `-50%` must come after `--`, exactly as at the `blink` CLI.
+ * `positionalsFirst` puts all positionals before the options, for a loop that
+ * reads positionals by fixed index (the swap scripts).
+ *
  * @param {string[]} argv
  * @param {Record<string, {type: 'string'|'boolean', multiple?: boolean}>} options
+ * `positionals: [min, max]` enforces the positional arity (PR #27 review: an
+ * option typo WITHOUT dashes, `l402-store clear expird`, was an ignored extra
+ * positional — and cleared every token). Without `keepTerminator`, a `--` is
+ * REFUSED: words after it would otherwise be re-read as live options by the
+ * script's own loop (`-- --network mainnet`).
+ *
+ * @param {{ keepTerminator?: boolean, positionalsFirst?: boolean, positionals?: [number, number] }} [opts]
  * @returns {string[]}  canonical argv: `--name` (+ value for strings) and positionals, in order
  */
-function strictArgv(argv, options) {
+function strictArgv(argv, options, { keepTerminator = false, positionalsFirst = false, positionals: arity } = {}) {
   let tokens;
   try {
     ({ tokens } = require('node:util').parseArgs({
@@ -612,21 +615,50 @@ function strictArgv(argv, options) {
       tokens: true,
     }));
   } catch (err) {
-    const reason = String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, '');
-    const e = new Error(`${reason}. Unknown or malformed options are refused before anything is sent.`);
-    e.code = 'ARG_INVALID';
-    throw e;
+    throw argInvalid(String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, ''));
   }
+  const opts = [];
+  const positionals = [];
   const out = [];
+  const allPositionals = tokens.filter((t) => t.kind === 'positional').map((t) => t.value);
+  if (!keepTerminator && tokens.some((t) => t.kind === 'option-terminator')) {
+    throw argInvalid("'--' is only accepted by commands that take free text (a memo or description)");
+  }
+  if (arity) assertPositionalCount(allPositionals, arity[0], arity[1]);
   for (const t of tokens) {
     if (t.kind === 'option') {
-      out.push(`--${t.name}`);
-      if (options[t.name].type === 'string') out.push(t.value);
+      const o = [`--${t.name}`];
+      if (options[t.name].type === 'string') o.push(t.value);
+      (positionalsFirst ? opts : out).push(...o);
+    } else if (t.kind === 'option-terminator') {
+      if (keepTerminator) out.push('--');
     } else if (t.kind === 'positional') {
-      out.push(t.value);
+      (positionalsFirst ? positionals : out).push(t.value);
     }
   }
-  return out;
+  return positionalsFirst ? [...positionals, ...opts] : out;
+}
+
+function argInvalid(reason) {
+  const e = new Error(`${reason}. Unknown or malformed options are refused before anything is sent.`);
+  e.code = 'ARG_INVALID';
+  return e;
+}
+
+/**
+ * Enforce a positional arity: throws ARG_INVALID naming the unexpected words.
+ * Exported for scripts whose arity depends on a subcommand.
+ *
+ * @param {string[]} list
+ * @param {number} min
+ * @param {number} max  Infinity for free text
+ */
+function assertPositionalCount(list, min, max) {
+  if (list.length >= min && list.length <= max) return;
+  const range =
+    min === max ? `${min}` : max === Infinity ? `at least ${min}` : min === 0 ? `at most ${max}` : `${min}–${max}`;
+  const extra = list.length > max ? `: unexpected argument(s) '${list.slice(max).join("', '")}'` : '';
+  throw argInvalid(`Expected ${range} positional argument(s), got ${list.length}${extra}`);
 }
 
 const WALLET_ARG_OPTIONS = {
@@ -636,9 +668,20 @@ const WALLET_ARG_OPTIONS = {
   'max-amount': { type: 'string' },
 };
 
-function parseWalletArg(argv) {
+/**
+ * Parse a --wallet BTC|USD flag from an argv array.
+ * Also recognises payment safety flags: --dry-run, --force, --max-amount <sats>.
+ *
+ * Returns the chosen currency, safety flags, and the remaining positional args
+ * (with all recognised flags stripped out). Parsing is STRICT (strictArgv):
+ * an unknown or malformed option exits 1 before anything is sent.
+ *
+ * @param {string[]} argv  Typically `process.argv.slice(2)`.
+ * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
+ */
+function parseWalletArg(argv, { maxPositionals = Infinity } = {}) {
   try {
-    argv = strictArgv(argv, WALLET_ARG_OPTIONS);
+    argv = strictArgv(argv, WALLET_ARG_OPTIONS, { positionals: [0, maxPositionals] });
   } catch (err) {
     console.error(`Error: ${err.message}`);
     process.exit(1);
@@ -897,6 +940,8 @@ function exitAfterStdout(code) {
 
 module.exports = {
   strictArgv,
+  assertPositionalCount,
+  WALLET_ARG_OPTIONS,
   exitAfterStdout,
   // Constants
   DEFAULT_API_URL,

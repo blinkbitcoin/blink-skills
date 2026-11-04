@@ -285,7 +285,7 @@ describe('_swap_common: parseCommonSwapArgs', () => {
     const { parseCommonSwapArgs } = freshRequireSwapCommon();
     const result = parseCommonSwapArgs(['btc-to-usd', '1000', '--unknown']);
     assert.ok(result.error);
-    assert.ok(result.error.includes('Unknown argument'));
+    assert.match(result.error, /Unknown (argument|option)/); // v3.0.4: strict parser wording
   });
 
   it('returns error for invalid unit', () => {

@@ -22,6 +22,7 @@
 
 const { getApiKey, getApiUrl } = require('./_blink_client');
 const { parseCommonSwapArgs, estimateSwapQuote } = require('./_swap_common');
+const { SWAP_ARG_OPTIONS: ARG_OPTIONS } = require('./_swap_common');
 
 async function main() {
   const parsed = parseCommonSwapArgs(process.argv.slice(2));
@@ -65,4 +66,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

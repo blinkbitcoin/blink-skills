@@ -19,7 +19,7 @@
  * Dependencies: None (uses Node.js built-in fetch)
  */
 
-const { getApiKey, getApiUrl, graphqlRequest, getWallet } = require('./_blink_client');
+const { getApiKey, getApiUrl, graphqlRequest, getWallet, strictArgv } = require('./_blink_client');
 
 const TRANSACTIONS_QUERY = `
   query Transactions($first: Int, $after: String, $walletIds: [WalletId]) {
@@ -80,7 +80,16 @@ const TRANSACTIONS_QUERY = `
   }
 `;
 
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {
+  first: { type: 'string' },
+  after: { type: 'string' },
+  'include-preimage': { type: 'boolean' },
+  wallet: { type: 'string' },
+};
+
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { positionals: [0, 0] });
   const args = { first: 20, after: null, wallet: null, includePreimage: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--first' && argv[i + 1]) {
@@ -200,4 +209,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs, ARG_OPTIONS };

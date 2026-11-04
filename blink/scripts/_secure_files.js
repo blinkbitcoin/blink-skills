@@ -20,6 +20,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 /** State files that must be 0600 whenever they exist. */
 const SECURE_FILE_NAMES = ['l402-tokens.json', 'l402-root-key', 'budget.json', 'spending-log.json'];
@@ -124,12 +125,34 @@ function writeSecureFileAtomic(file, content) {
   } catch (e) {
     if (e.code !== 'ENOENT') throw e;
   }
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  // Unpredictable temp name, created EXCLUSIVELY (O_CREAT|O_EXCL via 'wx'),
+  // which also refuses a pre-existing symlink (ClawHub 3.0.3 ClawScan note:
+  // `<file>.<pid>.tmp` without exclusive creation let a planted symlink
+  // redirect the write). A collision (EEXIST) just draws a new name.
+  let tmp;
+  for (let attempt = 0; ; attempt++) {
+    tmp = `${file}.${crypto.randomBytes(12).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(tmp, content, { mode: 0o600, flag: 'wx' });
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST' || attempt >= 4) throw e;
+    }
+  }
   // Belt for a pre-existing target created by an older release with looser
   // umask: rename preserves the OLD file's mode, so set it explicitly.
-  fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // Never leave a 0600 copy of the state behind (PR #27 review).
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw e;
+  }
   fs.chmodSync(file, 0o600);
 }
 

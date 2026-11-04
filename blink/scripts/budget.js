@@ -25,6 +25,28 @@
 'use strict';
 
 const { getConfig, readConfigFile, writeConfig, getStatus, getLog, resetLog, LOG_FILE } = require('./_budget');
+const { strictArgv, assertPositionalCount } = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict sweep).
+const ARG_OPTIONS = {
+  hourly: { type: 'string' },
+  daily: { type: 'string' },
+  off: { type: 'boolean' },
+  last: { type: 'string' },
+  force: { type: 'boolean' },
+};
+
+// Maximum positionals (subcommand included); the minimum is left to each
+// subcommand's usage message. PR #27 review: extra words were ignored.
+const MAX_POSITIONALS = {
+  status: 1,
+  set: 1,
+  log: 1,
+  reset: 1,
+  'allowlist list': 2,
+  'allowlist add': 3,
+  'allowlist remove': 3,
+};
 
 // Options are scoped per subcommand; a flag meant for another subcommand is
 // rejected instead of silently ignored (e.g. `budget status --force`).
@@ -37,7 +59,22 @@ const SUBCOMMAND_OPTIONS = {
 };
 
 function main() {
-  const args = process.argv.slice(2);
+  let args;
+  try {
+    args = strictArgv(process.argv.slice(2), ARG_OPTIONS);
+    const positionals = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith('--')) {
+        if (ARG_OPTIONS[args[i].slice(2)].type === 'string') i++;
+      } else positionals.push(args[i]);
+    }
+    const key = positionals[0] === 'allowlist' ? `allowlist ${positionals[1]}` : positionals[0];
+    // Own keys only: `constructor` must reach the unknown-subcommand error.
+    if (Object.hasOwn(MAX_POSITIONALS, key)) assertPositionalCount(positionals, 0, MAX_POSITIONALS[key]);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   const subcommand = args[0];
 
   if (!subcommand) {
@@ -264,4 +301,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS };

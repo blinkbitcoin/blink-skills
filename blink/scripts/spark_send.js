@@ -66,7 +66,7 @@ const SPARK_SEND_OPTIONS = {
 function parseArgs(argv) {
   // Strict first: `--dry-run=true` or a typo like `--dryrun` used to be read
   // as a positional and the SEND WAS REAL. Throws ARG_INVALID before any SDK.
-  argv = strictArgv(argv, SPARK_SEND_OPTIONS);
+  argv = strictArgv(argv, SPARK_SEND_OPTIONS, { positionals: [0, 2] });
   let destination = null;
   let amountSats = null;
   let dryRun = false;
@@ -361,10 +361,14 @@ async function main() {
   }
 
   const tokenMode = args.token !== null || args.fromBtc || args.fromToken !== null;
+  // FT9: a dry run only PREPARES — the "spends real bitcoin" warning was
+  // misleading there. A real send keeps the warning unchanged.
   console.error(
-    tokenMode
-      ? '⚠️  NON-CUSTODIAL TOKEN SEND: this signs a transaction with your account seed and moves real funds (token and/or BTC).'
-      : '⚠️  NON-CUSTODIAL SEND: this signs a transaction with your account seed and spends real bitcoin.',
+    args.dryRun
+      ? 'DRY RUN: prepares the payment only — nothing is signed or sent.'
+      : tokenMode
+        ? '⚠️  NON-CUSTODIAL TOKEN SEND: this signs a transaction with your account seed and moves real funds (token and/or BTC).'
+        : '⚠️  NON-CUSTODIAL SEND: this signs a transaction with your account seed and spends real bitcoin.',
   );
 
   const { sdk, disconnect } = await connect({ network: args.network });
@@ -742,4 +746,5 @@ module.exports = {
   prepareBolt,
   prepareToken,
   conversionEstimateFrom,
+  ARG_OPTIONS: SPARK_SEND_OPTIONS,
 };

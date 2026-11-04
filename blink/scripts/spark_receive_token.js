@@ -31,8 +31,21 @@
  */
 
 const { connect, resolveTokenIdentifier, parseTokenAmount } = require('./_spark_sdk');
+const { strictArgv } = require('./_blink_client');
+
+// Every option this script accepts; anything else is refused (v3.0.4 strict
+// sweep). Free-text memo words go after `--` (e.g. a word like `-50%`),
+// exactly as at the `blink` CLI.
+const ARG_OPTIONS = {
+  token: { type: 'string' },
+  'base-units': { type: 'boolean' },
+  description: { type: 'string' },
+  network: { type: 'string' },
+};
 
 function parseArgs(argv) {
+  argv = strictArgv(argv, ARG_OPTIONS, { keepTerminator: true, positionals: [0, Infinity] });
+  let literal = false; // after `--`: every word is a positional (memo text)
   let amount = null;
   let token = 'usdb';
   let baseUnits = false;
@@ -40,13 +53,15 @@ function parseArgs(argv) {
   let network = process.env.SPARK_NETWORK || 'mainnet';
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--token' && i + 1 < argv.length) {
+    if (!literal && arg === '--') {
+      literal = true;
+    } else if (!literal && arg === '--token' && i + 1 < argv.length) {
       token = argv[++i];
-    } else if (arg === '--base-units') {
+    } else if (!literal && arg === '--base-units') {
       baseUnits = true;
-    } else if (arg === '--description' && i + 1 < argv.length) {
+    } else if (!literal && arg === '--description' && i + 1 < argv.length) {
       description = argv[++i];
-    } else if (arg === '--network' && i + 1 < argv.length) {
+    } else if (!literal && arg === '--network' && i + 1 < argv.length) {
       network = argv[++i];
     } else if (amount === null) {
       amount = arg;
@@ -133,4 +148,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, parseArgs };
+module.exports = { main, parseArgs, ARG_OPTIONS };

@@ -32,6 +32,7 @@ const {
   normalizeInvoice,
   warnIfNotBolt11,
   MUTATION_TIMEOUT_MS,
+  WALLET_ARG_OPTIONS,
 } = require('./_blink_client');
 
 const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
@@ -51,7 +52,9 @@ const PAY_INVOICE_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, dryRun, force, maxAmount, remaining } = parseWalletArg(process.argv.slice(2), {
+    maxPositionals: 1,
+  });
   const rawInvoice = remaining[0];
 
   if (!rawInvoice) {
@@ -226,4 +229,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, ARG_OPTIONS: WALLET_ARG_OPTIONS };

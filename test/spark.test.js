@@ -1390,7 +1390,10 @@ describe('spark_transactions.parseArgs', () => {
   });
 
   it('rejects a negative offset', () => {
-    assert.throws(() => parseArgs(['--offset', '-1']), /non-negative integer/);
+    // Split form: the strict parser refuses a dash-leading value as ambiguous.
+    assert.throws(() => parseArgs(['--offset', '-1']), /ambiguous|non-negative integer/);
+    // `=` form reaches the script's own range check.
+    assert.throws(() => parseArgs(['--offset=-1']), /non-negative integer/);
   });
 
   it('rejects an invalid --type', () => {
@@ -1436,10 +1439,12 @@ describe('spark_balance.parseArgs', () => {
     }
   });
 
-  it('ignores a trailing --network without a value', () => {
+  // v3.0.4 strict sweep: a valueless --network used to be ignored (silently
+  // falling back to mainnet); it is now refused like at the `blink` CLI.
+  it('refuses a trailing --network without a value', () => {
     delete process.env.SPARK_NETWORK;
     try {
-      assert.equal(parseArgs(['--network']).network, 'mainnet');
+      assert.throws(() => parseArgs(['--network']), (e) => e.code === 'ARG_INVALID');
     } finally {
       restoreEnv();
     }
