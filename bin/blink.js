@@ -1107,6 +1107,9 @@ commands['l402-search'] = {
 };
 
 commands['l402-info'] = {
+  // --report delegates to l402_pay (which may load the Spark SDK and now
+  // returns with process.exitCode instead of exiting): drain stdout, then exit.
+  forceExit: true,
   description: 'Get full details for an L402 service from l402.directory',
   args: [{ name: 'service_id', required: true, description: 'Service ID from l402.directory (hex string)' }],
   options: {

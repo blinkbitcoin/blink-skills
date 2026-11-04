@@ -68,9 +68,24 @@ refused unless the caller listed `host:port` explicitly. Plaintext `http` is
 permitted only for a local host the caller deliberately allowed; the match is
 exact, so `localhost.attacker.example` does not qualify.
 
-**Known limit:** the guard is name-based and does not pin the resolved address,
-so it does not defend against DNS rebinding. Closing that needs resolve-then-pin
-at the socket layer, which Node's `fetch` does not currently expose.
+**Resolved addresses (v3.0.2):** names are checked too, not only literals. Before
+each request attempt (the first URL and every redirect target), a hostname is
+resolved and refused if **any** of its addresses is private, loopback,
+link-local or metadata, so `ip6-localhost` or attacker DNS such as
+`127.0.0.1.nip.io` cannot reach a local service. **Fail closed:** a name whose
+address cannot be verified (a DNS error such as `EAI_AGAIN`/`ENOTFOUND`, a
+lookup timeout, an empty or malformed answer) is refused, never fetched; a
+transient failure is retried like any network fault. The name looked up is
+exactly the one the request uses. Loopback names (`localhost`, a trailing-dot `localhost.`,
+`*.localhost`, `ip6-localhost`, `ip6-loopback`, `localhost.localdomain`) are
+classified as local without DNS. Exempt: hosts you explicitly allowlisted (e.g.
+a LAN node by name), and the deliberately permitted regtest `localhost`.
+
+**Known limit:** the fetch resolves the name again, so an answer that was
+**verified public** and then changes before the connection (DNS rebinding) is not
+caught. Closing that
+needs pinning the checked address at the socket layer, which core Node's `fetch`
+does not expose without the `undici` package.
 
 ### Response binding
 

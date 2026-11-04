@@ -20,6 +20,7 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 ## Testing
 
 - The suite must run on ALL THREE Node lines before releasing — Node 24 (`npm test`), Node 22.4.0 (`~/.nvm/versions/node/v22.4.0/bin/node --test test/*.test.js`), Node 26 (`~/.nvm/versions/node/v26.12.1/bin/node --test test/*.test.js`): each must show **all tests passing, 0 skipped**, plus the `better-sqlite3` smoke check after rebuilding for that Node. Do not hard-code counts here — they drift every release.
+- **Tests must never touch the real `~/.blink`.** Modules resolve `os.homedir()` at load and capture each other's instances, so an in-process suite that patches `os.homedir` must clear the require cache for EVERY such module in `beforeEach` (not only `afterEach`). Otherwise an instance cached by an earlier `describe` keeps writing the real home: in v3.0.2 development a fake 100000-sat spend landed in the real spending log. Fingerprint `~/.blink` (`sha256sum`) before and after a full run when touching state-writing tests.
 - Test architecture: CLI tests spawn `bin/blink.js` with `test/fixtures/spark_sdk_stub.js` via `--require` (`Module._load` interception of `_spark_sdk`). Pure helpers (e.g. `normalizePayment`) are passed through from PRODUCTION via load-through capture — never re-mirror them in fixtures; mirrors drift.
 - Guard/stateful helpers in `_spark_sdk` (`suppressSdkStdoutNoise`) have lifecycle tests (formerly Node-22-gated; the gates were removed with the v3.0.0 floor raise); the pinned-storage regression test self-validates (counterfactual first) and `t.skip`s when the native binding is unavailable.
 
@@ -63,7 +64,13 @@ Concise, hard-won operational facts. Read before releasing, reviewing, or bumpin
 
 - Releases are validated by live mainnet field tests run by the user's agent. Prompts always start with **P0: discover and install the LATEST tag** (`git ls-remote --tags --sort=-v:refname`), make the tree byte-identical, and hard-stop if `blink --version` mismatches.
 - Budget caps, self-controlled destinations only, secrets never printed, stop-and-report on any breez.tips mention or unexplained balance delta.
-- Six live defects have been found and fixed this way (v2.3.0–v2.5.0). Keep the loop.
+- Six live defects have been found and fixed this way (v2.3.0–v2.5.0). Keep the loop. FT7 (v3.0.1) added four more, fixed in v3.0.2: no JSON after a post-payment transport failure, `l402-discover`/`--dry-run` gated by the allowlist, `--dry-run --probe` ignored, stale endpoint docs.
+- FT7 field-test lessons:
+  - Plaintext `http` is refused for any non-local host *before* a request is sent, so scheme-isolation cases can't be exercised live; they need a local server and live in the test suite.
+  - `--max-amount` must be ≥ 1, so it is not a zero-spend tripwire for a 1-sat endpoint. To probe cache behavior for free after one payment, set the budget limit equal to what is already spent (`blink budget set --hourly <spent> --daily <spent>`): any fresh payment is refused, while cache reuse needs no budget. Restore it afterwards.
+  - Live custodial routing fees were ~10 sats on 1–2 sat invoices while the fee probe estimated 1. Size the cap on the **wallet** drop, not the budget (which counts price only).
+  - Verify an endpoint's required query parameters before paying: a 400 after payment burns the sats (and with `--no-store`, the token too). The reliable test endpoint is `https://api.lightningenable.com/l402/test/ping` (1 sat).
+  - Never prescribe a flag combination you haven't checked in the code (FT7: `--dry-run --probe` was a no-op).
 
 ## Open upstream items
 

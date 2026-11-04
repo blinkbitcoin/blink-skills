@@ -41,6 +41,107 @@ const MAX_REDIRECTS = 3;
 // would accept `localhost.attacker.example`.
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
+// Loopback NAMES beyond the canonical spellings (PR #25 review round 2): the
+// common /etc/hosts IPv6 aliases, and RFC 6761 `*.localhost`, which resolvers
+// must answer with loopback. Classified as local without consulting DNS.
+const LOCAL_NAME_ALIASES = new Set(['ip6-localhost', 'ip6-loopback', 'localhost.localdomain']);
+
+/** Is this (normalized) hostname a local/loopback name or literal? */
+function isLocalName(host) {
+  return LOCAL_HOSTS.has(host) || LOCAL_NAME_ALIASES.has(host) || host.endsWith('.localhost');
+}
+
+/** Is this (normalized) hostname an IP literal (v4 dotted or bracketed v6)? */
+function isIpLiteral(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^\[.*\]$/.test(host) || host.includes(':');
+}
+
+// Per-URL guard decision, consumed by the resolved-address check below.
+const GUARD_DECISION = Symbol('guardDecision');
+
+const dns = require('node:dns');
+const net = require('node:net');
+// Test seam: a resolver installed under this registry key replaces DNS (the
+// in-process suites must never query real DNS). It is a process-global
+// Symbol.for key so it survives module reloads; only in-process code can set
+// it, and in-process code could patch fetch/dns directly anyway.
+const TEST_RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+
+function resolveHost(host) {
+  const stub = globalThis[TEST_RESOLVER];
+  if (typeof stub === 'function') return stub(host);
+  return dns.promises.lookup(host, { all: true, verbatim: true });
+}
+
+/**
+ * Refuse a NAME unless its resolved addresses are VERIFIED public (PR #25
+ * review rounds 2-3). The string checks in assertAllowedUrl can only classify
+ * literals and known local names; any other name — an alias like
+ * ip6-localhost, or attacker DNS such as 127.0.0.1.nip.io — passed them in
+ * every mode, including the default no-allowlist one.
+ *
+ * FAIL CLOSED: fetch() resolves the name again, independently, so an answer
+ * that cannot be verified here is never followed by a request. A lookup
+ * error (EAI_AGAIN, ENOTFOUND, SERVFAIL...), a timeout (bounded by the
+ * request deadline), an empty answer, or any entry that is not an IP literal
+ * is an UNVERIFIABLE refusal (`indeterminate: true`, retried by the walker
+ * like any transient fault); ANY private / loopback / link-local / metadata
+ * address is a deterministic refusal. The name looked up is exactly the
+ * hostname the fetch uses (an absolute trailing-dot name stays absolute).
+ *
+ * Exempt: IP literals (already classified), hosts the operator explicitly
+ * allowed (exclusive list entry, or the operator's own host under
+ * relax-only), and local names that assertAllowedUrl deliberately permitted
+ * (the LNURL regtest localhost).
+ *
+ * Residual limitation: an answer that was VERIFIED public and then changes
+ * before the connection (DNS rebinding) is not caught; pinning the checked
+ * address needs a custom dispatcher that core Node does not expose without
+ * the undici package.
+ *
+ * @param {URL} url  a URL returned by assertAllowedUrl
+ * @param {string} what  label for the error message
+ * @param {number} timeoutMs  lookup bound (the caller passes the remaining deadline)
+ */
+async function assertResolvedAddressesAllowed(url, what, timeoutMs) {
+  const decision = url[GUARD_DECISION];
+  if (!decision || decision.exempt) return;
+  const unverifiable = (why) => {
+    const err = policyError(
+      `Refusing to fetch ${what} from '${decision.host}': could not verify its resolved address (${why}).`,
+    );
+    err.indeterminate = true;
+    return err;
+  };
+  let timer;
+  let addresses;
+  try {
+    addresses = await Promise.race([
+      Promise.resolve().then(() => resolveHost(decision.lookupHost)),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(Object.assign(new Error('lookup timed out'), { code: 'ETIMEOUT' })),
+          Math.max(1, timeoutMs),
+        );
+      }),
+    ]);
+  } catch (err) {
+    throw unverifiable((err && (err.code || err.message)) || 'lookup failed');
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) throw unverifiable('empty answer');
+  for (const entry of addresses) {
+    const address = entry && typeof entry.address === 'string' ? entry.address : null;
+    if (!address || net.isIP(address) === 0) throw unverifiable('malformed answer');
+    if (isPrivateAddress(address)) {
+      throw policyError(
+        `Refusing to fetch ${what} from '${decision.host}': it resolves to the private address ${address}.`,
+      );
+    }
+  }
+}
+
 /**
  * Is this hostname a literal IP address in a private / loopback / link-local
  * range? Defence in depth behind the host allowlist: if an allowed host ever
@@ -105,7 +206,59 @@ function policyError(message) {
   return err;
 }
 
+const L402_ALLOWLIST = Symbol('l402Allowlist');
+
+/**
+ * Wrap the L402 BUDGET allowlist (a payment policy, not a network-access list)
+ * for the URL guard (FT7, v3.0.2):
+ *   - exclusive (default): only listed hosts may be fetched — every non-dry-run
+ *     l402-pay request (v2.6.1). Refusals name the L402 allowlist.
+ *   - relaxOnly: the list never restricts public hosts — the documented
+ *     ungated probes, l402-discover and l402-pay --dry-run. Its only effect is
+ *     to RELAX the SSRF guard for the host the OPERATOR chose (`operatorUrl`),
+ *     and only if that host is listed (PR #25 review: an exception that every
+ *     hop inherited let any public probe redirect — or name a
+ *     payment_request_url — at an allowlisted private service). Redirect
+ *     targets and server-supplied URLs on any other host get no exception.
+ * An unconfigured allowlist (null) stays null: behavior is unchanged.
+ *
+ * @param {Set<string>|string[]|null} hosts
+ * @param {{ relaxOnly?: boolean, operatorUrl?: string }} [opts]  operatorUrl is
+ *        REQUIRED with relaxOnly (fail closed: never an unbound exception).
+ * @returns {object|null} a value accepted wherever `allowedHosts` is
+ */
+function l402Allowlist(hosts, { relaxOnly = false, operatorUrl } = {}) {
+  if (!hosts) return null;
+  // Same normalization as assertAllowedUrl (lowercase, no trailing root dot) on
+  // both sides, so 'mynode.lan.' and 'mynode.lan' are one host (PR #25 review).
+  const norm = (h) => String(h).toLowerCase().replace(/\.$/, '');
+  let set = new Set([...(hosts instanceof Set ? hosts : new Set(hosts))].map(norm));
+  if (relaxOnly) {
+    let operatorHost;
+    try {
+      operatorHost = norm(new URL(String(operatorUrl)).hostname);
+    } catch {
+      throw new Error('l402Allowlist: relaxOnly requires the operatorUrl the exception is bound to.');
+    }
+    set = set.has(operatorHost) ? new Set([operatorHost]) : new Set();
+  }
+  return Object.freeze({
+    [L402_ALLOWLIST]: true,
+    hosts: set,
+    relaxOnly: Boolean(relaxOnly),
+  });
+}
+
 function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
+  // L402 budget-allowlist policy (see l402Allowlist); a plain Set/array keeps
+  // the original exclusive "Blink hosts" semantics of the LNURL flows.
+  let relaxOnly = false;
+  let label = null;
+  if (allowedHosts && allowedHosts[L402_ALLOWLIST]) {
+    relaxOnly = allowedHosts.relaxOnly;
+    label = 'the L402 budget allowlist';
+    allowedHosts = allowedHosts.hosts;
+  }
   let url;
   try {
     url = new URL(String(rawUrl));
@@ -117,8 +270,10 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
     throw policyError(`Refusing to fetch ${what} with unsupported scheme '${url.protocol}'.`);
   }
 
-  const host = url.hostname.toLowerCase();
-  const isLocal = LOCAL_HOSTS.has(host);
+  // Normalize: lowercase and strip a trailing root dot ('localhost.' is
+  // 'localhost'), so every check below sees one spelling (PR #25 review r2).
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  const isLocal = isLocalName(host);
 
   // Being a local host is NOT itself a licence to be fetched. Treating it as
   // one would let a hostile LNURL response name `http://127.0.0.1:6379/` (or
@@ -129,8 +284,13 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   const allowed = allowedHosts ? (allowedHosts instanceof Set ? allowedHosts : new Set(allowedHosts)) : null;
   const explicitlyAllowed = allowed ? allowed.has(host) : false;
 
-  if (allowed && !explicitlyAllowed) {
-    throw policyError(`Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`);
+  if (allowed && !explicitlyAllowed && !relaxOnly) {
+    throw policyError(
+      label
+        ? `Refusing to fetch ${what} from '${host}': not in ${label}. Allowed: ${[...allowed].join(', ')}. ` +
+            `Add it with: blink budget allowlist add ${host}`
+        : `Refusing to fetch ${what} from non-Blink host '${host}'. Allowed: ${[...allowed].join(', ')}.`,
+    );
   }
 
   // Plaintext is tolerable only for a local host the caller deliberately
@@ -149,7 +309,7 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   if (isPrivateAddress(host) && !explicitlyAllowed) {
     throw policyError(`Refusing to fetch ${what} from private address '${host}'.`);
   }
-  if (opts.strictLocal && LOCAL_HOSTS.has(host) && !explicitlyAllowed) {
+  if (opts.strictLocal && isLocal && !explicitlyAllowed) {
     throw policyError(`Refusing to fetch ${what} from local host '${host}' (not allowlisted).`);
   }
 
@@ -159,10 +319,14 @@ function assertAllowedUrl(rawUrl, allowedHosts, what = 'URL', opts = {}) {
   // (portsUnrestricted): L402 services routinely live on arbitrary ports, and
   // the L402 allowlist is a PAYMENT policy list, not a network-access list —
   // private-address and redirect re-validation still apply regardless.
-  if (!opts.portsUnrestricted && allowed && url.port && !allowed.has(`${host}:${url.port}`)) {
+  if (!opts.portsUnrestricted && allowed && !relaxOnly && url.port && !allowed.has(`${host}:${url.port}`)) {
     throw policyError(`Refusing to fetch ${what} on non-standard port ${url.port} of '${host}'.`);
   }
 
+  Object.defineProperty(url, GUARD_DECISION, {
+    // host: normalized, for policy identity; lookupHost: exactly what fetch() resolves.
+    value: { host, lookupHost: url.hostname, exempt: explicitlyAllowed || isLocal || isIpLiteral(host) },
+  });
   return url;
 }
 
@@ -333,6 +497,7 @@ async function fetchWithRetry(
   const overallDeadline = Date.now() + timeoutMs * (retries + 1) * (MAX_REDIRECTS + 1);
 
   for (let hop = 0; ; hop++) {
+    const hopWhat = hop === 0 ? what : `${what} redirect target`;
     let lastErr;
     let res = null;
 
@@ -340,6 +505,18 @@ async function fetchWithRetry(
       const remaining = overallDeadline - Date.now();
       if (remaining <= 0) {
         throw new Error(`LNURL request exceeded its overall deadline fetching ${what}.`);
+      }
+      // Before EVERY attempt — the first URL and each redirect target — the
+      // name's resolved addresses must be verified (fail closed, PR #25
+      // review). A deterministic refusal aborts; an unverifiable answer is a
+      // transient fault: retried, and never followed by a request.
+      try {
+        await assertResolvedAddressesAllowed(current, hopWhat, Math.min(timeoutMs, remaining));
+      } catch (err) {
+        if (!err || !err.indeterminate) throw err;
+        lastErr = err;
+        if (attempt < retries) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        continue;
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
@@ -389,9 +566,14 @@ async function fetchWithRetry(
     }
 
     if (!res) {
-      throw new Error(
-        `${what} request failed after ${retries + 1} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`,
-      );
+      // Every attempt was unverifiable: refuse as policy (nothing was sent).
+      if (lastErr && lastErr.indeterminate) throw lastErr;
+      // Keep the transport cause: undici reports e.g. "terminated" whose cause
+      // ("Decompression failed") is the actual diagnosis (FT7, v3.0.2).
+      const detail = lastErr
+        ? lastErr.message + (lastErr.cause && lastErr.cause.message ? ` (${lastErr.cause.message})` : '')
+        : 'unknown error';
+      throw new Error(`${what} request failed after ${retries + 1} attempt(s): ${detail}`, { cause: lastErr });
     }
 
     const isRedirect = res.status >= 300 && res.status < 400 && res.headers.get('location');
@@ -1139,6 +1321,7 @@ module.exports = {
   isPrivateAddress,
   assertAllowedUrl,
   withholdHeadersIfCrossOrigin,
+  l402Allowlist,
   isLnurlNotFoundReason,
   bech32Decode,
   convertBits,

@@ -1156,6 +1156,7 @@ describe('CLI: l402-pay --spark lifecycle', () => {
           env: { ...process.env, HOME: home, SPARK_MNEMONIC: 'test seed words for the stub', BREEZ_API_KEY: 'k' },
           timeout: 15000,
           killSignal: 'SIGKILL',
+          maxBuffer: 64 * 1024 * 1024, // the piped-stdout tests print multi-MiB JSON
         },
         (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }),
       );
@@ -1583,6 +1584,97 @@ describe('CLI: l402-pay --spark lifecycle', () => {
       assert.match(res.stderr, /Authorization/i, 'the dropped operator header is reported on stderr');
     } finally {
       s.server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #25 review: the new failure events must reach a PIPED stdout intact
+  // through the real CLI (no hard process.exit racing the write). The server
+  // kills the connection on the credentialed request, as in FT7.
+  it('a connection killed after payment yields complete l402_paid_retry_failed JSON on piped stdout, exit 1', async () => {
+    const server = http.createServer((req, res) => {
+      if (/^L402 /.test(req.headers.authorization || '')) {
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+      res.end();
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payViaRaw(home, server.address().port);
+      assert.equal(res.code, 1, res.stderr);
+      const out = JSON.parse(res.stdout); // throws if truncated or empty
+      assert.equal(out.event, 'l402_paid_retry_failed');
+      assert.equal(out.backend, 'spark');
+      assert.equal(out.tokenStored, true);
+      assert.ok(out.error && out.error.length > 0);
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // PR #25 review round 4 (Medium): the non-200 branches printed JSON and then
+  // called process.exit(1), which can cut a PIPED stdout mid-write. The output
+  // includes the server's body (`data`), so a large body made it deterministic:
+  // the agent got truncated, unparseable JSON — after money moved, on the paid path.
+  const BIG = 'x'.repeat(4 * 1024 * 1024); // far past the pipe buffer
+
+  function bigErrorServer() {
+    return new Promise((resolve) => {
+      const server = http.createServer((req, res) => {
+        if (/^L402 /.test(req.headers.authorization || '')) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: BIG }));
+          return;
+        }
+        res.writeHead(402, { 'www-authenticate': 'L402 macaroon="TESTMAC==", invoice="lnbc1000u1p0x"' });
+        res.end();
+      });
+      server.listen(0, '127.0.0.1', () => resolve(server));
+    });
+  }
+
+  it('a cached token answered with a large non-200 yields COMPLETE l402_error JSON on piped stdout, exit 1', async () => {
+    const server = await bigErrorServer();
+    const { port } = server.address();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    fs.writeFileSync(
+      path.join(home, '.blink', 'l402-tokens.json'),
+      JSON.stringify({
+        [`http://127.0.0.1:${port}/resource`]: { macaroon: 'TESTMAC==', preimage: 'f'.repeat(64), satoshis: 100000 },
+      }),
+      'utf8',
+    );
+    try {
+      const res = await payViaRaw(home, port);
+      assert.equal(res.code, 1, res.stderr.slice(0, 500));
+      const out = JSON.parse(res.stdout); // throws if truncated
+      assert.equal(out.event, 'l402_error');
+      assert.equal(out.tokenReused, true);
+      assert.equal(out.status, 500);
+      assert.equal(out.data.error.length, BIG.length, 'the whole body arrived');
+    } finally {
+      server.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a paid retry answered with a large non-200 yields COMPLETE l402_paid JSON on piped stdout, exit 1', async () => {
+    const server = await bigErrorServer();
+    const home = seededHome({ dailyLimitSats: 200000, allowlist: ['127.0.0.1'] });
+    try {
+      const res = await payViaRaw(home, server.address().port);
+      assert.equal(res.code, 1, res.stderr.slice(0, 500));
+      const out = JSON.parse(res.stdout); // throws if truncated
+      assert.equal(out.event, 'l402_paid');
+      assert.equal(out.paymentStatus, 'SUCCESS', 'money moved — the agent must see it');
+      assert.equal(out.tokenReused, false);
+      assert.equal(out.data.error.length, BIG.length, 'the whole body arrived');
+    } finally {
+      server.close();
       fs.rmSync(home, { recursive: true, force: true });
     }
   });

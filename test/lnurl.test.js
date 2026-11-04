@@ -8,6 +8,7 @@
 
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+require('./fixtures/public_dns_stub'); // never query real DNS (resolved-address guard)
 
 const {
   parseLightningAddress,

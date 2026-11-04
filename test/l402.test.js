@@ -17,6 +17,7 @@
 
 const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+require('./fixtures/public_dns_stub'); // never query real DNS (resolved-address guard)
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -439,6 +440,9 @@ describe('l402_pay dry-run flow', () => {
   let stderrLines = [];
   const originalStdout = console.log;
   const originalStderr = console.error;
+  const budgetPath = path.join(scriptsDir, '_budget.js');
+  const originalHomedir = os.homedir;
+  let homeDir;
 
   before(() => {
     process.env.BLINK_API_KEY = 'blink_test_key';
@@ -459,15 +463,28 @@ describe('l402_pay dry-run flow', () => {
     console.error = originalStderr;
   });
 
+  // v3.0.2: these tests used to seed (and restore) the developer's REAL
+  // ~/.blink/l402-tokens.json. Every test now gets a throwaway home, and every
+  // module that resolves os.homedir() at load is re-bound to it BEFORE the test.
+  beforeEach(() => {
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-dryrun-'));
+    os.homedir = () => homeDir;
+    for (const p of [payPath, discoverPath, storePath, clientPath, budgetPath]) {
+      delete require.cache[require.resolve(p)];
+    }
+  });
+
   afterEach(() => {
     stdoutLines = [];
     stderrLines = [];
     global.fetch = originalFetch;
+    os.homedir = originalHomedir;
+    process.exitCode = 0;
+    fs.rmSync(homeDir, { recursive: true, force: true });
     // Bust require cache so each test starts fresh
-    delete require.cache[require.resolve(payPath)];
-    delete require.cache[require.resolve(discoverPath)];
-    delete require.cache[require.resolve(storePath)];
-    delete require.cache[require.resolve(clientPath)];
+    for (const p of [payPath, discoverPath, storePath, clientPath, budgetPath]) {
+      delete require.cache[require.resolve(p)];
+    }
   });
 
   it('dry-run emits l402_dry_run event for Lightning Labs 402 response', async () => {
@@ -555,7 +572,7 @@ describe('l402_pay dry-run flow', () => {
     }
 
     // Should have exited with code 1 (budget exceeded — not a dry-run event)
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode ?? process.exitCode, 1);
     const out = JSON.parse(stdoutLines.join('\n'));
     assert.equal(out.event, 'l402_budget_exceeded');
     assert.equal(out.satoshis, 100_000); // lnbc1000u = 100_000 sats
@@ -772,7 +789,7 @@ describe('l402_pay dry-run flow', () => {
       assert.equal(out.status, 403);
       assert.equal(out.tokenReused, true);
       assert.ok(typeof out.message === 'string' && out.message.includes('403'), 'message must mention the status');
-      assert.equal(exitCode, 1, 'must exit with code 1 on error');
+      assert.equal(exitCode ?? process.exitCode, 1, 'must exit with code 1 on error');
     } finally {
       process.exit = originalExit;
       if (previousStore === null) {
@@ -1385,11 +1402,16 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     // developer's real files, and starts unconfigured for every test.
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-l402-enforce-'));
     os.homedir = () => tmpDir;
-    // Re-bind the budget module to this test's tmpDir: BLINK_DIR resolves
-    // os.homedir() at module load, and a file-load-time instance (bound to
-    // the real home) would otherwise leak across tests — reading and writing
-    // the developer's real spending log.
-    delete require.cache[require.resolve(budgetPath)];
+    // Re-bind EVERY module that resolves os.homedir() at load to this test's
+    // tmpDir. Clearing only _budget was not enough: l402_pay captures its own
+    // _budget/l402_store references at load, so an l402_pay instance cached by
+    // an EARLIER describe (bound to the real home) kept writing the
+    // developer's real ~/.blink/spending-log.json and l402-tokens.json
+    // (v3.0.2: a fake 100000-sat spend landed in the real log). afterEach
+    // alone cannot protect the first test of this suite.
+    for (const p of [payPath, discoverPath, storePath, budgetPath, clientPath, sparkPayPath]) {
+      delete require.cache[require.resolve(p)];
+    }
     delete process.env.BLINK_BUDGET_HOURLY_SATS;
     delete process.env.BLINK_BUDGET_DAILY_SATS;
     delete process.env.BLINK_L402_ALLOWED_DOMAINS;
@@ -1400,6 +1422,7 @@ describe('l402_pay enforcement (non-dry-run)', () => {
   afterEach(() => {
     global.fetch = originalFetch;
     os.homedir = originalHomedir;
+    process.exitCode = 0; // the v3.0.2 failure events set exitCode instead of exiting
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -1443,7 +1466,9 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     } finally {
       process.exit = originalExit;
     }
-    return exitCode;
+    // JSON-emitting refusals set process.exitCode and return (PR #25): the
+    // trapped hard exit, else the exit code the process would end with.
+    return exitCode ?? (process.exitCode || null);
   }
 
   function output() {
@@ -2473,6 +2498,378 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     assert.equal(out.event, 'l402_budget_exceeded');
     assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
   });
+
+  // ── v3.0.2 hardening (FT7 field test + ClawHub 3.0.1 scan) ──────────────────
+
+  /** Make every CREDENTIALED request to the paywall die like FT7's did. */
+  function credentialedRequestsDie() {
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (
+        String(url) === 'https://paywall.example.com/resource' &&
+        opts &&
+        opts.headers &&
+        opts.headers.Authorization
+      ) {
+        throw new TypeError('terminated', { cause: new Error('Decompression failed') });
+      }
+      return inner(url, opts);
+    };
+  }
+
+  it('FT7: a request that dies AFTER payment still emits machine-readable JSON (token stored)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(process.exitCode, 1);
+    const out = output(); // stdout must never be empty after money moved
+    assert.equal(out.event, 'l402_paid_retry_failed');
+    assert.equal(out.paymentStatus, 'SUCCESS');
+    assert.equal(out.paymentHash, 'b'.repeat(64));
+    assert.equal(out.satoshis, 100000);
+    assert.equal(out.tokenStored, true);
+    assert.match(out.error, /terminated.*Decompression failed/);
+    assert.match(out.message, /re-run/i, 'recovery hint: the cached token can be retried without paying');
+  });
+
+  it('FT7: with --no-store, the post-payment failure says the token was NOT kept', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource', '--no-store']);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
+    const out = output();
+    assert.equal(out.event, 'l402_paid_retry_failed');
+    assert.equal(out.tokenStored, false);
+    assert.match(out.message, /--no-store/);
+  });
+
+  it('FT7: a cached-token reuse that dies emits l402_reuse_failed (no payment made)', async () => {
+    configureAutoPay();
+    require(storePath).saveToken('https://paywall.example.com/resource', {
+      macaroon: 'TESTMAC==',
+      preimage: 'c'.repeat(64),
+      satoshis: 100000,
+    });
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsDie();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
+    const out = output();
+    assert.equal(out.event, 'l402_reuse_failed');
+    assert.equal(out.tokenReused, true);
+    assert.match(out.error, /terminated/);
+    assert.ok(!requestedUrls.some((u) => u.includes('graphql')), 'no payment was attempted');
+  });
+
+  it('FT7: --dry-run --probe reports the estimated routing fee (it used to be silently ignored)', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const inner = global.fetch;
+    let paid = false;
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('graphql')) {
+        const q = JSON.parse(opts.body).query || '';
+        if (q.includes('lnInvoicePaymentSend')) paid = true;
+        if (q.includes('lnInvoiceFeeProbe')) {
+          const data = { lnInvoiceFeeProbe: { amount: 3, errors: [] } };
+          return {
+            ok: true,
+            status: 200,
+            url: String(url),
+            headers: { get: () => 'application/json' },
+            json: async () => ({ data }),
+            text: async () => JSON.stringify({ data }),
+          };
+        }
+      }
+      return inner(url, opts);
+    };
+    const code = await runPay(['https://paywall.example.com/resource', '--dry-run', '--probe']);
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_dry_run');
+    assert.deepEqual(out.feeProbe, { estimatedFeeSats: 3, error: null });
+    assert.equal(paid, false, 'a dry-run never pays');
+  });
+
+  it('ClawHub 3.0.1 scan: a placeholder preimage (no paymentHash) is never cached as a paid token', async () => {
+    configureAutoPay();
+    mockPayment({ status: 'SUCCESS' });
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('graphql') && (JSON.parse(opts.body).query || '').includes('lnInvoicePaymentSend')) {
+        const data = { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [], transaction: null } };
+        return {
+          ok: true,
+          status: 200,
+          url: String(url),
+          headers: { get: () => 'application/json' },
+          json: async () => ({ data }),
+          text: async () => JSON.stringify({ data }),
+        };
+      }
+      return inner(url, opts);
+    };
+    await runPay(['https://paywall.example.com/resource']);
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.preimagePlaceholder, true);
+    const store = require(storePath).listTokens();
+    assert.deepEqual(store, [], 'a fabricated preimage is not a proof of payment — do not cache it');
+  });
+
+  // PR #25 review (Medium): a URL_POLICY refusal on the credentialed request
+  // was re-thrown — stderr-only, even though the payment had settled.
+  function credentialedRequestsRedirectToForbiddenHost() {
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (
+        String(url) === 'https://paywall.example.com/resource' &&
+        opts &&
+        opts.headers &&
+        opts.headers.Authorization
+      ) {
+        requestedUrls.push(String(url));
+        return {
+          status: 302,
+          url: String(url),
+          headers: { get: (n) => (n.toLowerCase() === 'location' ? 'https://forbidden.example/x' : null) },
+          text: async () => '',
+        };
+      }
+      return inner(url, opts);
+    };
+  }
+
+  it('PR #25: a POLICY refusal after payment still emits l402_paid_retry_failed (errorCode URL_POLICY)', async () => {
+    configureAutoPay(); // allowlist = paywall.example.com only
+    mockPayment({ status: 'SUCCESS' });
+    const inner = global.fetch;
+    global.fetch = async (url, opts) => {
+      requestedUrls.push(String(url));
+      return inner(url, opts);
+    };
+    credentialedRequestsRedirectToForbiddenHost();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
+    const out = output();
+    assert.equal(out.event, 'l402_paid_retry_failed');
+    assert.equal(out.errorCode, 'URL_POLICY');
+    assert.match(out.error, /forbidden\.example/);
+    assert.equal(out.paymentHash, 'b'.repeat(64));
+    assert.equal(out.tokenStored, true);
+    assert.ok(!requestedUrls.includes('https://forbidden.example/x'), 'the forbidden host is never fetched');
+  });
+
+  it('PR #25: a POLICY refusal on cache reuse emits l402_reuse_failed (errorCode URL_POLICY)', async () => {
+    configureAutoPay();
+    require(storePath).saveToken('https://paywall.example.com/resource', {
+      macaroon: 'TESTMAC==',
+      preimage: 'c'.repeat(64),
+      satoshis: 100000,
+    });
+    mockPayment({ status: 'SUCCESS' });
+    credentialedRequestsRedirectToForbiddenHost();
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, 1);
+    assert.equal(process.exitCode, 1, 'set via exitCode, not a hard exit');
+    const out = output();
+    assert.equal(out.event, 'l402_reuse_failed');
+    assert.equal(out.errorCode, 'URL_POLICY');
+  });
+
+  // PR #25 review (Medium): relax-only probing must not let a public server
+  // pivot to an allowlisted PRIVATE host via a redirect or payment_request_url.
+  function pivotFetch({ via, target = 'http://127.0.0.1:6379' }) {
+    global.fetch = async (url) => {
+      const u = String(url);
+      requestedUrls.push(u);
+      if (u.startsWith('https://attacker.example/')) {
+        if (via === 'redirect') {
+          return {
+            status: 302,
+            url: u,
+            headers: { get: (n) => (n.toLowerCase() === 'location' ? `${target}/x` : null) },
+            text: async () => '',
+          };
+        }
+        const body = { version: '0.2', payment_request_url: `${target}/pay`, offers: [] };
+        return {
+          status: 402,
+          ok: false,
+          url: u,
+          headers: { get: (n) => (n.toLowerCase() === 'content-type' ? 'application/json' : null) },
+          text: async () => JSON.stringify(body),
+          json: async () => body,
+        };
+      }
+      return {
+        status: 200,
+        ok: true,
+        url: u,
+        headers: { get: () => null },
+        text: async () => '{}',
+        json: async () => ({}),
+      };
+    };
+  }
+
+  async function runDiscover(url) {
+    process.argv = ['node', 'l402_discover.js', url];
+    const { main } = require(discoverPath);
+    const originalExit = process.exit;
+    process.exit = (c) => {
+      throw new Error(`process.exit(${c})`);
+    };
+    try {
+      await main();
+      return null;
+    } catch (err) {
+      return err;
+    } finally {
+      process.exit = originalExit;
+    }
+  }
+
+  const loopbackHit = () =>
+    requestedUrls.some((u) => /127\.0\.0\.1|ip6-localhost|ip6-loopback|rebind\.example/.test(u));
+
+  it('PR #25: l402-discover — a public redirect cannot pivot to an allowlisted private host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
+    pivotFetch({ via: 'redirect' });
+    const err = await runDiscover('https://attacker.example/start');
+    assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+    assert.equal(loopbackHit(), false, 'the loopback service is never requested');
+  });
+
+  it('PR #25: l402-discover — a public payment_request_url cannot pivot to an allowlisted private host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
+    pivotFetch({ via: 'payment_request_url' });
+    const err = await runDiscover('https://attacker.example/start');
+    assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+    assert.equal(loopbackHit(), false, 'the loopback service is never requested');
+  });
+
+  // PR #25 review round 2: loopback ALIASES and names that RESOLVE to loopback.
+  for (const target of ['https://ip6-localhost:6379', 'https://ip6-loopback:6379', 'https://rebind.example:6379']) {
+    for (const via of ['redirect', 'payment_request_url']) {
+      it(`PR #25 r2: l402-discover — a public ${via} to ${target} receives no request`, async () => {
+        process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
+        const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+        const prev = globalThis[RESOLVER];
+        globalThis[RESOLVER] = async (h) =>
+          h === 'rebind.example' ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.215.14', family: 4 }];
+        try {
+          pivotFetch({ via, target });
+          const err = await runDiscover('https://attacker.example/start');
+          assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+          assert.equal(loopbackHit(), false, 'the loopback alias is never requested');
+        } finally {
+          globalThis[RESOLVER] = prev;
+        }
+      });
+    }
+  }
+
+  for (const via of ['redirect', 'payment_request_url']) {
+    it(`PR #25 r3: l402-discover — a ${via} target whose lookup fails (EAI_AGAIN) is refused, never requested`, async () => {
+      const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+      const prev = globalThis[RESOLVER];
+      globalThis[RESOLVER] = async (h) => {
+        if (h === 'rebind.example') throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+        return [{ address: '93.184.215.14', family: 4 }];
+      };
+      try {
+        pivotFetch({ via, target: 'https://rebind.example:6379' });
+        const err = await runDiscover('https://attacker.example/start');
+        assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+        assert.equal(loopbackHit(), false, 'the unverified target is never requested');
+      } finally {
+        globalThis[RESOLVER] = prev;
+      }
+    });
+  }
+
+  it('PR #25 r2: with NO allowlist (the default), a public redirect to a name resolving to loopback is refused', async () => {
+    const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+    const prev = globalThis[RESOLVER];
+    globalThis[RESOLVER] = async (h) =>
+      h === 'rebind.example' ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.215.14', family: 4 }];
+    try {
+      pivotFetch({ via: 'redirect', target: 'https://rebind.example:6379' });
+      const err = await runDiscover('https://attacker.example/start');
+      assert.ok(err && err.code === 'URL_POLICY', `expected a URL_POLICY refusal, got ${err && err.message}`);
+      assert.equal(loopbackHit(), false);
+    } finally {
+      globalThis[RESOLVER] = prev;
+    }
+  });
+
+  it('PR #25: l402-pay --dry-run — a public payment_request_url cannot pivot to an allowlisted private host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = '127.0.0.1';
+    pivotFetch({ via: 'payment_request_url' });
+    process.argv = ['node', 'l402_pay.js', 'https://attacker.example/start', '--dry-run'];
+    const { main } = require(payPath);
+    await assert.rejects(main(), (err) => err.code === 'URL_POLICY');
+    assert.equal(loopbackHit(), false, 'the loopback service is never requested');
+  });
+
+  // FT7 finding: l402-discover and l402-pay --dry-run are documented as
+  // UNGATED (the allowlist is a payment policy), but a configured allowlist
+  // was enforced as an exclusive host list on their fetches.
+  it('FT7: --dry-run is not blocked by a configured allowlist that omits the host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'some-other.example';
+    mock402(INVOICE_100K);
+    const code = await runPay(['https://paywall.example.com/resource', '--dry-run']);
+    assert.equal(code, null);
+    assert.equal(output().event, 'l402_dry_run');
+  });
+
+  it('FT7: l402-discover is not blocked by a configured allowlist that omits the host', async () => {
+    process.env.BLINK_L402_ALLOWED_DOMAINS = 'some-other.example';
+    mock402(INVOICE_100K);
+    process.argv = ['node', 'l402_discover.js', 'https://paywall.example.com/resource'];
+    const { main } = require(discoverPath);
+    const originalExit = process.exit;
+    process.exit = (c) => {
+      throw new Error(`process.exit(${c})`);
+    };
+    try {
+      await main();
+    } finally {
+      process.exit = originalExit;
+    }
+    const out = output();
+    assert.equal(out.url, 'https://paywall.example.com/resource');
+    assert.equal(out.l402_detected, true, 'the 402 challenge was discovered');
+  });
+
+  it('FT7: a non-dry-run refusal names the L402 allowlist, not a "non-Blink host"', async () => {
+    configureAutoPay(); // allowlist = paywall.example.com
+    global.fetch = async (url) => {
+      requestedUrls.push(String(url));
+      return {
+        status: 302,
+        url: String(url),
+        headers: { get: (n) => (n.toLowerCase() === 'location' ? 'https://elsewhere.example/x' : null) },
+        text: async () => '',
+      };
+    };
+    process.argv = ['node', 'l402_pay.js', 'https://paywall.example.com/resource'];
+    const { main } = require(payPath);
+    await assert.rejects(main(), (err) => {
+      assert.equal(err.code, 'URL_POLICY');
+      assert.match(err.message, /not in the L402 budget allowlist/);
+      assert.doesNotMatch(err.message, /non-Blink/);
+      return true;
+    });
+    assert.ok(!requestedUrls.includes('https://elsewhere.example/x'), 'the out-of-policy host is never fetched');
+  });
 });
 
 // ── Security-audit fixes (v2.6.1) ─────────────────────────────────────────────
@@ -2480,6 +2877,260 @@ describe('l402_pay enforcement (non-dry-run)', () => {
 const { assertAllowedUrl, fetchWithRetry } = require(path.join(scriptsDir, '_lnurl'));
 const { writeSecureFileAtomic, ensureSecureStateDir } = require(path.join(scriptsDir, '_secure_files'));
 const { getAllowHosts } = require(path.join(scriptsDir, '_budget'));
+
+// FT7 (v3.0.2): the L402 budget allowlist is a PAYMENT policy. As an exclusive
+// host list it gates every non-dry-run l402-pay fetch; for the documented
+// ungated probes (l402-discover, l402-pay --dry-run) it may only RELAX the
+// SSRF guard (permit a listed private/local host), never restrict.
+describe('security: L402 allowlist policy (v3.0.2)', () => {
+  const { l402Allowlist } = require(path.join(scriptsDir, '_lnurl'));
+
+  it('exclusive mode refuses an unlisted host, naming the L402 allowlist (not "non-Blink host")', () => {
+    assert.throws(
+      () => assertAllowedUrl('https://elsewhere.example/x', l402Allowlist(new Set(['paywall.example.com']))),
+      (err) =>
+        err.code === 'URL_POLICY' &&
+        /not in the L402 budget allowlist/.test(err.message) &&
+        !/non-Blink/.test(err.message),
+    );
+    assert.doesNotThrow(() =>
+      assertAllowedUrl('https://paywall.example.com/x', l402Allowlist(new Set(['paywall.example.com']))),
+    );
+  });
+
+  it('relax-only mode lets an unlisted PUBLIC host through', () => {
+    const policy = l402Allowlist(new Set(['paywall.example.com']), {
+      relaxOnly: true,
+      operatorUrl: 'https://elsewhere.example/x',
+    });
+    assert.doesNotThrow(() => assertAllowedUrl('https://elsewhere.example/x', policy));
+  });
+
+  it('relax-only mode still refuses unlisted private/plaintext targets, and permits the operator’s LISTED local host', () => {
+    const policy = l402Allowlist(new Set(['127.0.0.1']), {
+      relaxOnly: true,
+      operatorUrl: 'http://127.0.0.1:8080/x',
+    });
+    assert.throws(() => assertAllowedUrl('https://10.0.0.5/x', policy), /private address/);
+    assert.throws(() => assertAllowedUrl('http://elsewhere.example/x', policy), /plaintext http/);
+    assert.throws(
+      () => assertAllowedUrl('https://localhost/x', policy, 'L402 URL', { strictLocal: true }),
+      /local host/,
+    );
+    assert.doesNotThrow(() =>
+      assertAllowedUrl('http://127.0.0.1:8080/x', policy, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+    );
+  });
+
+  // PR #25 review (Medium): the private/local exception must be bound to the
+  // host the OPERATOR chose. Otherwise any public probe could redirect — or
+  // name a payment_request_url — at an allowlisted private service (SSRF pivot).
+  it('relax-only: a listed private host is NOT reachable from a public operator URL (no pivot)', () => {
+    const policy = l402Allowlist(new Set(['127.0.0.1']), {
+      relaxOnly: true,
+      operatorUrl: 'https://attacker.example/start',
+    });
+    assert.doesNotThrow(() => assertAllowedUrl('https://attacker.example/start', policy));
+    assert.throws(
+      () => assertAllowedUrl('http://127.0.0.1:6379/x', policy, 'L402 URL redirect target', { strictLocal: true }),
+      (err) => err.code === 'URL_POLICY',
+    );
+  });
+
+  it('a trailing root dot is normalized on BOTH the operator URL and the allowlist entries', () => {
+    for (const [listed, operatorUrl] of [
+      ['mynode.lan', 'https://mynode.lan./x'],
+      ['mynode.lan.', 'https://mynode.lan/x'],
+    ]) {
+      const policy = l402Allowlist(new Set([listed]), { relaxOnly: true, operatorUrl });
+      assert.doesNotThrow(
+        () => assertAllowedUrl(operatorUrl, policy, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+        `${listed} vs ${operatorUrl}`,
+      );
+      assert.doesNotThrow(() => assertAllowedUrl(operatorUrl, l402Allowlist(new Set([listed]))));
+    }
+  });
+
+  it('relax-only without an operatorUrl fails closed (never an unbound exception)', () => {
+    assert.throws(() => l402Allowlist(new Set(['127.0.0.1']), { relaxOnly: true }), /operatorUrl/);
+  });
+
+  it('no configured allowlist stays null (unchanged behavior)', () => {
+    assert.equal(l402Allowlist(null), null);
+    assert.equal(l402Allowlist(null, { relaxOnly: true, operatorUrl: 'https://a.example/' }), null);
+  });
+});
+
+// PR #25 review round 2 (Medium): the guard classified HOSTNAME STRINGS only,
+// so any name that RESOLVES to a private address passed — loopback aliases
+// (ip6-localhost, localhost., *.localhost) and attacker DNS (127.0.0.1.nip.io)
+// alike, in every mode incl. the default no-allowlist one (since v2.6.1).
+// The walker now checks the resolved addresses of every name it fetches.
+describe('security: resolved-address guard (v3.0.2)', () => {
+  const RESOLVER = Symbol.for('blink-skills.test.hostResolver');
+  const { l402Allowlist } = require(path.join(scriptsDir, '_lnurl'));
+  const originalFetch = global.fetch;
+  let previousResolver;
+  let fetched;
+
+  beforeEach(() => {
+    previousResolver = globalThis[RESOLVER];
+    fetched = [];
+    global.fetch = async (url) => {
+      fetched.push(String(url));
+      return { status: 200, ok: true, url: String(url), headers: { get: () => null }, text: async () => '' };
+    };
+  });
+  afterEach(() => {
+    globalThis[RESOLVER] = previousResolver;
+    global.fetch = originalFetch;
+  });
+
+  /** Resolve names per a table; anything else resolves public. */
+  function resolveAs(table) {
+    globalThis[RESOLVER] = async (host) => {
+      if (host in table) {
+        if (table[host] instanceof Error) throw table[host];
+        return [].concat(table[host]).map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+      }
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+  }
+
+  const L402 = { what: 'L402 URL', portsUnrestricted: true, strictLocal: true, retries: 0, timeoutMs: 2000 };
+
+  for (const address of ['127.0.0.1', '::1', '10.0.0.5', '169.254.169.254', '::ffff:7f00:1']) {
+    it(`refuses a public-looking name that resolves to ${address} (no allowlist, the default)`, async () => {
+      resolveAs({ 'rebind.example': address });
+      await assert.rejects(fetchWithRetry('https://rebind.example:6379/x', L402), (err) => {
+        assert.equal(err.code, 'URL_POLICY');
+        assert.match(err.message, /resolves to/);
+        return true;
+      });
+      assert.deepEqual(fetched, [], 'no request is sent');
+    });
+  }
+
+  it('refuses a name with ANY private address among several', async () => {
+    resolveAs({ 'mixed.example': ['93.184.215.14', '127.0.0.1'] });
+    await assert.rejects(fetchWithRetry('https://mixed.example/x', L402), (err) => err.code === 'URL_POLICY');
+    assert.deepEqual(fetched, []);
+  });
+
+  for (const host of ['ip6-localhost', 'ip6-loopback', 'localhost.', 'foo.localhost', 'localhost.localdomain']) {
+    it(`treats ${host} as a local name (refused under strictLocal, no DNS needed)`, () => {
+      resolveAs({}); // would resolve "public" — the name itself must be enough
+      assert.throws(
+        () =>
+          assertAllowedUrl(`https://${host}:6379/x`, null, 'L402 URL', { strictLocal: true, portsUnrestricted: true }),
+        (err) => err.code === 'URL_POLICY',
+      );
+    });
+  }
+
+  it('a redirect to a name resolving to loopback is refused before it is requested', async () => {
+    resolveAs({ 'rebind.example': '127.0.0.1' });
+    global.fetch = async (url) => {
+      fetched.push(String(url));
+      return {
+        status: 302,
+        url: String(url),
+        headers: { get: (n) => (n.toLowerCase() === 'location' ? 'https://rebind.example:6379/x' : null) },
+        text: async () => '',
+      };
+    };
+    await assert.rejects(fetchWithRetry('https://public.example/start', L402), (err) => err.code === 'URL_POLICY');
+    assert.deepEqual(fetched, ['https://public.example/start'], 'only the public start was requested');
+  });
+
+  // PR #25 review round 3 (Medium): an indeterminate lookup used to be
+  // treated as permitted — but fetch() resolves AGAIN, independently, so a
+  // transient policy-lookup failure followed by a private answer at connect
+  // time was never checked at all. Fail closed: no verified answer, no request.
+  for (const code of ['EAI_AGAIN', 'ENOTFOUND', 'ESERVFAIL']) {
+    it(`a lookup failing with ${code} is REFUSED and no request is sent (fail closed)`, async () => {
+      resolveAs({ 'flaky.example': Object.assign(new Error(`getaddrinfo ${code}`), { code }) });
+      await assert.rejects(fetchWithRetry('https://flaky.example/x', L402), (err) => {
+        assert.equal(err.code, 'URL_POLICY');
+        assert.match(err.message, /could not verify/);
+        return true;
+      });
+      assert.deepEqual(fetched, []);
+    });
+  }
+
+  for (const [label, answer] of [
+    ['an empty answer', []],
+    ['an entry without an address', [{}]],
+    ['a non-IP address', [{ address: 'not-an-ip', family: 4 }]],
+    ['a non-array answer', 'garbage'],
+  ]) {
+    it(`${label} is REFUSED (an unverifiable answer is not "nothing private")`, async () => {
+      globalThis[Symbol.for('blink-skills.test.hostResolver')] = async () => answer;
+      await assert.rejects(fetchWithRetry('https://odd.example/x', L402), (err) => err.code === 'URL_POLICY');
+      assert.deepEqual(fetched, []);
+    });
+  }
+
+  it('a lookup that never answers is bounded by the request deadline and REFUSED', { timeout: 3000 }, async () => {
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = () => new Promise(() => {});
+    const started = Date.now();
+    await assert.rejects(
+      fetchWithRetry('https://slow.example/x', { ...L402, timeoutMs: 200 }),
+      (err) => err.code === 'URL_POLICY',
+    );
+    assert.ok(Date.now() - started < 2000, 'bounded by the deadline, not hanging');
+    assert.deepEqual(fetched, []);
+  });
+
+  it('resolves exactly the hostname the fetch will use (an absolute trailing-dot name stays absolute)', async () => {
+    const asked = [];
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = async (h) => {
+      asked.push(h);
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+    await fetchWithRetry('https://abs.example./x', L402);
+    assert.deepEqual(asked, ['abs.example.']);
+  });
+
+  it('a transient lookup failure is RETRIED like any transient fault, then the verified request proceeds', async () => {
+    let calls = 0;
+    globalThis[Symbol.for('blink-skills.test.hostResolver')] = async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+      return [{ address: '93.184.215.14', family: 4 }];
+    };
+    await fetchWithRetry('https://retry.example/x', { ...L402, retries: 1 });
+    assert.equal(calls, 2);
+    assert.deepEqual(fetched, ['https://retry.example/x'], 'exactly one request, after a verified answer');
+  });
+
+  it('control: an operator-allowlisted LAN name that resolves private is still reachable (exclusive mode)', async () => {
+    resolveAs({ 'mynode.lan': '192.168.1.5' });
+    await fetchWithRetry('https://mynode.lan:8443/x', {
+      ...L402,
+      allowedHosts: l402Allowlist(new Set(['mynode.lan'])),
+    });
+    assert.deepEqual(fetched, ['https://mynode.lan:8443/x']);
+  });
+
+  it('control: relax-only keeps the operator’s own listed LAN name, but not for other names', async () => {
+    resolveAs({ 'mynode.lan': '192.168.1.5', 'rebind.example': '127.0.0.1' });
+    const policy = l402Allowlist(new Set(['mynode.lan']), { relaxOnly: true, operatorUrl: 'https://mynode.lan/x' });
+    await fetchWithRetry('https://mynode.lan/x', { ...L402, allowedHosts: policy });
+    await assert.rejects(
+      fetchWithRetry('https://rebind.example/x', { ...L402, allowedHosts: policy }),
+      (err) => err.code === 'URL_POLICY',
+    );
+    assert.deepEqual(fetched, ['https://mynode.lan/x']);
+  });
+
+  it('control: LNURL regtest plaintext localhost (no allowlist, non-strict) still works', async () => {
+    resolveAs({});
+    await fetchWithRetry('http://localhost:3002/lnurlp/x', { what: 'LNURL', retries: 0, timeoutMs: 2000 });
+    assert.deepEqual(fetched, ['http://localhost:3002/lnurlp/x']);
+  });
+});
 
 describe('security: L402 SSRF guard (audit fix 1)', () => {
   it('refuses private/loopback/metadata targets even with NO allowlist configured', () => {

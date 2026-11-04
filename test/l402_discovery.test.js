@@ -341,7 +341,10 @@ describe('l402_info --report enforcement delegation', () => {
     } finally {
       process.exit = originalExit;
     }
-    return { exitCode, blinkCalls };
+    // l402_pay's JSON refusals set process.exitCode and return (PR #25).
+    const code = exitCode ?? (process.exitCode || null);
+    process.exitCode = 0;
+    return { exitCode: code, blinkCalls };
   }
 
   it('is denied by the allowlist when nothing is configured', async () => {

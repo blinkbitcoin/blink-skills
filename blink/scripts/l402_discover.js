@@ -29,9 +29,10 @@
 // fix: this script previously used bare fetch with redirect:'follow'). Discovery
 // deliberately has NO allowlist payment gate — it is the documented public
 // prober — but every fetch is SSRF-guarded: private/loopback/link-local
-// targets refused (unless the host appears in a configured budget allowlist),
+// targets refused (unless the host appears in a configured budget allowlist,
+// which here only RELAXES the guard — see l402Allowlist),
 // redirects followed manually and re-validated per hop.
-const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin } = require('./_lnurl');
+const { fetchWithRetry, assertAllowedUrl, withholdHeadersIfCrossOrigin, l402Allowlist } = require('./_lnurl');
 const { getAllowHosts } = require('./_budget');
 
 // ── Inline L402 parsing ───────────────────────────────────────────────────────
@@ -148,7 +149,11 @@ async function fetchL402ProtocolInvoice(paymentRequestUrl, timeoutMs = 15_000, a
     // Response shape: { invoice: "lnbc...", ... } or { payment_request: "lnbc..." }
     const invoice = data.invoice || data.payment_request || null;
     return invoice ? { invoice, offerId: data.offer_id || null } : null;
-  } catch {
+  } catch (err) {
+    // A policy refusal raised INSIDE the walker (a hostile redirect hop, or a
+    // name resolving to a private address) must fail loud too — it was
+    // swallowed into the graceful null (PR #25 review round 2).
+    if (err && err.code === 'URL_POLICY') throw err;
     return null;
   }
 }
@@ -306,7 +311,11 @@ async function main() {
 
   // Resolve canonical URL (follow any HTTP redirects) so the probe always
   // hits the final endpoint and reports the correct URL.
-  const allowHosts = getAllowHosts();
+  // FT7 (v3.0.2): discovery is the documented UNGATED prober — the budget
+  // allowlist may only relax the SSRF guard here (permit a listed private/local
+  // host), never restrict public hosts. It was passed as an exclusive list.
+  // The private/local exception is bound to the host the operator chose (PR #25 review).
+  const allowHosts = l402Allowlist(getAllowHosts(), { relaxOnly: true, operatorUrl: args.url });
   const canonicalUrl = await resolveCanonicalUrl(args.url, 10_000, allowHosts);
   if (canonicalUrl !== args.url) {
     console.error(`Resolved redirect: ${args.url} → ${canonicalUrl}`);
