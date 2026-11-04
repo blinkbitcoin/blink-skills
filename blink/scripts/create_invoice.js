@@ -36,6 +36,7 @@ const {
   getWallet,
   subscribeToInvoice,
   MUTATION_TIMEOUT_MS,
+  exitAfterStdout,
 } = require('./_blink_client');
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
@@ -157,7 +158,8 @@ async function main() {
   // Phase 2: Auto-subscribe to payment status (unless opted out)
   if (args.noSubscribe) {
     console.error('Subscription skipped (--no-subscribe).');
-    process.exit(0);
+    exitAfterStdout(0); // flush piped stdout first (v3.0.3 sweep)
+    return;
   }
 
   // Graceful fallback when WebSocket is not available
@@ -176,7 +178,8 @@ async function main() {
     timeoutSeconds: args.timeoutSeconds,
     onResult(resultObj, exitCode) {
       console.log(JSON.stringify(resultObj, null, 2));
-      process.exit(exitCode);
+      exitAfterStdout(exitCode); // flush piped stdout first (v3.0.3 sweep)
+      return;
     },
   });
 }

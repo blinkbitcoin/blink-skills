@@ -380,6 +380,63 @@ describe('l402_store token CRUD', () => {
     assert.equal(token.macaroon, 'NEW');
   });
 
+  // FT8 finding: the store recorded expiresAt: null although the server's
+  // macaroon carried an `expires = <unix>` caveat (lightningenable tokens live
+  // ~1 h), so a stale token was replayed and answered 402. The expiry is now
+  // read from a plain-text first-party caveat — on save, and on read for
+  // entries cached without it — and an expired entry counts as absent.
+  describe('macaroon expiry caveat (FT8)', () => {
+    const mac = (text) => Buffer.from(`\x02\x01\x0clocation\x02\x10${text}\x00garbage`, 'latin1').toString('base64');
+    const past = Math.floor(Date.now() / 1000) - 60;
+    const future = Math.floor(Date.now() / 1000) + 3600;
+
+    it('reads `expires = <unix>` (FT8 live format) and `<service>_valid_until=<unix>`', () => {
+      assert.equal(storeModule.macaroonExpiryMs(mac(`expires = ${future}`)), future * 1000);
+      assert.equal(storeModule.macaroonExpiryMs(mac(`air_valid_until=${future}`)), future * 1000);
+      assert.equal(storeModule.macaroonExpiryMs(mac('services=ping:0')), null, 'no expiry caveat');
+      assert.equal(storeModule.macaroonExpiryMs('not base64 !!'), null);
+      assert.equal(storeModule.macaroonExpiryMs(mac('expires = 3600')), null, 'a short number is not a timestamp');
+    });
+
+    it('takes the EARLIEST of several expiry caveats', () => {
+      const m = mac(`expires = ${future}\x00expires = ${future - 100}`);
+      assert.equal(storeModule.macaroonExpiryMs(m), (future - 100) * 1000);
+    });
+
+    it('saveToken records the caveat expiry; an expired token is never returned for reuse', () => {
+      storeModule.saveToken('https://expired.example/x', {
+        macaroon: mac(`expires = ${past}`),
+        preimage: 'a'.repeat(64),
+      });
+      assert.equal(storeModule.getToken('https://expired.example/x'), null);
+      const listed = storeModule.listTokens().find((t) => t.domain === 'https://expired.example/x');
+      assert.equal(listed.expired, true);
+      assert.equal(storeModule.clearTokens({ expiredOnly: true }), 1);
+    });
+
+    it('an entry cached WITHOUT expiresAt (pre-3.0.3) is still judged by its macaroon caveat', () => {
+      // Written directly, the way older versions stored it (expiresAt absent).
+      storeModule.saveToken('https://fresh.example/x', {
+        macaroon: mac(`expires = ${future}`),
+        preimage: 'b'.repeat(64),
+      });
+      const raw = require('node:fs');
+      const file = storeModule.STORE_FILE;
+      const store = JSON.parse(raw.readFileSync(file, 'utf8'));
+      store['https://stale.example/x'] = { macaroon: mac(`expires = ${past}`), preimage: 'c'.repeat(64), savedAt: 1 };
+      raw.writeFileSync(file, JSON.stringify(store));
+      assert.equal(storeModule.getToken('https://stale.example/x'), null, 'stale by caveat');
+      assert.ok(storeModule.getToken('https://fresh.example/x'), 'fresh by caveat');
+    });
+
+    it('control: a macaroon without an expiry caveat keeps expiresAt null and stays reusable', () => {
+      storeModule.saveToken('https://noexp.example/x', { macaroon: mac('services=ping:0'), preimage: 'd'.repeat(64) });
+      const t = storeModule.getToken('https://noexp.example/x');
+      assert.ok(t);
+      assert.equal(t.expiresAt ?? null, null);
+    });
+  });
+
   // ClawHub review (v3.0.0): the cache key was hostname + path — scheme and
   // port were dropped, so a token earned at http://h:8080/x was replayed to
   // http://h:9090/x and to http://h/x (plaintext). The key is now the URL's
@@ -2497,6 +2554,43 @@ describe('l402_pay enforcement (non-dry-run)', () => {
     const out = output();
     assert.equal(out.event, 'l402_budget_exceeded');
     assert.match(out.message, /Payment of 2 sats exceeds --max-amount of 1 sats/);
+  });
+
+  // PR #25 review (LOW): the URL guard treats `host.` and `host` as one host,
+  // but the PAYMENT-domain gate did not — an allowlisted host spelled with a
+  // trailing root dot was refused (fail closed, but wrong).
+  for (const [allowlist, url] of [
+    ['paywall.example.com', 'https://paywall.example.com./resource'],
+    ['paywall.example.com.', 'https://paywall.example.com/resource'],
+  ]) {
+    it(`trailing-dot spellings match at the payment-domain gate (${allowlist} vs ${url})`, async () => {
+      process.env.BLINK_L402_ALLOWED_DOMAINS = allowlist;
+      process.env.BLINK_BUDGET_DAILY_SATS = '200000';
+      mockPayment({ status: 'SUCCESS' });
+      const inner = global.fetch;
+      global.fetch = async (u, opts) => inner(String(u).replace('paywall.example.com./', 'paywall.example.com/'), opts);
+      await runPay([url, '--no-store']);
+      const out = output();
+      assert.notEqual(out.event, 'l402_domain_blocked', out.message);
+      assert.equal(out.event, 'l402_paid');
+    });
+  }
+
+  it('FT8: a cached token whose macaroon caveat has EXPIRED is not replayed — the request pays fresh', async () => {
+    configureAutoPay();
+    const past = Math.floor(Date.now() / 1000) - 60;
+    const expiredMac = Buffer.from(`\x02\x01location\x00expires = ${past}\x00`, 'latin1').toString('base64');
+    require(storePath).saveToken('https://paywall.example.com/resource', {
+      macaroon: expiredMac,
+      preimage: 'e'.repeat(64),
+      satoshis: 100000,
+    });
+    mockPayment({ status: 'SUCCESS' });
+    const code = await runPay(['https://paywall.example.com/resource']);
+    assert.equal(code, null);
+    const out = output();
+    assert.equal(out.event, 'l402_paid');
+    assert.equal(out.tokenReused, false, 'the expired token is treated as absent');
   });
 
   // ── v3.0.2 hardening (FT7 field test + ClawHub 3.0.1 scan) ──────────────────

@@ -556,3 +556,217 @@ describe('pay_lnurl', () => {
     await assert.rejects(main, /exceeds --max-amount/);
   });
 });
+
+// ── --max-amount is honored by every command that accepts it (ClawHub 3.0.2 scan) ──
+//
+// ClawScan (3.0.2, concern): pay_invoice parsed --max-amount through the shared
+// parseWalletArg — validated it, then DISCARDED it, so `node pay_invoice.js
+// <invoice> --max-amount 100` paid any amount. Direct script invocation is how
+// ClawHub installs run commands. The ceiling must refuse BEFORE any API call.
+
+describe('--max-amount ceiling (pay_invoice, fee_probe, CLI)', () => {
+  let env;
+  let calls;
+
+  beforeEach(() => {
+    env = setupTestEnv();
+    calls = [];
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      calls.push(body.query.includes('LnInvoicePaymentSend') ? 'PAY' : 'OTHER');
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+  });
+  afterEach(() => {
+    env.restore();
+  });
+
+  it('pay_invoice refuses an invoice above --max-amount before ANY API call', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--max-amount', '500']; // 10u = 1000 sats
+    await assert.rejects(freshRequire('pay_invoice.js').main, /1000 sats exceeds --max-amount ceiling of 500/);
+    assert.deepEqual(calls, [], 'no wallet lookup, no payment');
+  });
+
+  it('pay_invoice refuses on --dry-run too (a preview never green-lights what execution rejects)', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--max-amount', '500', '--dry-run'];
+    await assert.rejects(freshRequire('pay_invoice.js').main, /exceeds --max-amount/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('pay_invoice fails CLOSED when --max-amount is set but the amount cannot be decoded', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbcgarbage', '--max-amount', '500'];
+    await assert.rejects(freshRequire('pay_invoice.js').main, /cannot enforce --max-amount/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('--force does not bypass --max-amount', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--max-amount', '500', '--force'];
+    await assert.rejects(freshRequire('pay_invoice.js').main, /exceeds --max-amount/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('control: pay_invoice pays an invoice AT the ceiling (charge = ceil, 1000 ≤ 1000)', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--max-amount', '1000'];
+    await freshRequire('pay_invoice.js').main();
+    assert.ok(calls.includes('PAY'));
+  });
+
+  it('a fractional invoice is ceilinged on its conservative charge (1400 msat → 2 sats > 1)', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc14000p1p0frac', '--max-amount', '1'];
+    await assert.rejects(freshRequire('pay_invoice.js').main, /2 sats exceeds --max-amount ceiling of 1/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('fee_probe REJECTS --max-amount instead of silently accepting a flag it cannot honor', async () => {
+    process.argv = ['node', 'fee_probe.js', 'lnbc10u1p0ceiling', '--max-amount', '500'];
+    await assert.rejects(freshRequire('fee_probe.js').main, /--max-amount is not supported by fee-probe/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('CLI: `blink pay-invoice … --max-amount` is accepted and enforced (it used to be an Unknown option)', async () => {
+    const { execFile } = require('node:child_process');
+    const binPath = path.resolve(__dirname, '..', 'bin', 'blink.js');
+    const res = await new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        [binPath, 'pay-invoice', 'lnbc10u1p0ceiling', '--max-amount', '500'],
+        {
+          // An unroutable API URL: any network attempt would fail differently.
+          env: {
+            ...process.env,
+            HOME: env.tmpHome,
+            BLINK_API_KEY: 'blink_test',
+            BLINK_API_URL: 'http://127.0.0.1:9/graphql',
+          },
+          timeout: 15000,
+        },
+        (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stderr }),
+      ),
+    );
+    assert.equal(res.code, 1);
+    assert.doesNotMatch(res.stderr, /Unknown option/);
+    assert.match(res.stderr, /exceeds --max-amount ceiling of 500/);
+  });
+});
+
+// ── Strict option parsing on every money-moving script (PR #26 review) ───────
+//
+// The hand-rolled parsers treated anything they did not recognize as an
+// ignored positional: `--max-amount=500` and a valueless `--max-amount` lost
+// the ceiling, and — worse — `--dry-run=true` or a typo like `--dryrun` lost
+// the DRY RUN, so the payment was real. Direct script invocation is the
+// ClawHub install path. Every such argument must now be refused (exit 1)
+// before any credential, network, or SDK call. The `blink` CLI was already
+// strict (node:util parseArgs).
+
+describe('strict options on money-moving scripts (direct invocation)', () => {
+  const { execFile } = require('node:child_process');
+  const PARSE_ERROR = /Unknown option|does not take an argument|argument missing/;
+
+  function runScript(script, args, home) {
+    return new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        [path.join(scriptsDir, script), ...args],
+        {
+          env: {
+            ...process.env,
+            HOME: home,
+            BLINK_API_KEY: 'blink_test',
+            BLINK_API_URL: 'http://127.0.0.1:9/graphql', // unroutable: any network attempt fails differently
+            SPARK_MNEMONIC: '',
+            BREEZ_API_KEY: '',
+          },
+          timeout: 15000,
+        },
+        (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stderr }),
+      ),
+    );
+  }
+
+  const INV = 'lnbc10u1p0strict'; // 1000 sats
+  const cases = [
+    ['pay_invoice.js', [INV, '--dry-run=true']],
+    ['pay_invoice.js', [INV, '--dryrun']],
+    ['pay_invoice.js', [INV, '--max-amount']],
+    ['pay_invoice.js', [INV, '--bogus']],
+    ['pay_lnaddress.js', ['alice@blink.sv', '1000', '--dry-run=true']],
+    ['pay_lnaddress.js', ['alice@blink.sv', '1000', '--max-amount']],
+    ['pay_lnurl.js', ['lnurl1dp68gup69uhnzwfj9cknpvz', '1000', '--dryrun']],
+    ['fee_probe.js', [INV, '--bogus']],
+    ['l402_pay.js', ['https://paywall.example.com/x', '--dry-run=true']],
+    ['l402_pay.js', ['https://paywall.example.com/x', '--max-amount']],
+    ['l402_pay.js', ['https://paywall.example.com/x', '--nostore']],
+    ['spark_send.js', ['alice@blink.sv', '100', '--dry-run=true']],
+    ['spark_send.js', ['alice@blink.sv', '100', '--dryrun']],
+    ['spark_fee_probe.js', ['alice@blink.sv', '100', '--bogus']],
+  ];
+
+  for (const [script, args] of cases) {
+    it(`${script} ${args.slice(-1)[0]} is REFUSED before anything is sent`, async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'blink-strict-'));
+      try {
+        const res = await runScript(script, args, home);
+        assert.equal(res.code, 1, res.stderr);
+        assert.match(res.stderr, PARSE_ERROR);
+        assert.doesNotMatch(res.stderr, /fetch failed|ECONNREFUSED|SPARK_MNEMONIC|BREEZ_API_KEY/);
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('the --opt=value form is honored, not ignored (PR #26 review)', () => {
+  let env;
+  let calls;
+  beforeEach(() => {
+    env = setupTestEnv();
+    calls = [];
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      calls.push(body.query.includes('LnInvoicePaymentSend') ? 'PAY' : 'OTHER');
+      if (body.query.includes('query Me')) {
+        return { ok: true, json: async () => ({ data: MOCK_WALLETS_DATA }), text: async () => '{}' };
+      }
+      if (body.query.includes('LnInvoicePaymentSend')) {
+        return {
+          ok: true,
+          json: async () => ({ data: { lnInvoicePaymentSend: { status: 'SUCCESS', errors: [] } } }),
+          text: async () => '{}',
+        };
+      }
+      throw new Error(`Unhandled query: ${body.query.slice(0, 60)}`);
+    };
+  });
+  afterEach(() => env.restore());
+
+  it('pay_invoice --max-amount=500 enforces the ceiling before ANY API call (the reviewer’s case)', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--max-amount=500'];
+    await assert.rejects(freshRequire('pay_invoice.js').main, /1000 sats exceeds --max-amount ceiling of 500/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('pay_invoice --wallet=USD pays from the USD wallet', async () => {
+    process.argv = ['node', 'pay_invoice.js', 'lnbc10u1p0ceiling', '--wallet=USD', '--dry-run'];
+    await freshRequire('pay_invoice.js').main();
+    const out = env.getStdoutJson();
+    assert.equal(out.walletCurrency, 'USD');
+  });
+
+  it('pay_lnaddress --max-amount=500 refuses a 1000-sat send', async () => {
+    process.argv = ['node', 'pay_lnaddress.js', 'alice@blink.sv', '1000', '--max-amount=500'];
+    await assert.rejects(freshRequire('pay_lnaddress.js').main, /exceeds --max-amount/);
+    assert.deepEqual(calls, []);
+  });
+});

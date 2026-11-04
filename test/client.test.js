@@ -260,3 +260,70 @@ describe('decimalFromBaseOffset', () => {
     assert.equal(decimalFromBaseOffset(0, -5), 0);
   });
 });
+
+// ── exitAfterStdout (v3.0.3: the process.exit sweep) ─────────────────────────
+//
+// process.exit() right after console.log() can cut a PIPED stdout mid-write
+// (PR #25 review measured 8 MiB → 146 KB). Commands that must exit (e.g. to
+// tear down a WebSocket) use exitAfterStdout(code), which exits only once the
+// buffered stdout has been flushed.
+describe('exitAfterStdout', () => {
+  const { execFile } = require('node:child_process');
+  const clientFile = require('node:path').resolve(__dirname, '..', 'blink', 'scripts', '_blink_client.js');
+
+  function runChild(exitExpr) {
+    const code = `
+      const { exitAfterStdout } = require(${JSON.stringify(clientFile)});
+      setInterval(() => {}, 60000); // an open handle, like a WebSocket
+      console.log(JSON.stringify({ big: 'x'.repeat(8 * 1024 * 1024) }));
+      ${exitExpr};`;
+    return new Promise((resolve) =>
+      execFile(
+        process.execPath,
+        ['-e', code],
+        { maxBuffer: 64 * 1024 * 1024, timeout: 15000, killSignal: 'SIGKILL' },
+        (err, stdout) => resolve({ code: err ? err.code : 0, killed: Boolean(err && err.killed), stdout }),
+      ),
+    );
+  }
+
+  it('delivers the COMPLETE piped stdout, then exits with the given code', async () => {
+    const res = await runChild('exitAfterStdout(3)');
+    assert.equal(res.killed, false);
+    assert.equal(res.code, 3);
+    assert.equal(JSON.parse(res.stdout).big.length, 8 * 1024 * 1024);
+  });
+});
+
+// Repo-wide guard: no script may write stdout and then hard-exit directly.
+// Lint-style (source scan) on purpose — it bans a pattern; the behavior is
+// covered by the spawned tests above and in cli_noncustodial.test.js.
+describe('no hard process.exit right after a stdout write', () => {
+  it('every script uses exitAfterStdout (or exitCode + return) after console.log', () => {
+    const fs = require('node:fs');
+    const p = require('node:path');
+    const dir = p.resolve(__dirname, '..', 'blink', 'scripts');
+    const offenders = [];
+    for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+      const lines = fs.readFileSync(p.join(dir, file), 'utf8').split('\n');
+      lines.forEach((line, i) => {
+        if (!/^\s*process\.exit\(/.test(line)) return;
+        // The previous 14 code lines (blank lines and comments skipped).
+        const win = [];
+        for (let j = i - 1; j >= 0 && win.length < 14; j--) {
+          const t = lines[j].trim();
+          if (t && !t.startsWith('//') && !t.startsWith('*')) win.unshift(t);
+        }
+        const lastLog = win.map((t) => /console\.log\(/.test(t)).lastIndexOf(true);
+        if (lastLog === -1) return;
+        // A boundary after that write means the exit belongs to another path:
+        // an earlier branch that returned, a catch handler, a new function.
+        const boundary = win
+          .slice(lastLog + 1)
+          .some((t) => t === 'return;' || /\.catch\(|^\} catch|catch \(|^(async )?function |writableLength/.test(t));
+        if (!boundary) offenders.push(`${file}:${i + 1}`);
+      });
+    }
+    assert.deepEqual(offenders, []);
+  });
+});

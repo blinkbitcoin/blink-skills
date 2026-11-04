@@ -676,8 +676,11 @@ function checkDomainAllowed(domain, opts = {}) {
     }
     return { allowed: true, allowlist: [] };
   }
-  const normalized = domain.toLowerCase();
-  const allowed = config.allowlist.includes(normalized);
+  // Same host identity as the URL guard: lowercase, no trailing root dot
+  // ('host.' and 'host' are one host) — PR #25 review.
+  const norm = (d) => String(d).toLowerCase().replace(/\.$/, '');
+  const normalized = norm(domain);
+  const allowed = config.allowlist.some((entry) => norm(entry) === normalized);
   return {
     allowed,
     ...(allowed ? {} : { reason: `Domain "${domain}" is not in the L402 allowlist.` }),

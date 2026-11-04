@@ -23,7 +23,13 @@
  * Dependencies: None (uses Node.js built-in fetch).
  */
 
-const { getApiKey, getApiUrl, resolveReceiver, DEFAULT_LN_ADDRESS_DOMAIN } = require('./_blink_client');
+const {
+  getApiKey,
+  getApiUrl,
+  resolveReceiver,
+  DEFAULT_LN_ADDRESS_DOMAIN,
+  exitAfterStdout,
+} = require('./_blink_client');
 
 async function main() {
   const identifier = process.argv[2] ? process.argv[2].trim() : null;
@@ -69,7 +75,8 @@ async function main() {
           2,
         ),
       );
-      process.exit(0);
+      exitAfterStdout(0); // flush piped stdout first (v3.0.3 sweep)
+      return;
     }
     throw err;
   }

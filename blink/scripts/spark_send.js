@@ -48,9 +48,25 @@
  */
 
 const { connect, feeFromPrepare, safeErrorDetail, resolveTokenIdentifier, parseTokenAmount } = require('./_spark_sdk');
+const { strictArgv } = require('./_blink_client');
 const { reserveBudget, settleSpend, releaseSpend } = require('./_budget');
 
+// Every option spark-send / spark-fee-probe accept; anything else is refused (PR #26 review).
+const SPARK_SEND_OPTIONS = {
+  'dry-run': { type: 'boolean' },
+  force: { type: 'boolean' },
+  network: { type: 'string' },
+  token: { type: 'string' },
+  'base-units': { type: 'boolean' },
+  'from-btc': { type: 'boolean' },
+  'from-token': { type: 'string' },
+  'slippage-bps': { type: 'string' },
+};
+
 function parseArgs(argv) {
+  // Strict first: `--dry-run=true` or a typo like `--dryrun` used to be read
+  // as a positional and the SEND WAS REAL. Throws ARG_INVALID before any SDK.
+  argv = strictArgv(argv, SPARK_SEND_OPTIONS);
   let destination = null;
   let amountSats = null;
   let dryRun = false;

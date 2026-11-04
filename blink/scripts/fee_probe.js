@@ -59,8 +59,16 @@ const FEE_PROBE_USD_MUTATION = `
 `;
 
 async function main() {
-  const { walletCurrency, remaining } = parseWalletArg(process.argv.slice(2));
+  const { walletCurrency, maxAmount, remaining } = parseWalletArg(process.argv.slice(2));
   const rawInvoice = remaining[0];
+
+  // The shared parser accepts --max-amount; a probe never pays, so it cannot
+  // honor a spending ceiling — refuse instead of silently accepting a safety
+  // flag it ignores (ClawHub 3.0.2 scan: that is how pay_invoice's ceiling
+  // went missing). --dry-run/--force stay harmless no-ops here.
+  if (maxAmount !== null) {
+    throw new Error('--max-amount is not supported by fee-probe (it never pays). Pass it to pay-invoice instead.');
+  }
 
   if (!rawInvoice) {
     console.error('Usage: node fee_probe.js <bolt11_invoice> [--wallet BTC|USD]');

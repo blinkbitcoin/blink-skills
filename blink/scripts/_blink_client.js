@@ -584,7 +584,65 @@ function formatUsdCents(cents) {
  * @param {string[]} argv  Typically `process.argv.slice(2)`.
  * @returns {{ walletCurrency: string, dryRun: boolean, force: boolean, maxAmount: number|null, remaining: string[] }}
  */
+/**
+ * Strictly validate a money-moving script's argv and return it in canonical
+ * split form (`--opt value`), for that script's own validation loop.
+ *
+ * PR #26 review: the hand-rolled parsers treated anything they did not
+ * recognize as an ignored positional, so a safety flag spelled slightly
+ * differently was silently dropped — `--max-amount=500` or a valueless
+ * `--max-amount` lost the ceiling, and `--dry-run=true` or a typo like
+ * `--dryrun` lost the DRY RUN, making the payment real. This runs the same
+ * engine as the `blink` CLI (node:util parseArgs, strict): unknown options, a
+ * missing value, and a value on a boolean flag all THROW (code ARG_INVALID)
+ * before any credential, network, or SDK call; `--opt=value` is accepted.
+ *
+ * @param {string[]} argv
+ * @param {Record<string, {type: 'string'|'boolean', multiple?: boolean}>} options
+ * @returns {string[]}  canonical argv: `--name` (+ value for strings) and positionals, in order
+ */
+function strictArgv(argv, options) {
+  let tokens;
+  try {
+    ({ tokens } = require('node:util').parseArgs({
+      args: argv,
+      options,
+      allowPositionals: true,
+      strict: true,
+      tokens: true,
+    }));
+  } catch (err) {
+    const reason = String(err.message).replace(/\. To specify a positional argument[\s\S]*$/, '');
+    const e = new Error(`${reason}. Unknown or malformed options are refused before anything is sent.`);
+    e.code = 'ARG_INVALID';
+    throw e;
+  }
+  const out = [];
+  for (const t of tokens) {
+    if (t.kind === 'option') {
+      out.push(`--${t.name}`);
+      if (options[t.name].type === 'string') out.push(t.value);
+    } else if (t.kind === 'positional') {
+      out.push(t.value);
+    }
+  }
+  return out;
+}
+
+const WALLET_ARG_OPTIONS = {
+  wallet: { type: 'string' },
+  'dry-run': { type: 'boolean' },
+  force: { type: 'boolean' },
+  'max-amount': { type: 'string' },
+};
+
 function parseWalletArg(argv) {
+  try {
+    argv = strictArgv(argv, WALLET_ARG_OPTIONS);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   let walletCurrency = 'BTC';
   let dryRun = false;
   let force = false;
@@ -817,7 +875,29 @@ function subscribeToInvoice({ paymentRequest, apiKey, wsUrl, timeoutSeconds, onR
 
 // ── Exports ──────────────────────────────────────────────────────────────────
 
+/**
+ * Exit with `code` only after buffered stdout has been flushed.
+ *
+ * process.exit() right after console.log() can cut a PIPED stdout mid-write
+ * (PR #25 review: 8 MiB of JSON arrived as 146 KB). Commands that must exit
+ * explicitly — e.g. to tear down a WebSocket subscription — call this instead,
+ * and `return` right after it (the exit may happen on a later tick).
+ * Synchronous when nothing is buffered, so tests that trap process.exit see
+ * the code immediately.
+ *
+ * @param {number} code
+ */
+function exitAfterStdout(code) {
+  if (process.stdout.writableLength === 0) {
+    process.exit(code);
+    return;
+  }
+  process.stdout.write('', () => process.exit(code));
+}
+
 module.exports = {
+  strictArgv,
+  exitAfterStdout,
   // Constants
   DEFAULT_API_URL,
   DEFAULT_TIMEOUT_MS,

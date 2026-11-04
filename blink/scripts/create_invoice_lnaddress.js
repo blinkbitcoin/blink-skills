@@ -45,6 +45,7 @@ const {
   DEFAULT_LN_ADDRESS_DOMAIN,
   ALLOWED_LN_ADDRESS_DOMAINS,
   ALLOWED_LNURL_SERVICE_HOSTS,
+  exitAfterStdout,
 } = require('./_blink_client');
 const { getInvoiceFromLightningAddress, verifyLnurlPayment } = require('./_lnurl');
 
@@ -231,7 +232,8 @@ async function main() {
   );
   const result = await pollVerify(invoice.verify, args.timeoutSeconds, invoice.paymentRequest);
   console.log(JSON.stringify(result, null, 2));
-  process.exit(result.settled ? 0 : 1);
+  exitAfterStdout(result.settled ? 0 : 1); // flush piped stdout first (v3.0.3 sweep)
+  return;
 }
 
 if (require.main === module) {
